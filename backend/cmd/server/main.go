@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
+	"github.com/shawn-bluce/renderbin/backend/internal/config"
 	"github.com/shawn-bluce/renderbin/backend/internal/db"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/server"
@@ -31,6 +32,11 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	runtimeConfig, err := config.Load()
+	if err != nil {
+		logger.Error("load runtime config", "error", err)
+		os.Exit(1)
+	}
 
 	addr := envOr("LISTEN_ADDR", defaultListenAddr)
 	dbPath := envOr("DB_PATH", defaultDBPath)
@@ -48,7 +54,7 @@ func main() {
 	defer conn.Close()
 
 	queries := sqlcgen.New(conn)
-	handler := server.New(queries, conn, logger)
+	handler := server.NewWithConfig(queries, conn, logger, runtimeConfig)
 
 	srv := &http.Server{
 		Addr:              addr,

@@ -57,3 +57,12 @@ func requestBaseURL(r *http.Request) string {
 	}
 	return scheme + "://" + host
 }
+
+// publicShareBaseURL uses the configured share origin when one is present and
+// otherwise preserves the upstream request-derived behavior.
+func publicShareBaseURL(r *http.Request, configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return requestBaseURL(r)
+}

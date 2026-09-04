@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -20,24 +21,24 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/config"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
-// maxHTMLBytes caps stored HTML at 5 MB per file. maxFileBody is the cap on the
-// raw request body carrying it.
+// maxFileBody is the cap on the raw request body carrying a document.
 //
-// maxFileBody is deliberately far above maxHTMLBytes rather than "5MB plus a
-// little". The body is JSON, and JSON escaping costs an extra byte for every
-// quote, backslash, tab and newline in the document -- a 5MB HTML file has well
-// over a hundred thousand of those. The cap used to be maxHTMLBytes+64KB, so a
-// legal 5MB document tripped the reader before the decoder ever ran and the
-// user got 400 "invalid request body" for a file that was within the advertised
-// limit. Leaving room for a 2x expansion means the explicit length check below
-// is what rejects an oversized document, with a message that says so.
-const (
-	maxHTMLBytes = 5 << 20
-	maxFileBody  = 2*maxHTMLBytes + 64<<10
-)
+// It is deliberately far above maxFileSizeBytes rather than "the limit plus a
+// little". encoding/json may render one input byte as a six-byte \u00XX escape.
+// Leaving room for that worst case means the explicit decoded-content check is
+// what rejects an oversized document, with a message that says so.
+func maxFileBody(maxFileSizeBytes int64) int64 {
+	const envelopeBytes int64 = 64 << 10
+	const maxJSONBytesPerContentByte int64 = 6
+	if maxFileSizeBytes > (math.MaxInt64-envelopeBytes)/maxJSONBytesPerContentByte {
+		return math.MaxInt64
+	}
+	return maxJSONBytesPerContentByte*maxFileSizeBytes + envelopeBytes
+}
 
 // maxNameBytes bounds a file's display name. It is not cosmetic: the name goes
 // into the Content-Disposition header of every download, and a name longer than
@@ -92,10 +93,11 @@ func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, para
 type FilesHandler struct {
 	queries *sqlcgen.Queries
 	logger  *slog.Logger
+	config  config.Runtime
 }
 
-func NewFilesHandler(queries *sqlcgen.Queries, logger *slog.Logger) *FilesHandler {
-	return &FilesHandler{queries: queries, logger: logger}
+func NewFilesHandler(queries *sqlcgen.Queries, logger *slog.Logger, cfg config.Runtime) *FilesHandler {
+	return &FilesHandler{queries: queries, logger: logger, config: cfg}
 }
 
 type fileResponse struct {
@@ -369,8 +371,8 @@ const snippetRadius = 100
 //
 // The window comes from SQL rather than the whole document on purpose -- see
 // the query -- so this never sees the file's full source and cannot be given a
-// 5MB string to slice. It receives the window, the 1-based character offset of
-// the match within the *document* (0 when the content did not match at all),
+// large content string to slice. It receives the window, the 1-based character
+// offset of the match within the *document* (0 when the content did not match at all),
 // and the document's length in characters, which together are everything
 // needed to decide about ellipses.
 //
@@ -410,13 +412,13 @@ type createFileRequest struct {
 
 // validateContent applies the two rules every stored document has to satisfy.
 // Returns false after writing the response.
-func validateContent(w http.ResponseWriter, content string) bool {
+func (h *FilesHandler) validateContent(w http.ResponseWriter, content string) bool {
 	if content == "" {
 		http.Error(w, "html_content is required", http.StatusBadRequest)
 		return false
 	}
-	if len(content) > maxHTMLBytes {
-		http.Error(w, "html_content exceeds 5MB", http.StatusRequestEntityTooLarge)
+	if int64(len(content)) > h.config.MaxFileSizeBytes {
+		http.Error(w, fmt.Sprintf("html_content exceeds %dMB", h.config.MaxFileSizeMB), http.StatusRequestEntityTooLarge)
 		return false
 	}
 	return true
@@ -447,7 +449,7 @@ var errOverQuota = errors.New("storage quota exceeded")
 //
 // **Every path that stores content must call this**, not just the HTTP one.
 // `users.quota_bytes` is worth nothing if one way in ignores it, and MCP is a
-// way in: an API key could upload 20 files of 5MB per call, without limit,
+// way in: an API key could upload 20 files at the configured maximum per call,
 // while the dashboard's own uploads were being refused.
 //
 // The sum comes from the content_size column, so this costs an indexed
@@ -491,10 +493,10 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createFileRequest
-	if !decodeJSON(w, r, &req, maxFileBody) {
+	if !decodeJSON(w, r, &req, maxFileBody(h.config.MaxFileSizeBytes)) {
 		return
 	}
-	if !validateContent(w, req.HTMLContent) {
+	if !h.validateContent(w, req.HTMLContent) {
 		return
 	}
 	kind, ok := normalizeKind(req.Kind)
@@ -590,10 +592,10 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	oldSlug := chi.URLParam(r, "slug")
 
 	var req updateFileRequest
-	if !decodeJSON(w, r, &req, maxFileBody) {
+	if !decodeJSON(w, r, &req, maxFileBody(h.config.MaxFileSizeBytes)) {
 		return
 	}
-	if !validateContent(w, req.HTMLContent) {
+	if !h.validateContent(w, req.HTMLContent) {
 		return
 	}
 	req.Slug = strings.TrimSpace(req.Slug)

@@ -24,12 +24,14 @@ curl -LO https://github.com/shawn-bluce/renderbin/releases/latest/download/rende
 tar xzf renderbin_linux_amd64.tar.gz && ./renderbin
 ```
 
-环境变量只有两个,其余配置都在应用的设置页里:
+运行时环境变量如下,其余配置都在应用的设置页里:
 
-| 变量          | 默认值        | 说明                  |
-| ------------- | ------------- | --------------------- |
-| `LISTEN_ADDR` | `:8080`       | 服务监听地址          |
-| `DB_PATH`     | `data/app.db` | SQLite 数据库文件路径 |
+| 变量                    | 默认值        | 说明                                                                 |
+| ----------------------- | ------------- | -------------------------------------------------------------------- |
+| `LISTEN_ADDR`           | `:8080`       | 服务监听地址                                                         |
+| `DB_PATH`               | `data/app.db` | SQLite 数据库文件路径                                                |
+| `MAX_FILE_SIZE_MB`      | `5`           | 单文件上限(MiB),必须为正整数                                        |
+| `PUBLIC_SHARE_BASE_URL` | 空            | 分享链接使用的可选纯 `http`/`https` origin,例如 `https://pages.example.com` |
 
 ## MCP
 
@@ -56,7 +58,7 @@ claude mcp add --transport http renderbin https://your-host/mcp \
 
 - 上传的 HTML/Markdown **不做净化、带脚本原样输出**——这正是工具的意义——但每个文档都在 `Content-Security-Policy: sandbox` 的独立源中运行:脚本照常工作,却读不到访问者的 Cookie,也无法以其身份调用本站 API。想要更强隔离,可把 `/res` 放到单独的域名下。
 - 账号之间的文件在 SQL 层按属主隔离,超级管理员也看不到别人的文件内容——只多了全局设置、数据库备份和账号管理。
-- 上传有上限:单文件 5 MB,每账号默认 100 MB 存储配额(超级管理员可调)。
+- 上传有上限:单文件默认 5 MiB(可通过 `MAX_FILE_SIZE_MB` 调整),每账号默认 100 MB 存储配额(超级管理员可调)。
 - 没有自助找回密码:普通账号请超级管理员在设置页重置;超级管理员自己忘了密码,用 `docker compose exec app ./server reset-password --user=NAME`。
 - 发现漏洞请开 issue 说明**影响面**,修复发布前先不要贴出可直接利用的细节。
 
@@ -101,12 +103,14 @@ curl -LO https://github.com/shawn-bluce/renderbin/releases/latest/download/rende
 tar xzf renderbin_linux_amd64.tar.gz && ./renderbin
 ```
 
-There are only two environment variables; everything else is configured in the app's Settings page:
+Runtime environment variables are listed below; everything else is configured in the app's Settings page:
 
-| Variable      | Default       | Description                      |
-| ------------- | ------------- | -------------------------------- |
-| `LISTEN_ADDR` | `:8080`       | Address the server binds to      |
-| `DB_PATH`     | `data/app.db` | Path to the SQLite database file |
+| Variable                | Default       | Description                                                                 |
+| ----------------------- | ------------- | --------------------------------------------------------------------------- |
+| `LISTEN_ADDR`           | `:8080`       | Address the server binds to                                                 |
+| `DB_PATH`               | `data/app.db` | Path to the SQLite database file                                            |
+| `MAX_FILE_SIZE_MB`      | `5`           | Per-file limit in MiB; must be a positive whole number                      |
+| `PUBLIC_SHARE_BASE_URL` | empty         | Optional pure `http`/`https` origin for share links, e.g. `https://pages.example.com` |
 
 ## MCP
 
@@ -133,7 +137,7 @@ One process, one database file, no external services:
 
 - Uploaded HTML/Markdown is served **unsanitized, scripts intact** — that's the point of the tool — but every document runs in its own origin under `Content-Security-Policy: sandbox`: scripts work, yet the page cannot read the viewer's cookies or call this app's API as them. For stronger separation, serve `/res` from a different hostname.
 - Files are isolated per account in SQL; even the super admin cannot see other users' file contents — id=1 only gains the global settings, the database backup, and account management.
-- Uploads are bounded: 5 MB per file, and each account has a storage quota (100 MB by default, adjustable by the super admin).
+- Uploads are bounded: 5 MiB per file by default (configurable with `MAX_FILE_SIZE_MB`), and each account has a storage quota (100 MB by default, adjustable by the super admin).
 - There is no self-service password reset: ask the super admin to reset yours in Settings; if the super admin is locked out, use `docker compose exec app ./server reset-password --user=NAME`.
 - Found a vulnerability? Open an issue describing the **impact**, and hold back trivially exploitable details until a fix ships.
 

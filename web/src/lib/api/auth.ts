@@ -8,6 +8,8 @@ export interface Me {
 export interface SetupStatus {
 	needs_setup: boolean;
 	allow_registration: boolean;
+	max_file_size_bytes: number;
+	public_share_base_url: string;
 }
 
 /** Error carrying the HTTP status so callers can map it to a message. */

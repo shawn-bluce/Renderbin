@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/shawn-bluce/renderbin/backend/internal/config"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
@@ -15,15 +16,18 @@ type SetupHandler struct {
 	queries *sqlcgen.Queries
 	auth    *AuthHandler
 	logger  *slog.Logger
+	config  config.Runtime
 }
 
-func NewSetupHandler(queries *sqlcgen.Queries, authH *AuthHandler, logger *slog.Logger) *SetupHandler {
-	return &SetupHandler{queries: queries, auth: authH, logger: logger}
+func NewSetupHandler(queries *sqlcgen.Queries, authH *AuthHandler, logger *slog.Logger, cfg config.Runtime) *SetupHandler {
+	return &SetupHandler{queries: queries, auth: authH, logger: logger, config: cfg}
 }
 
 type setupStatusResponse struct {
-	NeedsSetup        bool `json:"needs_setup"`
-	AllowRegistration bool `json:"allow_registration"`
+	NeedsSetup         bool   `json:"needs_setup"`
+	AllowRegistration  bool   `json:"allow_registration"`
+	MaxFileSizeBytes   int64  `json:"max_file_size_bytes"`
+	PublicShareBaseURL string `json:"public_share_base_url"`
 }
 
 // Status is public: the SPA layout guard calls it on every load to decide
@@ -37,8 +41,10 @@ func (h *SetupHandler) Status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, setupStatusResponse{
-		NeedsSetup:        count == 0,
-		AllowRegistration: configBool(r, h.queries, ConfigAllowRegistration),
+		NeedsSetup:         count == 0,
+		AllowRegistration:  configBool(r, h.queries, ConfigAllowRegistration),
+		MaxFileSizeBytes:   h.config.MaxFileSizeBytes,
+		PublicShareBaseURL: h.config.PublicShareBaseURL,
 	})
 }
 

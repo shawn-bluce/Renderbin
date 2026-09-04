@@ -12,6 +12,7 @@
 	import LanguageSwitcher from '$lib/components/LanguageSwitcher.svelte';
 	import { copyText } from '$lib/clipboard';
 	import { formatSize } from '$lib/format';
+	import { fileSizeLimitLabel, publicShareURL } from '$lib/runtime-config';
 	import { getUsage, type Usage } from '$lib/api/settings';
 	import {
 		ApiError,
@@ -41,7 +42,10 @@
 	// svelte-ignore state_referenced_locally
 	let files = $state<FileItem[]>(data.files);
 
-	const MAX_HTML_BYTES = 5 * 1024 * 1024;
+	// Intentional one-time snapshot: runtime config is fixed for the process.
+	// svelte-ignore state_referenced_locally
+	const maxFileSizeBytes = data.maxFileSizeBytes;
+	const maxFileSizeLabel = fileSizeLimitLabel(maxFileSizeBytes);
 
 	let uploading = $state(false);
 	let errorMessage = $state<string | null>(null);
@@ -341,7 +345,7 @@
 	}
 
 	function resUrl(file: FileItem): string {
-		return `${location.origin}/res/${file.slug}?code=${file.access_code}`;
+		return publicShareURL(data.publicShareBaseURL, location.origin, file.slug, file.access_code);
 	}
 
 	async function copyToClipboard(text: string, slug: string) {
@@ -415,11 +419,13 @@
 			.map((file) => ({ file, kind: detectKind(file) }))
 			.filter((c): c is { file: File; kind: FileKind } => c.kind !== null);
 		const skippedCount = all.length - candidates.length;
-		const accepted = candidates.filter((c) => c.file.size <= MAX_HTML_BYTES);
+		const accepted = candidates.filter((c) => c.file.size <= maxFileSizeBytes);
 		const oversizeCount = candidates.length - accepted.length;
 		if (accepted.length === 0) {
 			errorMessage =
-				oversizeCount > 0 ? t('error.oversizeOnly', { n: oversizeCount }) : t('error.noSupported');
+				oversizeCount > 0
+					? t('error.oversizeOnly', { n: oversizeCount, size: maxFileSizeLabel })
+					: t('error.noSupported');
 			return;
 		}
 
@@ -448,7 +454,7 @@
 			notes.push(t('note.skipped', { n: skippedCount }));
 		}
 		if (oversizeCount > 0) {
-			notes.push(t('note.oversize', { n: oversizeCount }));
+			notes.push(t('note.oversize', { n: oversizeCount, size: maxFileSizeLabel }));
 		}
 		if (failedCount > 0) {
 			notes.push(t('note.failed', { n: failedCount }));
@@ -540,8 +546,8 @@
 			createError = t('error.contentRequired');
 			return;
 		}
-		if (new Blob([createContent]).size > MAX_HTML_BYTES) {
-			createError = t('error.contentTooLarge');
+		if (new Blob([createContent]).size > maxFileSizeBytes) {
+			createError = t('error.contentTooLarge', { size: maxFileSizeLabel });
 			return;
 		}
 		createError = null;
@@ -621,8 +627,8 @@
 			editError = t('error.contentRequired');
 			return;
 		}
-		if (new Blob([editContent]).size > MAX_HTML_BYTES) {
-			editError = t('error.contentTooLarge');
+		if (new Blob([editContent]).size > maxFileSizeBytes) {
+			editError = t('error.contentTooLarge', { size: maxFileSizeLabel });
 			return;
 		}
 		editError = null;

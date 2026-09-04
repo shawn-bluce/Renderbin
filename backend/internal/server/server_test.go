@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/config"
 	"github.com/shawn-bluce/renderbin/backend/internal/db"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/server"
@@ -39,6 +40,10 @@ type testEnv struct {
 // newBareEnv starts a server against an empty database — no users yet, the
 // state the first-run /api/setup flow expects.
 func newBareEnv(t *testing.T) *testEnv {
+	return newBareEnvWithConfig(t, config.Default())
+}
+
+func newBareEnvWithConfig(t *testing.T, cfg config.Runtime) *testEnv {
 	t.Helper()
 	conn, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
@@ -48,7 +53,7 @@ func newBareEnv(t *testing.T) *testEnv {
 
 	queries := sqlcgen.New(conn)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(server.New(queries, conn, logger))
+	srv := httptest.NewServer(server.NewWithConfig(queries, conn, logger, cfg))
 	t.Cleanup(srv.Close)
 
 	return &testEnv{srv: srv, queries: queries, conn: conn}
@@ -57,8 +62,12 @@ func newBareEnv(t *testing.T) *testEnv {
 // newEnv additionally seeds the super admin (id=1, testUser/testPass), the
 // state every post-setup test wants.
 func newEnv(t *testing.T) *testEnv {
+	return newEnvWithConfig(t, config.Default())
+}
+
+func newEnvWithConfig(t *testing.T, cfg config.Runtime) *testEnv {
 	t.Helper()
-	e := newBareEnv(t)
+	e := newBareEnvWithConfig(t, cfg)
 	hash, err := auth.HashPassword(testPass)
 	if err != nil {
 		t.Fatalf("HashPassword: %v", err)
@@ -389,6 +398,70 @@ func TestCreateValidation(t *testing.T) {
 	// Unknown kind -> 400.
 	resp = e.do(t, http.MethodPost, "/api/files", `{"name":"x","kind":"pdf","html_content":"x"}`, cookie)
 	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+}
+
+func TestConfiguredFileSizeLimitAcrossRESTCreateAndUpdate(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxFileSizeMB = 20
+	cfg.MaxFileSizeBytes = 20 << 20
+	e := newEnvWithConfig(t, cfg)
+	cookie := e.authCookie(t)
+
+	body, err := json.Marshal(map[string]string{
+		"name": "ten-mib", "kind": "html", "html_content": strings.Repeat("a", 10<<20),
+	})
+	if err != nil {
+		t.Fatalf("marshal upload: %v", err)
+	}
+	resp := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
+	assertStatus(t, resp, http.StatusCreated)
+	created := decodeFile(t, resp)
+
+	body, err = json.Marshal(map[string]string{
+		"name": "nineteen-mib", "kind": "html", "html_content": strings.Repeat("b", 19<<20),
+	})
+	if err != nil {
+		t.Fatalf("marshal 19MiB upload: %v", err)
+	}
+	resp = e.do(t, http.MethodPost, "/api/files", string(body), cookie)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// encoding/json expands each control byte to a six-byte \u00XX escape.
+	// The decoded file is valid and below 20 MiB even though its request body
+	// exceeds the old 2x transport allowance.
+	body, err = json.Marshal(map[string]string{
+		"name": "escaped", "kind": "html", "html_content": strings.Repeat("\x01", 7<<20),
+	})
+	if err != nil {
+		t.Fatalf("marshal escaped upload: %v", err)
+	}
+	resp = e.do(t, http.MethodPost, "/api/files", string(body), cookie)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	body, err = json.Marshal(map[string]string{
+		"name": "over-twenty-mib", "kind": "html", "html_content": strings.Repeat("c", (20<<20)+1),
+	})
+	if err != nil {
+		t.Fatalf("marshal oversized upload: %v", err)
+	}
+	resp = e.do(t, http.MethodPost, "/api/files", string(body), cookie)
+	assertStatus(t, resp, http.StatusRequestEntityTooLarge)
+	if msg := bodyString(t, resp); !strings.Contains(msg, "20MB") {
+		t.Errorf("oversized response = %q, want configured 20MB limit", strings.TrimSpace(msg))
+	}
+
+	body, err = json.Marshal(map[string]string{
+		"name": created.Name, "slug": created.Slug, "access_code": created.AccessCode,
+		"html_content": strings.Repeat("d", 19<<20),
+	})
+	if err != nil {
+		t.Fatalf("marshal 19MiB update: %v", err)
+	}
+	resp = e.do(t, http.MethodPatch, "/api/files/"+created.Slug, string(body), cookie)
+	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 }
 
@@ -1078,6 +1151,31 @@ func TestSetupFlow(t *testing.T) {
 	resp = e.do(t, http.MethodGet, "/api/setup/status", "", nil)
 	if b := bodyString(t, resp); !strings.Contains(b, `"needs_setup":false`) || !strings.Contains(b, `"allow_registration":true`) {
 		t.Errorf("status body after setup = %q", b)
+	}
+}
+
+func TestSetupStatusExposesRuntimeUploadAndShareConfig(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxFileSizeMB = 20
+	cfg.MaxFileSizeBytes = 20 << 20
+	cfg.PublicShareBaseURL = "https://share.example.com"
+	e := newBareEnvWithConfig(t, cfg)
+
+	resp := e.do(t, http.MethodGet, "/api/setup/status", "", nil)
+	assertStatus(t, resp, http.StatusOK)
+	var status struct {
+		MaxFileSizeBytes   int64  `json:"max_file_size_bytes"`
+		PublicShareBaseURL string `json:"public_share_base_url"`
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode setup status: %v", err)
+	}
+	if status.MaxFileSizeBytes != 20<<20 {
+		t.Errorf("max_file_size_bytes = %d, want %d", status.MaxFileSizeBytes, 20<<20)
+	}
+	if status.PublicShareBaseURL != "https://share.example.com" {
+		t.Errorf("public_share_base_url = %q", status.PublicShareBaseURL)
 	}
 }
 
@@ -1780,6 +1878,25 @@ func TestMCPUploadPublishFlow(t *testing.T) {
 	}
 }
 
+func TestMCPPublishUsesConfiguredPublicShareOrigin(t *testing.T) {
+	cfg := config.Default()
+	cfg.PublicShareBaseURL = "https://share.example.com"
+	e := newEnvWithConfig(t, cfg)
+	key := e.enableMCP(t)
+
+	uploaded := e.mcpUpload(t, key, "shared", "markdown", "# shared")
+	slug, _ := uploaded["slug"].(string)
+	res := decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{"slug": slug}))
+	if res.IsError {
+		t.Fatalf("publish_file error: %s", res.text())
+	}
+	url, _ := res.StructuredContent["url"].(string)
+	want := "https://share.example.com/res/" + slug
+	if !strings.HasPrefix(url, want+"?code=") {
+		t.Errorf("publish_file URL = %q, want prefix %q", url, want+"?code=")
+	}
+}
+
 // TestMCPPublishWithExpiry covers the self-expiring publish: one call has to
 // both make the file public and attach the limit, since a two-step version
 // could leave it public with no limit if the second step failed.
@@ -1931,6 +2048,72 @@ func TestMCPUploadValidation(t *testing.T) {
 	}))
 	if !res.IsError || !strings.Contains(res.text(), "content is required") {
 		t.Errorf("empty content = %v %q, want content error", res.IsError, res.text())
+	}
+
+	res = decodeMCPResult(t, e.mcpCall(t, key, "upload_file", map[string]any{
+		"name": "too-big", "kind": "html", "content": strings.Repeat("x", (5<<20)+1),
+	}))
+	if !res.IsError || !strings.Contains(res.text(), "5MB") {
+		t.Errorf("oversized content = %v %q, want default 5MB error", res.IsError, res.text())
+	}
+}
+
+func TestConfiguredFileSizeLimitAllowsNineteenMiBMCPUpload(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxFileSizeMB = 20
+	cfg.MaxFileSizeBytes = 20 << 20
+	e := newEnvWithConfig(t, cfg)
+	key := e.enableMCP(t)
+
+	res := decodeMCPResult(t, e.mcpCall(t, key, "upload_file", map[string]any{
+		"name": "nineteen-mib", "kind": "html", "content": strings.Repeat("a", 19<<20),
+	}))
+	if res.IsError {
+		t.Fatalf("upload_file error: %s", res.text())
+	}
+	slug, _ := res.StructuredContent["slug"].(string)
+	res = decodeMCPResult(t, e.mcpCall(t, key, "update_file", map[string]any{
+		"slug": slug, "content": strings.Repeat("b", 19<<20),
+	}))
+	if res.IsError {
+		t.Fatalf("update_file error: %s", res.text())
+	}
+
+	res = decodeMCPResult(t, e.mcpCall(t, key, "upload_files", map[string]any{
+		"files": []map[string]any{
+			{"name": "ten-mib", "kind": "html", "content": strings.Repeat("c", 10<<20)},
+			{"name": "over-twenty-mib", "kind": "html", "content": strings.Repeat("d", (20<<20)+1)},
+		},
+	}))
+	if res.IsError {
+		t.Fatalf("upload_files error: %s", res.text())
+	}
+	if got := res.StructuredContent["uploaded"].(float64); got != 1 {
+		t.Errorf("upload_files uploaded = %v, want 1", got)
+	}
+	if got := res.StructuredContent["failed"].(float64); got != 1 {
+		t.Errorf("upload_files failed = %v, want 1", got)
+	}
+	if !strings.Contains(res.text(), "20MB") {
+		t.Errorf("upload_files result = %q, want configured 20MB error", res.text())
+	}
+}
+
+func TestConfiguredFileSizeLimitAllowsEscapedMCPUpload(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxFileSizeMB = 20
+	cfg.MaxFileSizeBytes = 20 << 20
+	e := newEnvWithConfig(t, cfg)
+	key := e.enableMCP(t)
+
+	// encoding/json expands each control byte to a six-byte \u00XX escape.
+	// Seven MiB therefore exceeds the old ~40 MiB request cap even though the
+	// decoded file remains well below the configured 20 MiB per-file limit.
+	res := decodeMCPResult(t, e.mcpCall(t, key, "upload_file", map[string]any{
+		"name": "escaped", "kind": "html", "content": strings.Repeat("\x01", 7<<20),
+	}))
+	if res.IsError {
+		t.Fatalf("upload_file with escaped content error: %s", res.text())
 	}
 }
 

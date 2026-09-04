@@ -16,16 +16,18 @@ import (
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
+	"github.com/shawn-bluce/renderbin/backend/internal/config"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
 const (
 	// mcpMaxBatchFiles caps upload_files; each file is separately capped at
-	// maxHTMLBytes, but the whole batch must also fit mcpMaxRequestBytes.
+	// the configured per-file limit, but the whole batch must also fit the MCP
+	// request-body limit.
 	mcpMaxBatchFiles = 20
-	// mcpMaxRequestBytes bounds a /mcp request body — the SDK reads the whole
+	// mcpDefaultMaxRequestBytes bounds a /mcp request body — the SDK reads the whole
 	// JSON-RPC message into memory and (as of v1.2.0) applies no limit itself.
-	mcpMaxRequestBytes = 32 << 20
+	mcpDefaultMaxRequestBytes = 32 << 20
 )
 
 // errFileNotFound is returned both for slugs that don't exist and for files
@@ -40,21 +42,22 @@ var errFileNotFound = errors.New("file not found in this project")
 type MCPHandler struct {
 	queries *sqlcgen.Queries
 	logger  *slog.Logger
+	config  config.Runtime
 }
 
 // NewMCPHandler builds the /mcp http.Handler: body cap → mcp_enabled gate →
 // Bearer-token auth → streamable MCP server with the eight file tools.
-func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
-	m := &MCPHandler{queries: queries, logger: logger}
+func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger, cfg config.Runtime) http.Handler {
+	m := &MCPHandler{queries: queries, logger: logger, config: cfg}
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "renderbin", Version: buildinfo.Version}, nil)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "upload_file",
-		Description: "Upload a Markdown or HTML document. The file starts private; the returned URL (with its access code) becomes publicly viewable once the file is published with publish_file.",
+		Description: fmt.Sprintf("Upload a Markdown or HTML document of at most %dMB. The file starts private; the returned URL (with its access code) becomes publicly viewable once the file is published with publish_file.", cfg.MaxFileSizeMB),
 	}, m.uploadFile)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "upload_files",
-		Description: "Upload up to 20 Markdown or HTML documents in one call. Files start private; returns each file's URL.",
+		Description: fmt.Sprintf("Upload up to 20 Markdown or HTML documents of at most %dMB each in one call. Files start private; returns each file's URL.", cfg.MaxFileSizeMB),
 	}, m.uploadFiles)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "list_files",
@@ -86,7 +89,7 @@ func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
 	)
 	withAuth := mcpauth.RequireBearerToken(m.verifyAPIKey, nil)(streamable)
-	return m.requireMCPEnabled(capRequestBody(withAuth))
+	return m.requireMCPEnabled(capRequestBody(withAuth, mcpRequestBodyLimit(cfg.MaxFileSizeBytes)))
 }
 
 // requireMCPEnabled 403s every /mcp request while the mcp_enabled config is off.
@@ -100,9 +103,13 @@ func (m *MCPHandler) requireMCPEnabled(next http.Handler) http.Handler {
 	})
 }
 
-func capRequestBody(next http.Handler) http.Handler {
+func mcpRequestBodyLimit(maxFileSizeBytes int64) int64 {
+	return max(mcpDefaultMaxRequestBytes, maxFileBody(maxFileSizeBytes))
+}
+
+func capRequestBody(next http.Handler, limit int64) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, mcpMaxRequestBytes)
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -129,7 +136,10 @@ func (m *MCPHandler) verifyAPIKey(ctx context.Context, token string, r *http.Req
 		// API keys don't expire; this only satisfies the SDK's per-request
 		// zero-expiration check and easily outlives the request it's made for.
 		Expiration: time.Now().Add(time.Hour),
-		Extra:      map[string]any{"user": user, "baseURL": requestBaseURL(r)},
+		Extra: map[string]any{
+			"user":    user,
+			"baseURL": publicShareBaseURL(r, m.config.PublicShareBaseURL),
+		},
 	}, nil
 }
 
@@ -181,7 +191,7 @@ func textResult(format string, args ...any) *mcp.CallToolResult {
 type mcpUploadInput struct {
 	Name    string `json:"name,omitempty" jsonschema:"display name; defaults to Untitled"`
 	Kind    string `json:"kind" jsonschema:"document format: markdown or html"`
-	Content string `json:"content" jsonschema:"the raw document source, at most 5MB"`
+	Content string `json:"content" jsonschema:"the raw document source, subject to the configured per-file size limit"`
 }
 
 type mcpFileInfo struct {
@@ -217,8 +227,8 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 	if in.Content == "" {
 		return sqlcgen.File{}, errors.New("content is required")
 	}
-	if len(in.Content) > maxHTMLBytes {
-		return sqlcgen.File{}, errors.New("content exceeds 5MB")
+	if int64(len(in.Content)) > m.config.MaxFileSizeBytes {
+		return sqlcgen.File{}, fmt.Errorf("content exceeds %dMB", m.config.MaxFileSizeMB)
 	}
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
@@ -460,7 +470,7 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 type updateFileInput struct {
 	Slug    string `json:"slug" jsonschema:"the document's slug (the path segment of its URL)"`
 	Name    string `json:"name,omitempty" jsonschema:"new display name; omit to keep the current one"`
-	Content string `json:"content,omitempty" jsonschema:"new document source (at most 5MB); omit to keep the current one"`
+	Content string `json:"content,omitempty" jsonschema:"new document source, subject to the configured per-file size limit; omit to keep the current one"`
 }
 
 func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, in updateFileInput) (*mcp.CallToolResult, mcpFileInfo, error) {
@@ -471,8 +481,8 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if in.Name == "" && in.Content == "" {
 		return nil, mcpFileInfo{}, errors.New("provide a new name, new content, or both")
 	}
-	if len(in.Content) > maxHTMLBytes {
-		return nil, mcpFileInfo{}, errors.New("content exceeds 5MB")
+	if int64(len(in.Content)) > m.config.MaxFileSizeBytes {
+		return nil, mcpFileInfo{}, fmt.Errorf("content exceeds %dMB", m.config.MaxFileSizeMB)
 	}
 
 	file, err := m.ownedFile(ctx, user, in.Slug)

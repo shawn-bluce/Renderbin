@@ -12,12 +12,17 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/shawn-bluce/renderbin/backend/internal/config"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/handlers"
 	"github.com/shawn-bluce/renderbin/backend/internal/web"
 )
 
 func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handler {
+	return NewWithConfig(queries, conn, logger, config.Default())
+}
+
+func NewWithConfig(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger, cfg config.Runtime) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -25,9 +30,9 @@ func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handl
 	r.Use(slogRequestLogger(logger))
 
 	authH := handlers.NewAuthHandler(queries, logger)
-	setupH := handlers.NewSetupHandler(queries, authH, logger)
+	setupH := handlers.NewSetupHandler(queries, authH, logger, cfg)
 	settingsH := handlers.NewSettingsHandler(queries, logger)
-	files := handlers.NewFilesHandler(queries, logger)
+	files := handlers.NewFilesHandler(queries, logger, cfg)
 	backupH := handlers.NewBackupHandler(conn, logger)
 	adminH := handlers.NewAdminHandler(queries, conn, logger)
 
@@ -103,7 +108,7 @@ func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handl
 
 	// MCP endpoint: its own Bearer-token (API key) auth + mcp_enabled gate,
 	// deliberately outside /api and the session-cookie requireAuth.
-	r.Handle("/mcp", handlers.NewMCPHandler(queries, logger))
+	r.Handle("/mcp", handlers.NewMCPHandler(queries, logger, cfg))
 
 	r.NotFound(spaHandler(web.FS()))
 
