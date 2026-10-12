@@ -8,6 +8,32 @@ Upgrades are `docker compose pull && docker compose up -d`. Database migrations
 are forward-only and apply themselves on start, so **take a backup before
 upgrading** (Settings → Backup) if you might want to go back.
 
+## Unreleased
+
+### Added
+
+- **Multi-page sites.** Upload a directory — `index.html` plus the pages,
+  stylesheets, scripts and data files it uses — as one file of the new kind
+  `site`. Relative references and links between its files work unchanged. Upload
+  a folder from the dashboard (button or drag-and-drop), a `.zip`, or
+  `POST /api/sites` with a zip body; replace a site's content with
+  `PUT /api/files/{slug}/site`. MCP gains `upload_site` and `update_site` (a
+  patch: only the files that changed). Limits: 5 MB uncompressed, 200 files.
+- Sites are served at `/res/{slug}/{token}/{path}`, where the token is the
+  access code or, for the owner of a private site, a signed preview token valid
+  for 6 hours. The existing share link `/res/{slug}?code=...` redirects there, so
+  links already handed out keep their format.
+
+### Behaviour changes to know about before upgrading
+
+- **A slug or access code can no longer be `.` or `..`.** A browser removes such
+  a segment from a site URL before sending the request. A single document with
+  such a slug was never reachable either.
+- **A site's `max_views` counts HTML page views**, not link openings: every page
+  opened inside the site uses one view, and its stylesheets and scripts use none.
+- **Rolling back** to an earlier version after creating a site needs a restored
+  backup, as with any migration; an older binary cannot render sites at all.
+
 ## v0.2.0
 
 ### Breaking

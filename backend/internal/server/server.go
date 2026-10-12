@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -69,10 +70,12 @@ func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handl
 			// bulk action therefore live at their own top-level paths.
 			r.Get("/search", files.Search)
 			r.Delete("/trash", files.EmptyTrash)
+			r.Post("/sites", files.CreateSite)
 
 			r.Get("/files", files.List)
 			r.Get("/files/{slug}", files.Get)
 			r.Get("/files/{slug}/download", files.Download)
+			r.Put("/files/{slug}/site", files.ReplaceSite)
 			r.Post("/files", files.Create)
 			r.Patch("/files/{slug}", files.Update)
 			r.Patch("/files/{slug}/name", files.Rename)
@@ -100,10 +103,14 @@ func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handl
 	})
 
 	r.Get("/res/{slug}", files.Render)
+	// Directory sites: /res/{slug}/{token}/{path...}. A slug that is not a
+	// site 404s here without the user-content headers, so "/res/a/b" keeps the
+	// app's X-Frame-Options: DENY (TestAppPagesAreNotFramable).
+	r.Get("/res/{slug}/*", files.RenderSite)
 
 	// MCP endpoint: its own Bearer-token (API key) auth + mcp_enabled gate,
 	// deliberately outside /api and the session-cookie requireAuth.
-	r.Handle("/mcp", handlers.NewMCPHandler(queries, logger))
+	r.Handle("/mcp", handlers.NewMCPHandler(queries, conn, logger))
 
 	r.NotFound(spaHandler(web.FS()))
 
@@ -168,9 +175,10 @@ func writeAPIError(w http.ResponseWriter, status int, msg string) {
 // stops a framed dashboard being clickjacked into a destructive action).
 //
 // The exemption follows the handler rather than a path prefix on purpose: an
-// earlier version skipped anything under "/res/", but only /res/{slug} is a
-// real route -- "/res/" and "/res/a/b" fall through to the SPA catch-all, so
-// the app's own pages became framable at those URLs.
+// earlier version skipped anything under "/res/", but not everything there is
+// user content -- "/res/" falls through to the SPA catch-all, and "/res/a/b"
+// is RenderSite's plain 404 when "a" is not a site -- so the app's own pages
+// became framable at those URLs.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -186,10 +194,31 @@ func securityHeaders(next http.Handler) http.Handler {
 func slogRequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			logger.Info("request", "method", r.Method, "path", r.URL.Path)
+			logger.Info("request", "method", r.Method, "path", redactPath(r.URL.Path))
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// redactPath masks the credential segment of a site URL,
+// /res/{slug}/{token}/..., before it reaches the log. The token is an access
+// code or an owner preview token, and container logs are not a place for
+// either. (A document link carries its code in the query string, which was
+// never logged.)
+func redactPath(p string) string {
+	rest, ok := strings.CutPrefix(p, "/res/")
+	if !ok {
+		return p
+	}
+	slug, rest, ok := strings.Cut(rest, "/")
+	if !ok || rest == "" {
+		return p
+	}
+	_, after, hasSlash := strings.Cut(rest, "/")
+	if !hasSlash {
+		return "/res/" + slug + "/***"
+	}
+	return "/res/" + slug + "/***/" + after
 }
 
 // spaHandler serves static assets from distFS, falling back to index.html

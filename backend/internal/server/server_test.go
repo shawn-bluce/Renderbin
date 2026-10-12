@@ -2183,6 +2183,8 @@ func TestMCPToolsAreAllTested(t *testing.T) {
 		"publish_file":   "TestMCPPublishWithExpiry",
 		"unpublish_file": "TestMCPUnpublish",
 		"delete_file":    "TestMCPDeleteTwoPhase",
+		"upload_site":    "TestMCPSiteUploadAndUpdate",
+		"update_site":    "TestMCPSiteUploadAndUpdate",
 	}
 	if len(envelope.Result.Tools) != len(tested) {
 		t.Errorf("server advertises %d tools, the test map lists %d",
@@ -2229,6 +2231,10 @@ var foreignCases = []foreignCase{
 	{method: http.MethodDelete, path: "/api/files/%s"},
 	{method: http.MethodPost, path: "/api/files/%s/restore", trashed: true},
 	{method: http.MethodDelete, path: "/api/files/%s/permanent", trashed: true},
+	// The body is a valid site zip, so the request would succeed if the
+	// ownership check did not stop it first.
+	{method: http.MethodPut, path: "/api/files/%s/site",
+		body: mustSiteZip(map[string]string{"index.html": "<p>hacked</p>"})},
 }
 
 // fingerprint is every column a foreignCase could plausibly mutate, so the
@@ -2239,8 +2245,8 @@ func (e *testEnv) fingerprint(t *testing.T, slug string) string {
 	if err != nil {
 		t.Fatalf("fingerprint %q: %v", slug, err)
 	}
-	return fmt.Sprintf("name=%q content=%q public=%v code=%q tags=%q expires=%v maxviews=%v",
-		f.Name, f.HtmlContent, f.IsPublic, f.AccessCode, f.Tags, f.ExpiresAt.Valid, f.MaxViews.Valid)
+	return fmt.Sprintf("name=%q content=%q archive=%x public=%v code=%q tags=%q expires=%v maxviews=%v",
+		f.Name, f.HtmlContent, f.Archive, f.IsPublic, f.AccessCode, f.Tags, f.ExpiresAt.Valid, f.MaxViews.Valid)
 }
 
 // trashFingerprint is fingerprint for a soft-deleted file, which
@@ -2333,7 +2339,7 @@ func TestFileEndpointsRejectForeignSlug(t *testing.T) {
 // in TestFileEndpointsCoverAllRoutes for why.
 func isFileRoute(route string) bool {
 	return strings.HasPrefix(route, "/api/files") ||
-		route == "/api/search" || route == "/api/trash"
+		route == "/api/search" || route == "/api/trash" || route == "/api/sites"
 }
 
 // TestFileEndpointsCoverAllRoutes walks the real router so that adding a file
@@ -2352,6 +2358,7 @@ func TestFileEndpointsCoverAllRoutes(t *testing.T) {
 		http.MethodPost + " /api/files":   true, // creates, attributed to caller
 		http.MethodGet + " /api/search":   true, // covered by TestSearchScopedToOwnFiles
 		http.MethodDelete + " /api/trash": true, // covered by TestEmptyTrash
+		http.MethodPost + " /api/sites":   true, // creates, attributed to caller
 	}
 
 	seen := 0

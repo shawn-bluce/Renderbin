@@ -21,6 +21,7 @@ import (
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
+	"github.com/shawn-bluce/renderbin/backend/internal/site"
 )
 
 // maxHTMLBytes caps stored HTML at 5 MB per file. maxFileBody is the cap on the
@@ -53,6 +54,15 @@ const maxTagsBytes = 1024
 // dropped into /res/{slug} without escaping.
 var slugPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
+// validPathToken is slugPattern minus "." and "..". Slugs and access codes are
+// both path segments of a site URL (/res/{slug}/{code}/...), and a browser
+// resolves dot segments before it sends the request, so a site whose slug or
+// code is ".." could never be reached -- the segment simply vanishes. (A
+// single document at /res/.. was never reachable either.)
+func validPathToken(s string) bool {
+	return slugPattern.MatchString(s) && s != "." && s != ".."
+}
+
 // newShortSlug returns an 8-character slug: the first 6 characters of a random
 // UUID, base64-encoded. 24 bits of entropy — short shareable URLs over
 // collision headroom; createFileWithFreshSlug retries on UNIQUE conflicts to
@@ -66,20 +76,19 @@ func newShortSlug() (string, error) {
 	return base64.RawURLEncoding.EncodeToString([]byte(u.String()[:6])), nil
 }
 
-// createFileWithFreshSlug inserts params under a freshly generated short slug
-// (params.Slug is overwritten), retrying up to 5 times on UNIQUE collisions —
-// 8-char slugs carry only 24 bits of entropy, so a collision is a realistic
-// event once enough files (including soft-deleted ones, which keep their slug)
-// accumulate. Shared by the web upload handler and the MCP upload tools.
-func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, params sqlcgen.CreateFileParams) (sqlcgen.File, error) {
+// withFreshSlug runs insert under a freshly generated short slug, retrying up
+// to 5 times on UNIQUE collisions — 8-char slugs carry only 24 bits of
+// entropy, so a collision is a realistic event once enough files (including
+// soft-deleted ones, which keep their slug) accumulate. Shared by every path
+// that creates a file or a site, over HTTP and MCP alike.
+func withFreshSlug(insert func(slug string) (sqlcgen.File, error)) (sqlcgen.File, error) {
 	const maxSlugAttempts = 5
 	for attempt := 1; ; attempt++ {
 		slug, err := newShortSlug()
 		if err != nil {
 			return sqlcgen.File{}, err
 		}
-		params.Slug = slug
-		file, err := queries.CreateFile(ctx, params)
+		file, err := insert(slug)
 		if err == nil {
 			return file, nil
 		}
@@ -89,13 +98,33 @@ func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, para
 	}
 }
 
+// createFileWithFreshSlug inserts a document under a fresh slug (params.Slug is
+// overwritten).
+func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, params sqlcgen.CreateFileParams) (sqlcgen.File, error) {
+	return withFreshSlug(func(slug string) (sqlcgen.File, error) {
+		params.Slug = slug
+		return queries.CreateFile(ctx, params)
+	})
+}
+
+// createSiteWithFreshSlug is createFileWithFreshSlug for a directory site.
+func createSiteWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, params sqlcgen.CreateSiteParams) (sqlcgen.File, error) {
+	return withFreshSlug(func(slug string) (sqlcgen.File, error) {
+		params.Slug = slug
+		return queries.CreateSite(ctx, params)
+	})
+}
+
 type FilesHandler struct {
 	queries *sqlcgen.Queries
 	logger  *slog.Logger
+	// preview signs the owner's preview links into private sites; see
+	// previewSigner. Its key lives only in this process.
+	preview *previewSigner
 }
 
 func NewFilesHandler(queries *sqlcgen.Queries, logger *slog.Logger) *FilesHandler {
-	return &FilesHandler{queries: queries, logger: logger}
+	return &FilesHandler{queries: queries, logger: logger, preview: newPreviewSigner()}
 }
 
 type fileResponse struct {
@@ -103,9 +132,9 @@ type fileResponse struct {
 	Name        string `json:"name"`
 	Kind        string `json:"kind"`
 	HTMLContent string `json:"html_content,omitempty"`
-	// Size is the stored source's length in bytes. The listings read it from
-	// the files.content_size column; the single-file endpoints, which hold the
-	// content anyway, measure it directly.
+	// Size is the stored source's length in bytes (for a site, its compressed
+	// archive). The listings read it from the files.content_size column; the
+	// single-file endpoints, which hold the content anyway, measure it directly.
 	Size             int64   `json:"size"`
 	IsPublic         bool    `json:"is_public"`
 	AccessCode       string  `json:"access_code"`
@@ -123,6 +152,9 @@ type fileResponse struct {
 	// kept, and configuring a new limit clears both.
 	ExpiredAt     *string `json:"expired_at"`
 	ExpiredReason string  `json:"expired_reason"`
+	// Entries lists a site's files. Only the single-file endpoints fill it;
+	// the listings never read the archive.
+	Entries []site.EntryInfo `json:"entries,omitempty"`
 }
 
 const timeLayout = "2006-01-02T15:04:05Z07:00"
@@ -133,7 +165,7 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 		Name:             f.Name,
 		Kind:             f.Kind,
 		HTMLContent:      f.HtmlContent,
-		Size:             int64(len(f.HtmlContent)),
+		Size:             int64(len(f.HtmlContent) + len(f.Archive)),
 		IsPublic:         f.IsPublic,
 		AccessCode:       f.AccessCode,
 		Tags:             f.Tags,
@@ -569,7 +601,19 @@ func (h *FilesHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, toFileResponse(file))
+	resp := toFileResponse(file)
+	if file.Kind == KindSite {
+		// A site has no single source to edit; the dashboard shows what it
+		// holds instead, read from the zip's central directory alone.
+		entries, err := site.List(file.Archive)
+		if err != nil {
+			h.logger.Error("list site entries", "slug", file.Slug, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		resp.Entries = entries
+	}
+	writeJSON(w, resp)
 }
 
 type updateFileRequest struct {
@@ -582,6 +626,9 @@ type updateFileRequest struct {
 // Update replaces a file's name, slug, html_content, and access_code at PATCH
 // /api/files/{slug}. The slug and access code are user-editable (custom
 // values); a slug collision with an existing file returns 409.
+//
+// A site takes the same request minus html_content: its content is replaced
+// only as a whole archive, at PUT /api/files/{slug}/site.
 func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
@@ -593,20 +640,17 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req, maxFileBody) {
 		return
 	}
-	if !validateContent(w, req.HTMLContent) {
-		return
-	}
 	req.Slug = strings.TrimSpace(req.Slug)
-	if !slugPattern.MatchString(req.Slug) {
-		http.Error(w, "slug must be 1-128 chars of letters, digits, '.', '_' or '-'", http.StatusBadRequest)
+	if !validPathToken(req.Slug) {
+		http.Error(w, "slug must be 1-128 chars of letters, digits, '.', '_' or '-' (and not '.' or '..')", http.StatusBadRequest)
 		return
 	}
 	req.AccessCode = strings.TrimSpace(req.AccessCode)
-	// Reuses slugPattern: same URL-query-safe charset, and {1,128} forbids the
-	// empty string — an empty stored access_code would compare equal to a
-	// missing ?code= param in accessCodeMatches, opening the file to everyone.
-	if !slugPattern.MatchString(req.AccessCode) {
-		http.Error(w, "access_code must be 1-128 chars of letters, digits, '.', '_' or '-'", http.StatusBadRequest)
+	// Same charset as the slug, and {1,128} forbids the empty string — an
+	// empty stored access_code would compare equal to a missing ?code= param in
+	// accessCodeMatches, opening the file to everyone.
+	if !validPathToken(req.AccessCode) {
+		http.Error(w, "access_code must be 1-128 chars of letters, digits, '.', '_' or '-' (and not '.' or '..')", http.StatusBadRequest)
 		return
 	}
 	name, ok := normalizeName(w, req.Name)
@@ -618,7 +662,7 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// What this edit replaces, so an in-place edit isn't charged twice against
 	// the quota. A slug that matches nothing 404s here rather than after the
 	// quota check, which keeps a missing file from being reported as a full one.
-	oldSize, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
+	old, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
 		Slug:   oldSlug,
 		UserID: user.ID,
 	})
@@ -631,18 +675,36 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if !h.checkQuota(w, r, user, int64(len(req.HTMLContent)), oldSize) {
-		return
-	}
 
-	file, err := h.queries.UpdateFile(r.Context(), sqlcgen.UpdateFileParams{
-		Name:        req.Name,
-		NewSlug:     req.Slug,
-		HtmlContent: req.HTMLContent,
-		AccessCode:  req.AccessCode,
-		Slug:        oldSlug,
-		UserID:      user.ID,
-	})
+	var file sqlcgen.File
+	if old.Kind == KindSite {
+		if req.HTMLContent != "" {
+			http.Error(w, "a site's content is replaced as a whole zip at PUT /api/files/{slug}/site", http.StatusBadRequest)
+			return
+		}
+		file, err = h.queries.UpdateSiteMeta(r.Context(), sqlcgen.UpdateSiteMetaParams{
+			Name:       req.Name,
+			NewSlug:    req.Slug,
+			AccessCode: req.AccessCode,
+			Slug:       oldSlug,
+			UserID:     user.ID,
+		})
+	} else {
+		if !validateContent(w, req.HTMLContent) {
+			return
+		}
+		if !h.checkQuota(w, r, user, int64(len(req.HTMLContent)), old.ContentSize) {
+			return
+		}
+		file, err = h.queries.UpdateFile(r.Context(), sqlcgen.UpdateFileParams{
+			Name:        req.Name,
+			NewSlug:     req.Slug,
+			HtmlContent: req.HTMLContent,
+			AccessCode:  req.AccessCode,
+			Slug:        oldSlug,
+			UserID:      user.ID,
+		})
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -1108,12 +1170,17 @@ const userContentCSP = "sandbox allow-scripts allow-forms allow-modals " +
 	"allow-top-navigation-by-user-activation"
 
 // setUserContentHeaders prepares a response carrying uploader-authored bytes.
-// Referrer-Policy is not decoration: the access code travels in the query
-// string, so without it every external image or script in a shared document
-// hands that code to a third party in the Referer header.
-func setUserContentHeaders(w http.ResponseWriter) {
+// Referrer-Policy is not decoration: the access code travels in the URL (the
+// query string of a document link, the path of a site link), so without it
+// every external image or script in a shared document hands that code to a
+// third party in the Referer header.
+//
+// A site sends this on every entry, stylesheets and scripts included: the
+// headers are harmless on a subresource, and any HTML or SVG entry opened
+// directly is a document that needs the sandbox as much as index.html does.
+func setUserContentHeaders(w http.ResponseWriter, contentType string) {
 	h := w.Header()
-	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Type", contentType)
 	// Undo the router's blanket X-Frame-Options: embedding a document you
 	// published is reasonable, and the sandbox above is what contains it.
 	h.Del("X-Frame-Options")
@@ -1178,6 +1245,10 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 	// visitor. Anonymous requests carry no cookie, so this costs them nothing.
 	user, signedIn := CurrentUser(r, h.queries)
 	owner := signedIn && user.ID == file.UserID
+	if file.Kind == KindSite {
+		h.redirectIntoSite(w, r, file, user, owner)
+		return
+	}
 	if owner || (file.IsPublic && accessCodeMatches(file.AccessCode, r.URL.Query().Get("code"))) {
 		if owner {
 			if err := h.queries.IncrementFileSuccessCount(r.Context(), file.Slug); err != nil {
@@ -1195,7 +1266,7 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 				h.logger.Warn("increment view count", "error", err)
 			}
 		}
-		setUserContentHeaders(w)
+		setUserContentHeaders(w, htmlContentType)
 		w.Write(renderContent(file.Kind, file.Name, file.HtmlContent))
 		return
 	}
@@ -1203,7 +1274,7 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 	if err := h.queries.IncrementFileFailureCount(r.Context(), file.Slug); err != nil {
 		h.logger.Warn("increment failure count", "error", err)
 	}
-	setUserContentHeaders(w)
+	setUserContentHeaders(w, htmlContentType)
 	w.WriteHeader(http.StatusForbidden)
 	w.Write([]byte(accessDeniedBody))
 }
@@ -1214,6 +1285,8 @@ func accessCodeMatches(want, got string) bool {
 	}
 	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
 }
+
+const htmlContentType = "text/html; charset=utf-8"
 
 // Download serves the raw source as a file attachment at
 // GET /api/files/{slug}/download. It returns the stored source untransformed
@@ -1244,6 +1317,11 @@ func (h *FilesHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", downloadContentType(file.Kind))
 	w.Header().Set("Content-Disposition", downloadDisposition(file.Name, file.Slug, extForKind(file.Kind)))
+	if file.Kind == KindSite {
+		// The stored archive is already the site's source, as a zip.
+		w.Write(file.Archive)
+		return
+	}
 	w.Write([]byte(file.HtmlContent))
 }
 

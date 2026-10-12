@@ -29,6 +29,24 @@ VALUES (
 )
 RETURNING *;
 
+-- A directory site: html_content stays '' and the whole directory is one zip
+-- in archive (see internal/site). content_size is again derived by the
+-- statement, from the archive this time; length() of a BLOB is bytes.
+-- name: CreateSite :one
+INSERT INTO files (slug, name, html_content, archive, content_size, kind, is_public, access_code, user_id)
+VALUES (
+    sqlc.arg(slug),
+    sqlc.arg(name),
+    '',
+    sqlc.arg(archive),
+    length(sqlc.arg(archive)),
+    'site',
+    sqlc.arg(is_public),
+    sqlc.arg(access_code),
+    sqlc.arg(user_id)
+)
+RETURNING *;
+
 -- The two listings and the name search deliberately do NOT select
 -- html_content. They used to be SELECT *, which read every document's full
 -- source out of SQLite so the handler could blank the field before encoding --
@@ -64,9 +82,10 @@ SELECT CAST(COALESCE(SUM(content_size), 0) AS INTEGER) AS used_bytes FROM files
 WHERE user_id = sqlc.arg(user_id);
 
 -- What an edit is replacing, so the quota check can subtract it instead of
--- charging the account twice for a file it already stores.
+-- charging the account twice for a file it already stores -- plus the kind,
+-- since a site is edited through different statements than a document.
 -- name: GetUserFileSize :one
-SELECT content_size FROM files
+SELECT content_size, kind FROM files
 WHERE slug = sqlc.arg(slug) AND user_id = sqlc.arg(user_id) AND deleted_at IS NULL;
 
 -- Plain substring search via instr() rather than LIKE: no wildcard/escape
@@ -132,15 +151,43 @@ RETURNING *;
 
 -- The SET slug and the WHERE slug are different values; naming both explicitly
 -- keeps them from being mixed up (and avoids sqlc's generated `Slug_2` field).
+--
+-- kind <> 'site' keeps document writes off site rows in SQL rather than in a
+-- Go check someone can forget: a site's html_content is '' by design, so a
+-- rename that wrote the unchanged "content" back would otherwise be a write
+-- of that empty string -- and a site whose archive is left alone but whose
+-- size is recomputed from html_content stops counting against the quota.
 -- name: UpdateFile :one
 UPDATE files
 SET name = sqlc.arg(name),
     slug = sqlc.arg(new_slug),
     html_content = sqlc.arg(html_content),
-    content_size = length(CAST(sqlc.arg(html_content) AS BLOB)),
+    content_size = length(CAST(sqlc.arg(html_content) AS BLOB)) + COALESCE(length(archive), 0),
     access_code = sqlc.arg(access_code),
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = sqlc.arg(slug) AND user_id = sqlc.arg(user_id) AND deleted_at IS NULL
+  AND kind <> 'site'
+RETURNING *;
+
+-- A site's counterpart to UpdateFile: the same name/slug/access-code edit,
+-- without content, which for a site is replaced only as a whole archive.
+-- name: UpdateSiteMeta :one
+UPDATE files
+SET name = sqlc.arg(name),
+    slug = sqlc.arg(new_slug),
+    access_code = sqlc.arg(access_code),
+    updated_at = CURRENT_TIMESTAMP
+WHERE slug = sqlc.arg(slug) AND user_id = sqlc.arg(user_id) AND deleted_at IS NULL
+  AND kind = 'site'
+RETURNING *;
+
+-- name: ReplaceSiteArchive :one
+UPDATE files
+SET archive = sqlc.arg(archive),
+    content_size = length(sqlc.arg(archive)),
+    updated_at = CURRENT_TIMESTAMP
+WHERE slug = sqlc.arg(slug) AND user_id = sqlc.arg(user_id) AND deleted_at IS NULL
+  AND kind = 'site'
 RETURNING *;
 
 -- Both expiry writers clear expired_at/expired_reason: that marker records the

@@ -36,6 +36,7 @@ type File struct {
 	ExpiredAt        sql.NullTime  `json:"expired_at"`
 	ExpiredReason    string        `json:"expired_reason"`
 	ContentSize      int64         `json:"content_size"`
+	Archive          []byte        `json:"archive"`
 }
 
 type Session struct {

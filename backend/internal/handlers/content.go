@@ -16,10 +16,14 @@ import (
 //   - KindHTML     — served verbatim (the original behavior).
 //   - KindMarkdown — rendered to HTML with goldmark, wrapped in a styled page.
 //   - KindText     — HTML-escaped and shown as preformatted, wrapping text.
+//   - KindSite     — a whole directory, stored as a zip in files.archive and
+//     served entry by entry under /res/{slug}/{token}/ (see sites.go). Never
+//     created through normalizeKind: sites have their own upload endpoints.
 const (
 	KindHTML     = "html"
 	KindMarkdown = "markdown"
 	KindText     = "txt"
+	KindSite     = "site"
 )
 
 // normalizeKind maps a client-supplied kind to a known value. An empty string
@@ -43,6 +47,8 @@ func extForKind(kind string) string {
 		return "md"
 	case KindText:
 		return "txt"
+	case KindSite:
+		return "zip"
 	default:
 		return "html"
 	}
@@ -56,6 +62,8 @@ func downloadContentType(kind string) string {
 		return "text/markdown; charset=utf-8"
 	case KindText:
 		return "text/plain; charset=utf-8"
+	case KindSite:
+		return "application/zip"
 	default:
 		return "text/html; charset=utf-8"
 	}

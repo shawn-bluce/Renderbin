@@ -13,6 +13,16 @@
 	import { copyText } from '$lib/clipboard';
 	import { formatSize } from '$lib/format';
 	import { getUsage, type Usage } from '$lib/api/settings';
+	import { buildZip } from '$lib/zip';
+	import {
+		planSite,
+		pickedFromEntries,
+		pickedFromInput,
+		SITE_MAX_ENTRIES,
+		SITE_MAX_UPLOAD_BYTES,
+		type PickedFile,
+		type SitePlan
+	} from '$lib/site';
 	import {
 		ApiError,
 		createFile,
@@ -23,15 +33,18 @@
 		listTrashed,
 		refreshCode,
 		renameFile,
+		replaceSite,
 		restoreFile,
 		searchFiles,
 		setExpiry,
 		setTags,
 		setVisibility,
 		updateFile,
+		uploadSite,
 		type FileItem,
 		type FileKind,
-		type SearchResult
+		type SearchResult,
+		type SiteEntry
 	} from '$lib/api/files';
 
 	let { data } = $props();
@@ -46,6 +59,7 @@
 	let uploading = $state(false);
 	let errorMessage = $state<string | null>(null);
 	let fileInput = $state<HTMLInputElement | null>(null);
+	let folderInput = $state<HTMLInputElement | null>(null);
 	let isDraggingOver = $state(false);
 	let dragCounter = 0;
 
@@ -174,6 +188,12 @@
 	let editContentOpen = $state(false);
 	let editBusy = $state(false);
 	let editError = $state<string | null>(null);
+	// Sites have no source to edit: the modal lists their files instead and
+	// offers to replace them wholesale, right away (not on Save).
+	let editEntries = $state<SiteEntry[]>([]);
+	let editNotice = $state<string | null>(null);
+	let replaceZipInput = $state<HTMLInputElement | null>(null);
+	let replaceFolderInput = $state<HTMLInputElement | null>(null);
 
 	// Expiry modal. A ttl is an amount plus a unit ("1d", "36h", "6mo"), the
 	// same grammar the API speaks, so the picker is free-form rather than a
@@ -372,18 +392,87 @@
 	function kindIcon(kind: FileKind): string {
 		if (kind === 'markdown') return 'lucide:file-type';
 		if (kind === 'txt') return 'lucide:file-text';
+		if (kind === 'site') return 'lucide:folder';
 		return 'lucide:file-code-2';
 	}
 
 	function kindLabel(kind: FileKind): string {
 		if (kind === 'markdown') return 'MD';
 		if (kind === 'txt') return 'TXT';
+		if (kind === 'site') return 'SITE';
 		return 'HTML';
 	}
 
 	function downloadName(file: FileItem): string {
-		const ext = file.kind === 'markdown' ? 'md' : file.kind === 'txt' ? 'txt' : 'html';
+		const ext =
+			file.kind === 'markdown'
+				? 'md'
+				: file.kind === 'txt'
+					? 'txt'
+					: file.kind === 'site'
+						? 'zip'
+						: 'html';
 		return `${file.name}.${ext}`;
+	}
+
+	function isZip(f: File): boolean {
+		return /\.zip$/i.test(f.name) || f.type === 'application/zip';
+	}
+
+	function sitePlanError(plan: Exclude<SitePlan, { ok: true }>): string {
+		switch (plan.reason) {
+			case 'empty':
+				return t('site.error.empty');
+			case 'noIndex':
+				return t('site.error.noIndex');
+			case 'tooMany':
+				return t('site.error.tooMany', { n: SITE_MAX_ENTRIES });
+			case 'tooLarge':
+				return t('site.error.tooLarge');
+		}
+	}
+
+	// A picked or dropped folder, checked against the site rules and zipped
+	// for upload -- or the reason it cannot be. The server re-checks all of it.
+	async function zipFolder(picked: PickedFile[]): Promise<Blob | string> {
+		const plan = planSite(picked);
+		if (!plan.ok) return sitePlanError(plan);
+		const entries = await Promise.all(
+			plan.files.map(async (f) => ({
+				path: f.path,
+				data: new Uint8Array(await f.file.arrayBuffer())
+			}))
+		);
+		return new Blob([buildZip(entries)], { type: 'application/zip' });
+	}
+
+	// Uploads one folder as a site. Named after its index.html <title> by the
+	// server; editable inline afterwards like any file.
+	async function uploadFolder(picked: PickedFile[]) {
+		if (uploading) return;
+		errorMessage = null;
+		uploading = true;
+		try {
+			const zip = await zipFolder(picked);
+			if (typeof zip === 'string') {
+				errorMessage = zip;
+				return;
+			}
+			const created = await uploadSite(null, zip);
+			files = [created, ...files];
+			await refreshUsage();
+		} catch (err) {
+			errorMessage = err instanceof Error ? err.message : t('note.failed', { n: 1 });
+		} finally {
+			uploading = false;
+		}
+	}
+
+	async function onFolderSelected(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		if (!input.files || input.files.length === 0) return;
+		await uploadFolder(pickedFromInput(input.files));
+		input.value = '';
 	}
 
 	function sourceLabel(kind: FileKind | undefined): string {
@@ -410,14 +499,18 @@
 	async function uploadMany(fileList: FileList | File[]) {
 		if (uploading) return;
 
+		// A .zip is a whole site and goes to the site endpoint as-is; the
+		// server unpacks and checks it.
 		const all = Array.from(fileList);
-		const candidates = all
+		const zips = all.filter(isZip);
+		const docs = all.filter((f) => !isZip(f));
+		const candidates = docs
 			.map((file) => ({ file, kind: detectKind(file) }))
 			.filter((c): c is { file: File; kind: FileKind } => c.kind !== null);
-		const skippedCount = all.length - candidates.length;
+		const skippedCount = docs.length - candidates.length;
 		const accepted = candidates.filter((c) => c.file.size <= MAX_HTML_BYTES);
 		const oversizeCount = candidates.length - accepted.length;
-		if (accepted.length === 0) {
+		if (accepted.length === 0 && zips.length === 0) {
 			errorMessage =
 				oversizeCount > 0 ? t('error.oversizeOnly', { n: oversizeCount }) : t('error.noSupported');
 			return;
@@ -426,6 +519,7 @@
 		errorMessage = null;
 		uploading = true;
 		const created: FileItem[] = [];
+		const notes: string[] = [];
 		let failedCount = 0;
 		try {
 			for (const { file, kind } of accepted) {
@@ -435,15 +529,34 @@
 					failedCount++;
 				}
 			}
+			// Site failures are reported by name with the server's reason
+			// ("needs an index.html", "not UTF-8", ...): a bare count would leave
+			// the user guessing what to fix in their zip.
+			for (const zip of zips) {
+				if (zip.size > SITE_MAX_UPLOAD_BYTES) {
+					notes.push(t('site.error.zipTooLarge', { name: zip.name }));
+					continue;
+				}
+				try {
+					created.push(await uploadSite(null, zip));
+				} catch (err) {
+					notes.push(
+						t('note.siteFailed', {
+							name: zip.name,
+							reason: err instanceof Error ? err.message : ''
+						})
+					);
+				}
+			}
 		} finally {
 			uploading = false;
 		}
 
 		if (created.length > 0) {
 			files = [...created, ...files];
+			await refreshUsage();
 		}
 
-		const notes: string[] = [];
 		if (skippedCount > 0) {
 			notes.push(t('note.skipped', { n: skippedCount }));
 		}
@@ -487,9 +600,31 @@
 		e.preventDefault();
 		dragCounter = 0;
 		isDraggingOver = false;
-		const dropped = e.dataTransfer?.files;
-		if (!dropped || dropped.length === 0) return;
-		await uploadMany(dropped);
+		// Folders can only be told apart through the entry API, and the item
+		// list is emptied once this handler yields -- so sort everything into
+		// folders and loose files before the first await.
+		const folders: FileSystemEntry[] = [];
+		const loose: File[] = [];
+		for (const item of Array.from(e.dataTransfer?.items ?? [])) {
+			if (item.kind !== 'file') continue;
+			const entry = item.webkitGetAsEntry?.();
+			if (entry?.isDirectory) {
+				folders.push(entry);
+			} else {
+				const file = item.getAsFile();
+				if (file) loose.push(file);
+			}
+		}
+		if (folders.length === 0 && loose.length === 0) {
+			const dropped = e.dataTransfer?.files;
+			if (dropped && dropped.length > 0) await uploadMany(dropped);
+			return;
+		}
+		// Each dropped folder becomes its own site.
+		for (const folder of folders) {
+			await uploadFolder(await pickedFromEntries([folder]));
+		}
+		if (loose.length > 0) await uploadMany(loose);
 	}
 
 	async function switchTab(next: 'files' | 'trashed') {
@@ -587,11 +722,14 @@
 		editContent = '';
 		editContentOpen = false;
 		editError = null;
+		editNotice = null;
+		editEntries = [];
 		editBusy = true;
 		editOpen = true;
 		try {
 			const full = await getFile(file.slug);
 			editContent = full.html_content ?? '';
+			editEntries = full.entries ?? [];
 		} catch (err) {
 			editError = err instanceof Error ? err.message : t('error.loadContent');
 		} finally {
@@ -604,26 +742,81 @@
 		editFile = null;
 	}
 
+	// Swaps a site's whole content for a new folder or zip. Takes effect
+	// immediately, independent of the modal's Save, which only covers the
+	// title, slug and access code.
+	async function replaceSiteWith(source: Blob | PickedFile[]) {
+		if (!editFile || editBusy) return;
+		editError = null;
+		editNotice = null;
+		editBusy = true;
+		try {
+			let zip: Blob | string;
+			if (source instanceof Blob) {
+				zip =
+					source.size > SITE_MAX_UPLOAD_BYTES
+						? t('site.error.zipTooLarge', { name: (source as File).name ?? '' })
+						: source;
+			} else {
+				zip = await zipFolder(source);
+			}
+			if (typeof zip === 'string') {
+				editError = zip;
+				return;
+			}
+			const updated = await replaceSite(editFile.slug, zip);
+			editEntries = updated.entries ?? [];
+			const slug = editFile.slug;
+			files = files.map((f) => (f.slug === slug ? { ...updated, entries: undefined } : f));
+			editNotice = t('site.replaced');
+			await refreshUsage();
+		} catch (err) {
+			editError = err instanceof Error ? err.message : t('error.save');
+		} finally {
+			editBusy = false;
+		}
+	}
+
+	async function onReplaceZip(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		const file = input.files?.[0];
+		input.value = '';
+		if (file) await replaceSiteWith(file);
+	}
+
+	async function onReplaceFolder(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		const picked = input.files && input.files.length > 0 ? pickedFromInput(input.files) : null;
+		input.value = '';
+		if (picked) await replaceSiteWith(picked);
+	}
+
 	async function saveEdit() {
 		if (!editFile) return;
 		const name = editTitle.trim() || t('untitled');
+		// '.' and '..' pass the charset but would vanish from a site's URL,
+		// where the slug and the code are both path segments.
+		const validToken = (v: string) => /^[A-Za-z0-9._-]{1,128}$/.test(v) && v !== '.' && v !== '..';
 		const slug = editSlug.trim();
-		if (!/^[A-Za-z0-9._-]{1,128}$/.test(slug)) {
+		if (!validToken(slug)) {
 			editError = t('error.slug');
 			return;
 		}
 		const access_code = editCode.trim();
-		if (!/^[A-Za-z0-9._-]{1,128}$/.test(access_code)) {
+		if (!validToken(access_code)) {
 			editError = t('error.accessCode');
 			return;
 		}
-		if (!editContent) {
-			editError = t('error.contentRequired');
-			return;
-		}
-		if (new Blob([editContent]).size > MAX_HTML_BYTES) {
-			editError = t('error.contentTooLarge');
-			return;
+		const isSite = editFile.kind === 'site';
+		if (!isSite) {
+			if (!editContent) {
+				editError = t('error.contentRequired');
+				return;
+			}
+			if (new Blob([editContent]).size > MAX_HTML_BYTES) {
+				editError = t('error.contentTooLarge');
+				return;
+			}
 		}
 		editError = null;
 		editBusy = true;
@@ -632,7 +825,7 @@
 			const updated = await updateFile(oldSlug, {
 				name,
 				slug,
-				html_content: editContent,
+				...(isSite ? {} : { html_content: editContent }),
 				access_code
 			});
 			files = files.map((f) => (f.slug === oldSlug ? updated : f));
@@ -1023,13 +1216,30 @@
 						/>
 						{uploading ? t('upload.uploading') : t('upload.button')}
 					</button>
+					<button
+						onclick={() => folderInput?.click()}
+						disabled={uploading}
+						title={t('upload.folderTitle')}
+						class="flex items-center gap-2 rounded-lg bg-neutral-800 px-4 py-2 text-sm font-medium
+							text-neutral-200 transition-colors hover:bg-neutral-700 disabled:opacity-50"
+					>
+						<Icon icon="lucide:folder-up" width="16" height="16" />
+						{t('upload.folder')}
+					</button>
 					<input
 						bind:this={fileInput}
 						type="file"
-						accept=".html,.htm,.md,.markdown,.txt,.text,text/html,text/markdown,text/plain"
+						accept=".html,.htm,.md,.markdown,.txt,.text,.zip,text/html,text/markdown,text/plain,application/zip"
 						multiple
 						class="hidden"
 						onchange={onFileSelected}
+					/>
+					<input
+						bind:this={folderInput}
+						type="file"
+						webkitdirectory
+						class="hidden"
+						onchange={onFolderSelected}
 					/>
 				</div>
 				<p class="text-xs text-neutral-600">{t('upload.hint')}</p>
@@ -1697,29 +1907,83 @@
 				/>
 			</label>
 
-			<div class="flex min-h-0 flex-col gap-1">
-				<button
-					onclick={() => (editContentOpen = !editContentOpen)}
-					title={t('edit.toggleContent')}
-					aria-expanded={editContentOpen}
-					class="flex items-center gap-1 self-start text-xs font-medium text-neutral-400 transition-colors hover:text-neutral-200"
-				>
-					<Icon
-						icon={editContentOpen ? 'lucide:chevron-down' : 'lucide:chevron-right'}
-						width="14"
-						height="14"
-					/>
-					{sourceLabel(editFile?.kind)}
-				</button>
-				{#if editContentOpen}
-					<textarea
-						bind:value={editContent}
-						disabled={editBusy}
-						spellcheck="false"
-						class="min-h-[240px] flex-1 resize-none rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-xs text-neutral-100 outline-none focus:border-emerald-500 disabled:opacity-50"
-					></textarea>
-				{/if}
-			</div>
+			{#if editFile?.kind === 'site'}
+				<div class="flex min-h-0 flex-col gap-2">
+					<span class="text-xs font-medium text-neutral-400">
+						{t('site.files', { n: editEntries.length })}
+					</span>
+					<ul
+						class="max-h-56 min-h-0 overflow-auto rounded-lg border border-neutral-800 bg-neutral-950 py-1 font-mono text-xs"
+					>
+						{#each editEntries as entry (entry.path)}
+							<li class="flex items-center justify-between gap-4 px-3 py-0.5 text-neutral-300">
+								<span class="truncate">{entry.path}</span>
+								<span class="shrink-0 text-neutral-600">{formatSize(entry.size)}</span>
+							</li>
+						{/each}
+					</ul>
+					<div class="flex flex-wrap items-center gap-2">
+						<button
+							onclick={() => replaceFolderInput?.click()}
+							disabled={editBusy}
+							class="flex items-center gap-1.5 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700 disabled:opacity-50"
+						>
+							<Icon icon="lucide:folder-up" width="14" height="14" />
+							{t('site.replaceFolder')}
+						</button>
+						<button
+							onclick={() => replaceZipInput?.click()}
+							disabled={editBusy}
+							class="flex items-center gap-1.5 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700 disabled:opacity-50"
+						>
+							<Icon icon="lucide:file-archive" width="14" height="14" />
+							{t('site.replaceZip')}
+						</button>
+						<input
+							bind:this={replaceFolderInput}
+							type="file"
+							webkitdirectory
+							class="hidden"
+							onchange={onReplaceFolder}
+						/>
+						<input
+							bind:this={replaceZipInput}
+							type="file"
+							accept=".zip,application/zip"
+							class="hidden"
+							onchange={onReplaceZip}
+						/>
+					</div>
+					<p class="text-xs text-neutral-600">{t('site.replaceHint')}</p>
+					{#if editNotice}
+						<p class="text-xs text-emerald-400">{editNotice}</p>
+					{/if}
+				</div>
+			{:else}
+				<div class="flex min-h-0 flex-col gap-1">
+					<button
+						onclick={() => (editContentOpen = !editContentOpen)}
+						title={t('edit.toggleContent')}
+						aria-expanded={editContentOpen}
+						class="flex items-center gap-1 self-start text-xs font-medium text-neutral-400 transition-colors hover:text-neutral-200"
+					>
+						<Icon
+							icon={editContentOpen ? 'lucide:chevron-down' : 'lucide:chevron-right'}
+							width="14"
+							height="14"
+						/>
+						{sourceLabel(editFile?.kind)}
+					</button>
+					{#if editContentOpen}
+						<textarea
+							bind:value={editContent}
+							disabled={editBusy}
+							spellcheck="false"
+							class="min-h-[240px] flex-1 resize-none rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-xs text-neutral-100 outline-none focus:border-emerald-500 disabled:opacity-50"
+						></textarea>
+					{/if}
+				</div>
+			{/if}
 
 			{#if editError}
 				<div

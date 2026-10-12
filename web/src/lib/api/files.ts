@@ -1,4 +1,15 @@
-export type FileKind = 'html' | 'markdown' | 'txt';
+/**
+ * A file's format. 'site' is a whole directory (index.html plus the pages,
+ * styles and scripts it uses) stored as one zip; it is created only through
+ * `uploadSite`, never through `createFile`.
+ */
+export type FileKind = 'html' | 'markdown' | 'txt' | 'site';
+
+/** One file inside a site. */
+export interface SiteEntry {
+	path: string;
+	size: number;
+}
 
 export interface FileItem {
 	slug: string;
@@ -25,6 +36,8 @@ export interface FileItem {
 	 */
 	expired_at?: string | null;
 	expired_reason?: '' | 'ttl' | 'views';
+	/** A site's files; only `getFile` and the site endpoints return them. */
+	entries?: SiteEntry[];
 }
 
 // ApiError keeps the HTTP status so callers can map known failures (e.g. a
@@ -92,9 +105,13 @@ export function getFile(slug: string): Promise<FileItem> {
 	return fetch(`/api/files/${slug}`).then((res) => unwrap<FileItem>(res));
 }
 
+/**
+ * Edits a file's name, slug and access code, and -- for a document -- its
+ * content. A site takes no html_content here; see `replaceSite`.
+ */
 export function updateFile(
 	slug: string,
-	fields: { name: string; slug: string; html_content: string; access_code: string }
+	fields: { name: string; slug: string; html_content?: string; access_code: string }
 ): Promise<FileItem> {
 	return fetch(`/api/files/${slug}`, {
 		method: 'PATCH',
@@ -171,4 +188,27 @@ export async function deleteFilePermanent(slug: string): Promise<void> {
  */
 export function emptyTrash(): Promise<{ deleted: number }> {
 	return fetch('/api/trash', { method: 'DELETE' }).then((res) => unwrap<{ deleted: number }>(res));
+}
+
+/**
+ * Uploads a directory site as a zip. `name` may be null: the server then names
+ * the site after the <title> of its index.html. Lives at /api/sites rather
+ * than under /api/files for the same reason as `searchFiles`.
+ */
+export function uploadSite(name: string | null, zip: Blob): Promise<FileItem> {
+	const query = name ? `?${new URLSearchParams({ name })}` : '';
+	return fetch(`/api/sites${query}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/zip' },
+		body: zip
+	}).then((res) => unwrap<FileItem>(res));
+}
+
+/** Replaces a site's whole content with a new zip. */
+export function replaceSite(slug: string, zip: Blob): Promise<FileItem> {
+	return fetch(`/api/files/${slug}/site`, {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/zip' },
+		body: zip
+	}).then((res) => unwrap<FileItem>(res));
 }

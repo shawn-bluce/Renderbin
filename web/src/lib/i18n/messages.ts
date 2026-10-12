@@ -20,8 +20,25 @@ export const en = {
 	// Upload
 	'upload.button': 'Upload',
 	'upload.uploading': 'Uploading…',
-	'upload.hint': 'or drag & drop .html, .md, or .txt files anywhere',
-	'upload.dropOverlay': 'Drop files to upload',
+	'upload.hint': 'or drag & drop .html, .md, .txt files, a folder or a .zip anywhere',
+	'upload.dropOverlay': 'Drop files or a folder to upload',
+	'upload.folder': 'Upload folder',
+	'upload.folderTitle':
+		'Upload a folder with an index.html at its top as one multi-page site; its pages can link to each other with relative paths',
+
+	// Directory sites
+	'site.error.empty': 'The folder has no files to upload.',
+	'site.error.noIndex': 'A site needs an index.html at the top of its folder.',
+	'site.error.tooMany': 'A site may hold at most {n} files.',
+	'site.error.tooLarge': 'A site may be at most 5MB in total.',
+	'site.error.zipTooLarge': '"{name}" is over 8MB and cannot be uploaded.',
+	'site.files': 'Files ({n})',
+	'site.replaceFolder': 'Replace with folder',
+	'site.replaceZip': 'Replace with .zip',
+	'site.replacing': 'Replacing…',
+	'site.replaceHint':
+		'Replaces every file of the site right away. The link, access code, visibility and expiry stay as they are.',
+	'site.replaced': 'Site content replaced.',
 
 	// New-file modal
 	'create.button': 'New',
@@ -148,10 +165,12 @@ export const en = {
 	'note.skipped': 'skipped {n} unsupported files',
 	'note.oversize': '{n} files over 5MB',
 	'note.failed': '{n} uploads failed',
+	'note.siteFailed': '{name}: {reason}',
 	'error.loadTrash': 'Failed to load trash',
 	'error.restore': 'Failed to restore',
 	'error.loadContent': 'Failed to load content',
-	'error.slug': "Slug must be 1-128 chars of letters, digits, '.', '_' or '-'.",
+	'error.slug':
+		"Slug must be 1-128 chars of letters, digits, '.', '_' or '-', and not '.' or '..'.",
 	'error.contentRequired': 'Content is required.',
 	'error.contentTooLarge': 'Content exceeds 5MB.',
 	'error.save': 'Failed to save',
@@ -165,7 +184,8 @@ export const en = {
 	'error.rename': 'Failed to rename',
 	'error.deletePermanent': 'Failed to permanently delete',
 	'error.slugTaken': 'This slug is already taken — pick a different one.',
-	'error.accessCode': "Access code must be 1-128 chars of letters, digits, '.', '_' or '-'.",
+	'error.accessCode':
+		"Access code must be 1-128 chars of letters, digits, '.', '_' or '-', and not '.' or '..'.",
 	'confirm.delete': 'Move "{name}" to the trash? You can restore it from the Trash tab.',
 	'confirm.refreshCode':
 		'Issue a new access code for "{name}"? Every link already shared for this file stops working, and the old code cannot be recovered.',
@@ -362,8 +382,24 @@ export const zh = {
 	// Upload
 	'upload.button': '上传',
 	'upload.uploading': '上传中…',
-	'upload.hint': '或将 .html、.md、.txt 文件拖放到任意位置',
-	'upload.dropOverlay': '拖放文件以上传',
+	'upload.hint': '或将 .html、.md、.txt 文件、文件夹或 .zip 拖放到任意位置',
+	'upload.dropOverlay': '拖放文件或文件夹以上传',
+	'upload.folder': '上传文件夹',
+	'upload.folderTitle':
+		'把顶层带 index.html 的文件夹上传为一个多页面站点，页面之间可以用相对路径互相链接',
+
+	// Directory sites
+	'site.error.empty': '文件夹里没有可上传的文件。',
+	'site.error.noIndex': '站点的文件夹顶层必须有 index.html。',
+	'site.error.tooMany': '一个站点最多 {n} 个文件。',
+	'site.error.tooLarge': '一个站点总大小不能超过 5MB。',
+	'site.error.zipTooLarge': '“{name}”超过 8MB，无法上传。',
+	'site.files': '文件（{n}）',
+	'site.replaceFolder': '用文件夹替换',
+	'site.replaceZip': '用 .zip 替换',
+	'site.replacing': '替换中…',
+	'site.replaceHint': '立即替换站点的全部文件。链接、访问码、可见性和过期设置保持不变。',
+	'site.replaced': '站点内容已替换。',
 
 	// New-file modal
 	'create.button': '新建',
@@ -487,10 +523,12 @@ export const zh = {
 	'note.skipped': '跳过 {n} 个不支持的文件',
 	'note.oversize': '{n} 个文件超过 5MB',
 	'note.failed': '{n} 个上传失败',
+	'note.siteFailed': '{name}：{reason}',
 	'error.loadTrash': '加载回收站失败',
 	'error.restore': '恢复失败',
 	'error.loadContent': '加载内容失败',
-	'error.slug': "链接标识必须为 1-128 个字符，仅含字母、数字、'.'、'_' 或 '-'。",
+	'error.slug':
+		"链接标识必须为 1-128 个字符，仅含字母、数字、'.'、'_' 或 '-'，且不能是 '.' 或 '..'。",
 	'error.contentRequired': '内容不能为空。',
 	'error.contentTooLarge': '内容超过 5MB。',
 	'error.save': '保存失败',
@@ -504,7 +542,8 @@ export const zh = {
 	'error.rename': '重命名失败',
 	'error.deletePermanent': '永久删除失败',
 	'error.slugTaken': '该链接标识已被占用，请换一个。',
-	'error.accessCode': "访问码必须为 1-128 个字符，仅含字母、数字、'.'、'_' 或 '-'。",
+	'error.accessCode':
+		"访问码必须为 1-128 个字符，仅含字母、数字、'.'、'_' 或 '-'，且不能是 '.' 或 '..'。",
 	'confirm.delete': '将“{name}”移入回收站？可以在回收站标签页中恢复。',
 	'confirm.refreshCode':
 		'为“{name}”生成新的访问码？此文件已分享出去的所有链接都会立即失效，且旧访问码无法找回。',

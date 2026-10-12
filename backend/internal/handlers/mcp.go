@@ -17,6 +17,7 @@ import (
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
+	"github.com/shawn-bluce/renderbin/backend/internal/site"
 )
 
 const (
@@ -39,13 +40,17 @@ var errFileNotFound = errors.New("file not found in this project")
 // endpoint is gated on the mcp_enabled config.
 type MCPHandler struct {
 	queries *sqlcgen.Queries
-	logger  *slog.Logger
+	// conn is here only for update_site, which reads a site's archive, merges
+	// the patch into it and writes it back: in one transaction, so two agents
+	// editing the same site cannot each overwrite the other's change.
+	conn   *sql.DB
+	logger *slog.Logger
 }
 
 // NewMCPHandler builds the /mcp http.Handler: body cap → mcp_enabled gate →
-// Bearer-token auth → streamable MCP server with the eight file tools.
-func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
-	m := &MCPHandler{queries: queries, logger: logger}
+// Bearer-token auth → streamable MCP server with the ten file tools.
+func NewMCPHandler(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handler {
+	m := &MCPHandler{queries: queries, conn: conn, logger: logger}
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "renderbin", Version: buildinfo.Version}, nil)
 	mcp.AddTool(srv, &mcp.Tool{
@@ -56,6 +61,17 @@ func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
 		Name:        "upload_files",
 		Description: "Upload up to 20 Markdown or HTML documents in one call. Files start private; returns each file's URL.",
 	}, m.uploadFiles)
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "upload_site",
+		Description: "Upload a small multi-page website: index.html plus the other pages, stylesheets, scripts and data files it uses, each given by its path inside the site. " +
+			"Pages may link to and load each other with relative paths (\"css/style.css\", \"docs/intro.html\", \"../index.html\"); paths starting with \"/\" will NOT resolve. " +
+			"Text files only, at most 200 files and 5MB in total. The site starts private; publish it with publish_file like any document. Use update_site to change it later.",
+	}, m.uploadSite)
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "update_site",
+		Description: "Change an existing site by patching it: put adds or overwrites the listed files, delete removes paths; every file you do not mention stays exactly as it is, so send only what changed. " +
+			"Can also rename the site. The slug, access code and URL stay the same.",
+	}, m.updateSite)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "list_files",
 		Description: "List your own documents, newest first, with each one's slug, format, visibility and access URL. Use search_files instead when you know part of a name or its content.",
@@ -479,6 +495,13 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, mcpFileInfo{}, err
 	}
+	// A site has no single document to write; its html_content is '' by
+	// design. UpdateFile would match no row anyway (kind <> 'site' in SQL),
+	// but that would read as an internal error rather than a pointer to the
+	// right tool.
+	if file.Kind == KindSite {
+		return nil, mcpFileInfo{}, errors.New("this is a site; use update_site to change its files or name")
+	}
 
 	name := file.Name
 	if in.Name != "" {
@@ -647,4 +670,148 @@ func (m *MCPHandler) deleteFile(ctx context.Context, req *mcp.CallToolRequest, i
 	}
 	out.Deleted = true
 	return textResult("Moved %q to the trash. It can be restored from the web UI; permanent deletion is not available over MCP.", out.Name), out, nil
+}
+
+// --- sites ---
+
+type mcpSiteFile struct {
+	Path    string `json:"path" jsonschema:"path inside the site, relative and using / (e.g. index.html, css/style.css, docs/intro.html)"`
+	Content string `json:"content" jsonschema:"the file's full text content"`
+}
+
+type uploadSiteInput struct {
+	Name  string        `json:"name,omitempty" jsonschema:"display name; defaults to the <title> of index.html"`
+	Files []mcpSiteFile `json:"files" jsonschema:"every file of the site, including index.html at the root; at most 200 files and 5MB in total"`
+}
+
+type siteOutput struct {
+	mcpFileInfo
+	Files []site.EntryInfo `json:"files" jsonschema:"every file the site now holds"`
+}
+
+func siteEntries(files []mcpSiteFile) []site.Entry {
+	entries := make([]site.Entry, 0, len(files))
+	for _, f := range files {
+		entries = append(entries, site.Entry{Path: f.Path, Data: []byte(f.Content)})
+	}
+	return entries
+}
+
+// siteToolError passes a problem with the agent's input through as the tool
+// error and logs anything else, which the agent only sees as "internal error".
+func (m *MCPHandler) siteToolError(op string, err error) error {
+	if site.IsUserError(err) || errors.Is(err, errOverQuota) {
+		return err
+	}
+	m.logger.Error("mcp "+op, "error", err)
+	return errors.New("internal error")
+}
+
+func (m *MCPHandler) uploadSite(ctx context.Context, req *mcp.CallToolRequest, in uploadSiteInput) (*mcp.CallToolResult, siteOutput, error) {
+	user, baseURL, err := mcpIdentity(req)
+	if err != nil {
+		return nil, siteOutput{}, err
+	}
+	// The same validation and limits as a zip uploaded over HTTP: both go
+	// through site.Normalize.
+	entries, err := site.Normalize(siteEntries(in.Files))
+	if err != nil {
+		return nil, siteOutput{}, err
+	}
+	name, err := siteName(in.Name, entries)
+	if err != nil {
+		return nil, siteOutput{}, err
+	}
+	// Private, like every MCP upload: publish_file is the consent step.
+	file, err := storeNewSite(ctx, m.queries, user, name, entries, false)
+	if err != nil {
+		return nil, siteOutput{}, m.siteToolError("upload site", err)
+	}
+
+	out := siteOutput{mcpFileInfo: fileInfo(baseURL, file), Files: site.Infos(entries)}
+	return textResult("Uploaded site %q with %d file(s) (private). URL: %s — call publish_file with slug %q to make it publicly viewable.",
+		out.Name, len(entries), out.URL, out.Slug), out, nil
+}
+
+type updateSiteInput struct {
+	Slug   string        `json:"slug" jsonschema:"the site's slug (the path segment of its URL)"`
+	Name   string        `json:"name,omitempty" jsonschema:"new display name; omit to keep the current one"`
+	Put    []mcpSiteFile `json:"put,omitempty" jsonschema:"files to add or overwrite; files not listed are kept unchanged"`
+	Delete []string      `json:"delete,omitempty" jsonschema:"paths of files to remove; index.html cannot be removed"`
+}
+
+func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, in updateSiteInput) (*mcp.CallToolResult, siteOutput, error) {
+	user, baseURL, err := mcpIdentity(req)
+	if err != nil {
+		return nil, siteOutput{}, err
+	}
+	name := strings.TrimSpace(in.Name)
+	if name == "" && len(in.Put) == 0 && len(in.Delete) == 0 {
+		return nil, siteOutput{}, errors.New("provide name, put or delete")
+	}
+	if len(name) > maxNameBytes {
+		return nil, siteOutput{}, fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	}
+
+	// Read, merge and write back in one transaction. The server runs a single
+	// database connection, so nothing else interleaves -- and every query in
+	// here must go through q, or it would wait forever for the connection
+	// this transaction holds.
+	tx, err := m.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, siteOutput{}, m.siteToolError("begin update site", err)
+	}
+	defer tx.Rollback()
+	q := m.queries.WithTx(tx)
+
+	file, err := q.GetUserFileBySlug(ctx, sqlcgen.GetUserFileBySlugParams{Slug: in.Slug, UserID: user.ID})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, siteOutput{}, errFileNotFound
+	}
+	if err != nil {
+		return nil, siteOutput{}, m.siteToolError("get site", err)
+	}
+	if file.Kind != KindSite {
+		return nil, siteOutput{}, errors.New("this is a single document, not a site; use update_file")
+	}
+
+	arc, err := site.Open(file.Archive)
+	if err != nil {
+		return nil, siteOutput{}, m.siteToolError("open site", err)
+	}
+	listing := arc.List()
+	if len(in.Put) > 0 || len(in.Delete) > 0 {
+		old, err := arc.Entries()
+		if err != nil {
+			return nil, siteOutput{}, m.siteToolError("read site", err)
+		}
+		merged, err := site.Merge(old, siteEntries(in.Put), in.Delete)
+		if err != nil {
+			return nil, siteOutput{}, err
+		}
+		archive, err := site.Pack(merged)
+		if err != nil {
+			return nil, siteOutput{}, m.siteToolError("pack site", err)
+		}
+		if err := enforceQuota(ctx, q, user, int64(len(archive)), file.ContentSize); err != nil {
+			return nil, siteOutput{}, m.siteToolError("check quota", err)
+		}
+		file, err = q.ReplaceSiteArchive(ctx, sqlcgen.ReplaceSiteArchiveParams{Archive: archive, Slug: file.Slug, UserID: user.ID})
+		if err != nil {
+			return nil, siteOutput{}, m.siteToolError("replace site", err)
+		}
+		listing = site.Infos(merged)
+	}
+	if name != "" {
+		file, err = q.RenameFile(ctx, sqlcgen.RenameFileParams{Name: name, Slug: file.Slug, UserID: user.ID})
+		if err != nil {
+			return nil, siteOutput{}, m.siteToolError("rename site", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, siteOutput{}, m.siteToolError("commit update site", err)
+	}
+
+	out := siteOutput{mcpFileInfo: fileInfo(baseURL, file), Files: listing}
+	return textResult("Updated site %q (%d file(s)). URL: %s", out.Name, len(listing), out.URL), out, nil
 }
