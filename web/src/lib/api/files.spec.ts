@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from './http';
 import {
-	ApiError,
 	createFile,
 	deleteFile,
 	deleteFilePermanent,
@@ -27,7 +27,7 @@ function okJson(body: unknown): Response {
 	} as unknown as Response;
 }
 
-function errText(status: number, text: string): Response {
+function failure(status: number, text: string): Response {
 	return {
 		ok: false,
 		status,
@@ -185,17 +185,17 @@ describe('files api — request shapes', () => {
 
 describe('files api — error handling', () => {
 	it('unwrap throws the response body text on non-ok', async () => {
-		mockFetch(errText(500, 'boom'));
+		mockFetch(failure(500, 'boom'));
 		await expect(listFiles()).rejects.toThrow('boom');
 	});
 
 	it('deleteFile throws the response body text on non-ok', async () => {
-		mockFetch(errText(409, 'cannot delete'));
+		mockFetch(failure(409, 'cannot delete'));
 		await expect(deleteFile('a')).rejects.toThrow('cannot delete');
 	});
 
 	it('throws an ApiError carrying the status, with the message trimmed', async () => {
-		mockFetch(errText(409, 'slug already taken\n'));
+		mockFetch(failure(409, 'slug already taken\n'));
 		const err = await listFiles().catch((e: unknown) => e);
 		expect(err).toBeInstanceOf(ApiError);
 		expect((err as ApiError).status).toBe(409);
@@ -218,7 +218,7 @@ describe('searchFiles', () => {
 	});
 
 	it('throws ApiError on failure', async () => {
-		mockFetch(errText(500, 'internal error'));
+		mockFetch(failure(500, 'internal error'));
 		await expect(searchFiles('x', false)).rejects.toBeInstanceOf(ApiError);
 	});
 });

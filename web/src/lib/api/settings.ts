@@ -1,4 +1,4 @@
-import { AuthApiError } from './auth';
+import { api, apiVoid } from './http';
 
 export interface Settings {
 	allow_registration: boolean;
@@ -6,25 +6,13 @@ export interface Settings {
 	upload_default_public: boolean;
 }
 
-export async function getSettings(fetchFn: typeof fetch = fetch): Promise<Settings> {
-	const res = await fetchFn('/api/settings');
-	if (!res.ok) {
-		throw new AuthApiError(res.status, 'Failed to load settings');
-	}
-	return res.json();
+export function getSettings(f?: typeof fetch): Promise<Settings> {
+	return api('/api/settings', { fetch: f });
 }
 
 /** Super-admin only; fields are optional so a single toggle can be sent alone. */
-export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
-	const res = await fetch('/api/settings', {
-		method: 'PUT',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(patch)
-	});
-	if (!res.ok) {
-		throw new AuthApiError(res.status, await res.text());
-	}
-	return res.json();
+export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
+	return api('/api/settings', { method: 'PUT', json: patch });
 }
 
 export interface Usage {
@@ -38,13 +26,8 @@ export interface Usage {
  * this one runs an aggregate. Counts trashed files, matching what the server
  * enforces on upload, so the figure shown is the figure that will be applied.
  */
-export function getUsage(fetchFn: typeof fetch = fetch): Promise<Usage> {
-	return fetchFn('/api/user/usage').then(async (res) => {
-		if (!res.ok) {
-			throw new AuthApiError(res.status, (await res.text()).trim());
-		}
-		return res.json();
-	});
+export function getUsage(f?: typeof fetch): Promise<Usage> {
+	return api('/api/user/usage', { fetch: f });
 }
 
 export interface ProfilePatch {
@@ -53,34 +36,23 @@ export interface ProfilePatch {
 	new_password?: string;
 }
 
-export async function updateProfile(patch: ProfilePatch): Promise<void> {
-	const res = await fetch('/api/user', {
-		method: 'PATCH',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(patch)
-	});
-	if (!res.ok) {
-		throw new AuthApiError(res.status, await res.text());
-	}
+export function updateProfile(patch: ProfilePatch): Promise<void> {
+	return apiVoid('/api/user', { method: 'PATCH', json: patch });
 }
 
-async function apiKeyRequest(path: string, fetchFn: typeof fetch): Promise<string> {
-	const res = await fetchFn(path, { method: 'POST' });
-	if (!res.ok) {
-		throw new AuthApiError(res.status, await res.text());
-	}
-	const body: { api_key: string } = await res.json();
+async function apiKeyRequest(path: string, f?: typeof fetch): Promise<string> {
+	const body = await api<{ api_key: string }>(path, { method: 'POST', fetch: f });
 	return body.api_key;
 }
 
 /** Returns the current user's MCP API key, creating one on first call. */
-export function ensureApiKey(fetchFn: typeof fetch = fetch): Promise<string> {
-	return apiKeyRequest('/api/user/api-key', fetchFn);
+export function ensureApiKey(f?: typeof fetch): Promise<string> {
+	return apiKeyRequest('/api/user/api-key', f);
 }
 
 /** Replaces the current user's MCP API key with a fresh one. */
-export function resetApiKey(fetchFn: typeof fetch = fetch): Promise<string> {
-	return apiKeyRequest('/api/user/api-key/reset', fetchFn);
+export function resetApiKey(): Promise<string> {
+	return apiKeyRequest('/api/user/api-key/reset');
 }
 
 export interface RestoreResult {
@@ -96,14 +68,10 @@ export interface RestoreResult {
  * nothing, but a *successful* one replaces the sessions table too, so the caller
  * should expect its own session to be gone and reload.
  */
-export async function restoreBackup(file: File): Promise<RestoreResult> {
-	const res = await fetch('/api/backup/restore', {
+export function restoreBackup(file: File): Promise<RestoreResult> {
+	return api('/api/backup/restore', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/octet-stream' },
-		body: file
+		body: file,
+		type: 'application/octet-stream'
 	});
-	if (!res.ok) {
-		throw new AuthApiError(res.status, (await res.text()).trim());
-	}
-	return res.json();
 }

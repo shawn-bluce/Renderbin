@@ -18,8 +18,16 @@ function intlFor(l: Locale): string {
 }
 
 function applyDocumentLang(l: Locale) {
-	if (typeof document !== 'undefined') {
-		document.documentElement.lang = intlFor(l);
+	document.documentElement.lang = intlFor(l);
+}
+
+// Storage can be disabled outright (some private-browsing modes throw on access);
+// the app must still start, just without remembering the choice.
+function readStored(): string | null {
+	try {
+		return localStorage.getItem(STORAGE_KEY);
+	} catch {
+		return null;
 	}
 }
 
@@ -27,7 +35,7 @@ function applyDocumentLang(l: Locale) {
 // falls back to the browser's preferred language (Chinese → zh, else English).
 export function initI18n() {
 	let next: Locale = 'en';
-	const stored = localStorage.getItem(STORAGE_KEY);
+	const stored = readStored();
 	if (isLocale(stored)) {
 		next = stored;
 	} else if (navigator.language.toLowerCase().startsWith('zh')) {
@@ -39,7 +47,11 @@ export function initI18n() {
 
 export function setLocale(l: Locale) {
 	locale = l;
-	localStorage.setItem(STORAGE_KEY, l);
+	try {
+		localStorage.setItem(STORAGE_KEY, l);
+	} catch {
+		/* storage disabled: the choice just won't survive a reload */
+	}
 	applyDocumentLang(l);
 }
 

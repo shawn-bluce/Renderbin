@@ -1,4 +1,4 @@
-import { ApiError } from './files';
+import { api, apiVoid } from './http';
 
 /**
  * Account management, super admin only — every endpoint here 403s for anyone
@@ -11,7 +11,6 @@ export interface AdminUser {
 	nickname: string;
 	is_super_admin: boolean;
 	disabled: boolean;
-	disabled_at: string | null;
 	created_at: string;
 	file_count: number;
 	trashed_count: number;
@@ -29,22 +28,9 @@ export interface CreatedUser {
 	password: string;
 }
 
-async function unwrap<T>(res: Response): Promise<T> {
-	if (!res.ok) {
-		throw new ApiError(res.status, (await res.text()).trim());
-	}
-	return res.json();
-}
-
-async function expectNoContent(res: Response): Promise<void> {
-	if (!res.ok) {
-		throw new ApiError(res.status, (await res.text()).trim());
-	}
-}
-
 /** `fetch` is a parameter so SvelteKit `load` functions can pass their own. */
 export function listUsers(f: typeof fetch = fetch): Promise<AdminUser[]> {
-	return f('/api/admin/users').then((res) => unwrap<AdminUser[]>(res));
+	return api('/api/admin/users', { fetch: f });
 }
 
 /**
@@ -54,20 +40,15 @@ export function listUsers(f: typeof fetch = fetch): Promise<AdminUser[]> {
  * the server's row alone couldn't carry the file counts the list shows.
  */
 export function setUserDisabled(id: number, disabled: boolean): Promise<void> {
-	return fetch(`/api/admin/users/${id}/status`, {
-		method: 'PATCH',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ disabled })
-	}).then(expectNoContent);
+	return apiVoid(`/api/admin/users/${id}/status`, { method: 'PATCH', json: { disabled } });
 }
 
 /** Set an account's password without knowing the old one, and sign it out everywhere. */
 export function resetUserPassword(id: number, newPassword: string): Promise<void> {
-	return fetch(`/api/admin/users/${id}/password`, {
+	return apiVoid(`/api/admin/users/${id}/password`, {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ new_password: newPassword })
-	}).then(expectNoContent);
+		json: { new_password: newPassword }
+	});
 }
 
 /**
@@ -76,11 +57,7 @@ export function resetUserPassword(id: number, newPassword: string): Promise<void
  * response is discarded.
  */
 export function createUser(username: string, nickname: string): Promise<CreatedUser> {
-	return fetch('/api/admin/users', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ username, nickname })
-	}).then((res) => unwrap<CreatedUser>(res));
+	return api('/api/admin/users', { method: 'POST', json: { username, nickname } });
 }
 
 /**
@@ -89,9 +66,7 @@ export function createUser(username: string, nickname: string): Promise<CreatedU
  * option. The server refuses the super admin and the caller's own account.
  */
 export function deleteUser(id: number): Promise<{ deleted_files: number }> {
-	return fetch(`/api/admin/users/${id}`, { method: 'DELETE' }).then((res) =>
-		unwrap<{ deleted_files: number }>(res)
-	);
+	return api(`/api/admin/users/${id}`, { method: 'DELETE' });
 }
 
 /**
@@ -99,9 +74,8 @@ export function deleteUser(id: number): Promise<{ deleted_files: number }> {
  * further uploads and leaves stored files alone.
  */
 export function setUserQuota(id: number, quotaBytes: number): Promise<void> {
-	return fetch(`/api/admin/users/${id}/quota`, {
+	return apiVoid(`/api/admin/users/${id}/quota`, {
 		method: 'PATCH',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ quota_bytes: quotaBytes })
-	}).then(expectNoContent);
+		json: { quota_bytes: quotaBytes }
+	});
 }

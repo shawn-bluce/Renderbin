@@ -22,12 +22,11 @@
 	aria-label={label}
 	{disabled}
 	onclick={onToggle}
-	class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors
-		disabled:cursor-not-allowed disabled:opacity-40
-		{checked ? 'bg-emerald-500' : 'bg-neutral-700'}"
+	class="relative h-6 w-11 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40
+		{checked ? 'border-accent bg-accent' : 'border-line-strong bg-raised'}"
 >
 	<span
-		class="inline-block h-4.5 w-4.5 transform rounded-full bg-neutral-100 transition-transform
-			{checked ? 'translate-x-5.5' : 'translate-x-1'}"
+		class="absolute top-0.5 left-0.5 size-4.5 rounded-full transition-transform
+			{checked ? 'translate-x-5 bg-on-accent' : 'bg-muted'}"
 	></span>
 </button>

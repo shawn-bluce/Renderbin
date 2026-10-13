@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+/** Mirrors auth.MinPasswordLen on the backend. */
+export const MIN_PASSWORD = 6;
+
 // Like login.ts, validation messages are i18n message keys resolved via t().
 // Mirrors the backend rules in internal/handlers/auth.go (createUser).
 export const registerSchema = z
@@ -14,7 +17,7 @@ export const registerSchema = z
 			.trim()
 			.min(1, 'register.nicknameRequired')
 			.max(64, 'register.nicknameTooLong'),
-		password: z.string().min(6, 'register.passwordTooShort'),
+		password: z.string().min(MIN_PASSWORD, 'register.passwordTooShort'),
 		rePassword: z.string().min(1, 'register.rePasswordRequired')
 	})
 	.refine((data) => data.password === data.rePassword, {
@@ -26,7 +29,7 @@ export const registerSchema = z
 export const changePasswordSchema = z
 	.object({
 		currentPassword: z.string().min(1, 'settings.currentPasswordRequired'),
-		password: z.string().min(6, 'register.passwordTooShort'),
+		password: z.string().min(MIN_PASSWORD, 'register.passwordTooShort'),
 		rePassword: z.string().min(1, 'register.rePasswordRequired')
 	})
 	.refine((data) => data.password === data.rePassword, {

@@ -5,7 +5,7 @@
 // replace them.
 
 /** Mirrors site.MaxTotalBytes. */
-export const SITE_MAX_BYTES = 5 * 1024 * 1024;
+const SITE_MAX_BYTES = 5 * 1024 * 1024;
 /** Mirrors site.MaxEntries. */
 export const SITE_MAX_ENTRIES = 200;
 /** Mirrors site.MaxUploadBytes, the cap on a zip request body. */
@@ -18,7 +18,7 @@ export interface PickedFile {
 }
 
 export type SitePlan =
-	| { ok: true; files: PickedFile[]; totalBytes: number }
+	| { ok: true; files: PickedFile[] }
 	| { ok: false; reason: 'empty' | 'noIndex' | 'tooMany' | 'tooLarge' };
 
 /** OS litter that never belongs in a site (mirrors site.isJunk). */
@@ -59,9 +59,10 @@ export function planSite(picked: PickedFile[]): SitePlan {
 	if (files.length === 0) return { ok: false, reason: 'empty' };
 	if (!files.some((f) => f.path === 'index.html')) return { ok: false, reason: 'noIndex' };
 	if (files.length > SITE_MAX_ENTRIES) return { ok: false, reason: 'tooMany' };
-	const totalBytes = files.reduce((n, f) => n + f.file.size, 0);
-	if (totalBytes > SITE_MAX_BYTES) return { ok: false, reason: 'tooLarge' };
-	return { ok: true, files, totalBytes };
+	if (files.reduce((n, f) => n + f.file.size, 0) > SITE_MAX_BYTES) {
+		return { ok: false, reason: 'tooLarge' };
+	}
+	return { ok: true, files };
 }
 
 /** The files of an <input webkitdirectory> selection, with their paths. */

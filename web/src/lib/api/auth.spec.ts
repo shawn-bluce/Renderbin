@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AuthApiError, login, logout, me, register, setup } from './auth';
+import { ApiError } from './http';
+import { login, logout, register, setup } from './auth';
 
 function response(init: { ok: boolean; body?: unknown }): Response {
 	return {
@@ -37,9 +38,9 @@ describe('auth api', () => {
 	// The status is what the login page needs: 401 is a wrong password, while a
 	// 403 means the password was right and the account is suspended, which the
 	// page reports differently.
-	it('login throws an AuthApiError carrying the status on failure', async () => {
+	it('login throws an ApiError carrying the status on failure', async () => {
 		mockFetch(response({ ok: false }));
-		await expect(login('admin', 'wrong')).rejects.toBeInstanceOf(AuthApiError);
+		await expect(login('admin', 'wrong')).rejects.toBeInstanceOf(ApiError);
 		await expect(login('admin', 'wrong')).rejects.toMatchObject({ status: 401 });
 	});
 
@@ -56,16 +57,6 @@ describe('auth api', () => {
 		expect(fetchMock).toHaveBeenCalledWith('/api/auth/logout', { method: 'POST' });
 	});
 
-	it('me returns the parsed body when authenticated', async () => {
-		mockFetch(response({ ok: true, body: { username: 'admin' } }));
-		await expect(me()).resolves.toEqual({ username: 'admin' });
-	});
-
-	it('me returns null when unauthenticated', async () => {
-		mockFetch(response({ ok: false }));
-		await expect(me()).resolves.toBeNull();
-	});
-
 	it('register POSTs the three fields and resolves on success', async () => {
 		const fetchMock = mockFetch(response({ ok: true }));
 		await expect(register('user', 'Nick', 'secret1')).resolves.toBeUndefined();
@@ -78,12 +69,12 @@ describe('auth api', () => {
 		);
 	});
 
-	it('register throws an AuthApiError carrying the status on failure', async () => {
+	it('register throws an ApiError carrying the status on failure', async () => {
 		const res = response({ ok: false });
 		(res as { status: number }).status = 409;
 		mockFetch(res);
 		await expect(register('user', 'Nick', 'secret1')).rejects.toMatchObject({ status: 409 });
-		await expect(register('user', 'Nick', 'secret1')).rejects.toBeInstanceOf(AuthApiError);
+		await expect(register('user', 'Nick', 'secret1')).rejects.toBeInstanceOf(ApiError);
 	});
 
 	it('setup POSTs the payload including config toggles', async () => {

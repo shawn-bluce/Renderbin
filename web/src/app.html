@@ -1,9 +1,27 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 	<head>
 		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<meta name="text-scale" content="scale" />
+		<meta name="theme-color" content="#1d2021" />
+		<!-- The theme is applied before first paint so a reload never flashes the
+		     wrong one. Same rule as $lib/theme.svelte.ts: a saved choice wins, otherwise the OS. -->
+		<script>
+			(function () {
+				var t = null;
+				try {
+					t = localStorage.getItem('rb_theme');
+				} catch (e) {}
+				if (t !== 'light' && t !== 'dark') {
+					t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+				}
+				document.documentElement.dataset.theme = t;
+				document
+					.querySelector('meta[name=theme-color]')
+					.setAttribute('content', t === 'light' ? '#f9f5d7' : '#1d2021');
+			})();
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

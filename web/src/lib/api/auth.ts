@@ -1,3 +1,5 @@
+import { apiVoid } from './http';
+
 export interface Me {
 	id: number;
 	username: string;
@@ -10,42 +12,15 @@ export interface SetupStatus {
 	allow_registration: boolean;
 }
 
-/** Error carrying the HTTP status so callers can map it to a message. */
-export class AuthApiError extends Error {
-	status: number;
-	constructor(status: number, message: string) {
-		super(message);
-		this.status = status;
-	}
+// The status on the ApiError matters to the login page: 401 is bad credentials,
+// while 403 means the password was right and the account is suspended -- telling
+// someone to re-check their password in that case would send them in circles.
+export function login(username: string, password: string): Promise<void> {
+	return apiVoid('/api/auth/login', { method: 'POST', json: { username, password } });
 }
 
-export async function login(username: string, password: string): Promise<void> {
-	const res = await fetch('/api/auth/login', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ username, password })
-	});
-	if (!res.ok) {
-		// The status matters here: 401 is bad credentials, while 403 means the
-		// password was right and the account is suspended — telling someone to
-		// re-check their password in that case would send them in circles.
-		throw new AuthApiError(res.status, await res.text());
-	}
-}
-
-export async function register(
-	username: string,
-	nickname: string,
-	password: string
-): Promise<void> {
-	const res = await fetch('/api/auth/register', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ username, nickname, password })
-	});
-	if (!res.ok) {
-		throw new AuthApiError(res.status, await res.text());
-	}
+export function register(username: string, nickname: string, password: string): Promise<void> {
+	return apiVoid('/api/auth/register', { method: 'POST', json: { username, nickname, password } });
 }
 
 export interface SetupPayload {
@@ -56,23 +31,11 @@ export interface SetupPayload {
 	mcp_enabled: boolean;
 }
 
-export async function setup(payload: SetupPayload): Promise<void> {
-	const res = await fetch('/api/setup', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(payload)
-	});
-	if (!res.ok) {
-		throw new AuthApiError(res.status, await res.text());
-	}
+export function setup(payload: SetupPayload): Promise<void> {
+	return apiVoid('/api/setup', { method: 'POST', json: payload });
 }
 
+/** Never throws: a failed logout leaves nothing the caller could do about it. */
 export async function logout(): Promise<void> {
 	await fetch('/api/auth/logout', { method: 'POST' });
-}
-
-export async function me(): Promise<Me | null> {
-	const res = await fetch('/api/auth/me');
-	if (!res.ok) return null;
-	return res.json();
 }

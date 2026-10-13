@@ -1,11 +1,12 @@
 import { redirect } from '@sveltejs/kit';
-import type { Me, SetupStatus } from '$lib/api/auth';
+import type { SetupStatus } from '$lib/api/auth';
 
 export const ssr = false;
 
-// Auth guard for the whole SPA. While the users table is empty every route
-// funnels into /welcome (first-run setup); afterwards /login and /register
-// stay public and everything else requires a session.
+// First half of the SPA's guard: while the users table is empty every route
+// funnels into /welcome (first-run setup), and once it is set up /welcome is a
+// dead end. Whether the visitor is signed in is the (app) group's business --
+// /login and /register live outside it and stay public.
 export async function load({ url, fetch }) {
 	let status: SetupStatus = { needs_setup: false, allow_registration: false };
 	const statusRes = await fetch('/api/setup/status');
@@ -15,18 +16,8 @@ export async function load({ url, fetch }) {
 
 	if (status.needs_setup) {
 		if (url.pathname !== '/welcome') redirect(302, '/welcome');
-		return { allowRegistration: status.allow_registration, user: null };
-	}
-	if (url.pathname === '/welcome') redirect(302, '/login');
-
-	if (url.pathname === '/login' || url.pathname === '/register') {
-		return { allowRegistration: status.allow_registration, user: null };
-	}
-
-	const res = await fetch('/api/auth/me');
-	if (!res.ok) {
+	} else if (url.pathname === '/welcome') {
 		redirect(302, '/login');
 	}
-	const user: Me = await res.json();
-	return { allowRegistration: status.allow_registration, user };
+	return { allowRegistration: status.allow_registration };
 }

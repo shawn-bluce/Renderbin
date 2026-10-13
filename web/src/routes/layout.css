@@ -1,25 +1,253 @@
 @import 'tailwindcss';
-@import '@fontsource-variable/inter';
-@import '@fontsource-variable/jetbrains-mono';
 
-@theme {
-	--font-sans: 'Inter Variable', sans-serif;
-	--font-mono: 'JetBrains Mono Variable', monospace;
-}
-
-html {
+/* ---- Gruvbox -----------------------------------------------------------
+   Everything below the palette talks in roles (page, surface, fg, accent...),
+   never in colors, so a component is written once and both themes fall out.
+   The theme is a data attribute on <html>, set before first paint by the
+   inline script in app.html. */
+:root,
+[data-theme='dark'] {
 	color-scheme: dark;
+	--page: #1d2021; /* bg0_h */
+	--surface: #282828; /* bg0 */
+	--raised: #3c3836; /* bg1 */
+	--line: #504945; /* bg2 */
+	--line-strong: #665c54; /* bg3 */
+	--fg: #ebdbb2; /* fg1 */
+	--fg-strong: #fbf1c7; /* fg0 */
+	--muted: #a89984; /* fg4 */
+	--faint: #928374; /* gray */
+	--accent: #fe8019; /* bright orange */
+	--accent-hover: #fabd2f;
+	--on-accent: #1d2021;
+	--ok: #b8bb26;
+	--warn: #fabd2f;
+	--bad: #fb5a46;
+	--info: #83a598;
 }
 
-body {
-	font-family: var(--font-sans);
-	background-color: var(--color-neutral-950);
-	color: var(--color-neutral-100);
+[data-theme='light'] {
+	color-scheme: light;
+	--page: #f9f5d7; /* bg0_h */
+	--surface: #fbf1c7; /* bg0 */
+	--raised: #ebdbb2; /* bg1 */
+	--line: #d5c4a1; /* bg2 */
+	--line-strong: #bdae93; /* bg3 */
+	--fg: #3c3836; /* fg1 */
+	--fg-strong: #282828; /* fg0 */
+	--muted: #665c54; /* fg3 */
+	--faint: #7c6f64; /* fg4 */
+	--accent: #af3a03; /* faded orange */
+	--accent-hover: #9d0006;
+	--on-accent: #fbf1c7;
+	--ok: #6f6a0b; /* darkened faded green, for text contrast */
+	--warn: #8a5a00;
+	--bad: #9d0006;
+	--info: #076678;
 }
 
-/* Chrome's autofill background is otherwise light-themed and clashes with the
-   rest of the (permanently dark) UI; the long transition defers it forever. */
-input:-webkit-autofill {
-	transition: background-color 9999s ease-in-out 0s;
-	-webkit-text-fill-color: var(--color-neutral-100);
+@theme inline {
+	/* System faces only: no webfont request on first paint, and CJK just works. */
+	--font-sans:
+		ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+		'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+	--color-page: var(--page);
+	--color-surface: var(--surface);
+	--color-raised: var(--raised);
+	--color-line: var(--line);
+	--color-line-strong: var(--line-strong);
+	--color-fg: var(--fg);
+	--color-fg-strong: var(--fg-strong);
+	--color-muted: var(--muted);
+	--color-faint: var(--faint);
+	--color-accent: var(--accent);
+	--color-accent-hover: var(--accent-hover);
+	--color-on-accent: var(--on-accent);
+	--color-ok: var(--ok);
+	--color-warn: var(--warn);
+	--color-bad: var(--bad);
+	--color-info: var(--info);
+}
+
+@layer base {
+	html {
+		-webkit-text-size-adjust: 100%;
+	}
+	body {
+		background: var(--page);
+		color: var(--fg);
+		font-family: var(--font-sans);
+		font-size: 14px;
+		line-height: 1.5;
+		-webkit-font-smoothing: antialiased;
+	}
+	::selection {
+		background: color-mix(in srgb, var(--accent) 35%, transparent);
+	}
+	:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+	button:not(:disabled),
+	[role='button'],
+	summary {
+		cursor: pointer;
+	}
+	* {
+		scrollbar-width: thin;
+		scrollbar-color: var(--line-strong) transparent;
+	}
+	/* Chrome paints autofill in its own light colors; the long transition keeps
+	   the field's own theme colors instead. */
+	input:-webkit-autofill {
+		transition: background-color 9999s ease-in-out 0s;
+		-webkit-text-fill-color: var(--fg);
+	}
+}
+
+/* ---- Shared building blocks ----------------------------------------------
+   Utilities still win over these (they sit in a later layer), so a one-off
+   tweak is just another class on the element. */
+@layer components {
+	.btn {
+		@apply inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-transparent px-3.5 text-sm font-medium whitespace-nowrap transition-colors select-none disabled:cursor-not-allowed disabled:opacity-50;
+	}
+	.btn-primary {
+		@apply bg-accent text-on-accent hover:bg-accent-hover;
+	}
+	.btn-soft {
+		@apply border-line bg-raised text-fg hover:border-line-strong;
+	}
+	.btn-ghost {
+		@apply text-muted hover:bg-raised hover:text-fg;
+	}
+	.btn-danger {
+		@apply bg-bad text-on-accent hover:brightness-110;
+	}
+	.btn-sm {
+		@apply h-8 px-2.5 text-xs;
+	}
+	/* Square icon-only button; always pair with title + aria-label. */
+	.btn-icon {
+		@apply size-8 shrink-0 p-0;
+	}
+	.hover-bad {
+		@apply hover:bg-bad/15 hover:text-bad;
+	}
+
+	.input {
+		@apply h-9 w-full rounded-md border border-line bg-page px-3 text-sm text-fg outline-none placeholder:text-faint focus:border-accent disabled:opacity-50;
+	}
+	.input-lg {
+		@apply h-10;
+	}
+	textarea.input {
+		@apply h-auto py-2 leading-relaxed;
+	}
+	.label {
+		@apply text-xs font-medium text-muted;
+	}
+	/* A label stacked over its control. */
+	.field {
+		@apply flex flex-col gap-1.5;
+	}
+	/* Small explanatory text under a heading or a setting. */
+	.hint {
+		@apply mt-0.5 text-xs text-muted;
+	}
+	/* A recessed box inside a card (lists, code, option groups). */
+	.panel {
+		@apply rounded-md border border-line bg-page;
+	}
+
+	.card {
+		@apply rounded-lg border border-line bg-surface;
+	}
+
+	.chip {
+		@apply inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] leading-4 font-medium;
+	}
+	.chip-neutral {
+		@apply bg-raised text-fg;
+	}
+	.chip-ok {
+		@apply bg-ok/15 text-ok;
+	}
+	.chip-warn {
+		@apply bg-warn/15 text-warn;
+	}
+	.chip-bad {
+		@apply bg-bad/15 text-bad;
+	}
+	.chip-info {
+		@apply bg-info/15 text-info;
+	}
+
+	.alert {
+		@apply flex items-start gap-2 rounded-md border px-3 py-2 text-sm;
+	}
+	.alert > svg {
+		@apply mt-0.5;
+	}
+	.alert-bad {
+		@apply border-bad/40 bg-bad/10 text-bad;
+	}
+	.alert-warn {
+		@apply border-warn/40 bg-warn/10 text-warn;
+	}
+	.alert-ok {
+		@apply border-ok/40 bg-ok/10 text-ok;
+	}
+
+	/* Segmented control: a row of mutually exclusive buttons. */
+	.seg {
+		@apply inline-flex items-center gap-0.5 rounded-md border border-line bg-page p-0.5;
+	}
+	.seg > button {
+		@apply inline-flex h-7 items-center justify-center gap-1 rounded px-2.5 text-xs font-medium whitespace-nowrap text-muted transition-colors hover:text-fg;
+	}
+	.seg > button[aria-pressed='true'] {
+		@apply bg-accent text-on-accent;
+	}
+
+	/* Navigation entries: a sidebar row on wide screens, a pill in the phone top bar. */
+	.nav-item {
+		@apply flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm text-muted transition-colors hover:bg-raised hover:text-fg aria-[current=page]:bg-raised aria-[current=page]:font-medium aria-[current=page]:text-fg-strong;
+	}
+	.nav-item[aria-current='page'] > svg {
+		@apply text-accent;
+	}
+	.nav-chip {
+		@apply flex items-center gap-1.5 rounded-full border border-line px-3 py-1 text-sm whitespace-nowrap text-muted transition-colors hover:text-fg aria-[current=page]:border-accent aria-[current=page]:bg-accent aria-[current=page]:text-on-accent;
+	}
+
+	dialog.modal {
+		@apply m-auto w-full max-w-lg bg-transparent p-0 text-fg backdrop:bg-black/60 max-sm:mt-auto max-sm:mb-0 max-sm:max-w-none;
+	}
+	dialog.modal[open] {
+		animation: rb-pop 140ms ease-out;
+	}
+	dialog.modal[open]::backdrop {
+		animation: rb-fade 140ms ease-out;
+	}
+}
+
+@keyframes rb-pop {
+	from {
+		opacity: 0;
+		transform: translateY(8px);
+	}
+}
+@keyframes rb-fade {
+	from {
+		opacity: 0;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	dialog.modal[open],
+	dialog.modal[open]::backdrop {
+		animation: none;
+	}
 }

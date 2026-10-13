@@ -43,7 +43,6 @@ describe('planSite', () => {
 		expect(plan.ok).toBe(true);
 		if (plan.ok) {
 			expect(plan.files.map((f) => f.path)).toEqual(['index.html', 'js/app.js']);
-			expect(plan.totalBytes).toBe(30);
 		}
 	});
 

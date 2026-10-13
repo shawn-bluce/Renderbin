@@ -3,14 +3,17 @@
 // `satisfies Record<MessageKey, string>` below). Placeholders use `{name}`
 // syntax and are filled in by `t()` (see ./index.svelte.ts).
 
-export const en = {
+const en = {
 	// Header
 	'header.settings': 'Settings',
 	'header.logout': 'Log out',
+	'shell.admin': 'Admin',
+	'theme.toLight': 'Switch to light theme',
+	'theme.toDark': 'Switch to dark theme',
 
 	// Overview / tabs
-	'overview.title': 'Overview',
-	'tab.files': 'Files',
+	'nav.all': 'All files',
+	'quota.title': 'Storage',
 	'tab.trashed': 'Trashed',
 	'count.total': '{n} total',
 	'count.public': '{n} public',
@@ -35,7 +38,6 @@ export const en = {
 	'site.files': 'Files ({n})',
 	'site.replaceFolder': 'Replace with folder',
 	'site.replaceZip': 'Replace with .zip',
-	'site.replacing': 'Replacing…',
 	'site.replaceHint':
 		'Replaces every file of the site right away. The link, access code, visibility and expiry stay as they are.',
 	'site.replaced': 'Site content replaced.',
@@ -57,20 +59,23 @@ export const en = {
 	// List controls
 	'list.searchPlaceholder': 'Search files…',
 	'list.sort': 'Sort',
-	'list.visibility': 'Visibility',
 	'search.scopeTitle': 'Searches your own files',
 	'search.content': 'Search content',
 	'search.contentTitle': 'Also search inside file contents',
 	'search.loading': 'Searching…',
+	'search.clear': 'Clear search',
 	'search.empty': 'No files match your search.',
 	'error.search': 'Search failed',
-	'visibility.all': 'All',
+	'error.pageNotFound': 'This page does not exist.',
+	'error.backHome': 'Back to Renderbin',
 	'visibility.public': 'Public',
 	'visibility.private': 'Private',
 	'sort.recent': 'Recent',
 	'sort.name': 'Name',
 	'sort.success': 'Successes',
 	'sort.failure': 'Failures',
+	'sort.ascending': 'Ascending',
+	'sort.descending': 'Descending',
 
 	// File row
 	'row.formatTitle': 'Format: {kind}',
@@ -120,7 +125,6 @@ export const en = {
 	'edit.titleLabel': 'Title',
 	'edit.slugLabel': 'Slug',
 	'edit.codeLabel': 'Access code',
-	'edit.toggleContent': 'Show or hide the content editor',
 	'source.markdown': 'Markdown source',
 	'source.txt': 'Text content',
 	'source.html': 'HTML source',
@@ -178,7 +182,6 @@ export const en = {
 	'error.ttlValue': 'Enter a whole number of at least 1, up to {years} years out.',
 	'error.visibility': 'Failed to update visibility',
 	'error.saveTags': 'Failed to save tags',
-	'error.removeTag': 'Failed to remove tag',
 	'error.refreshCode': 'Failed to refresh access code',
 	'error.delete': 'Failed to delete',
 	'error.rename': 'Failed to rename',
@@ -365,14 +368,17 @@ export const en = {
 export type Locale = 'en' | 'zh';
 export type MessageKey = keyof typeof en;
 
-export const zh = {
+const zh = {
 	// Header
 	'header.settings': '设置',
 	'header.logout': '退出登录',
+	'shell.admin': '管理员',
+	'theme.toLight': '切换到浅色主题',
+	'theme.toDark': '切换到深色主题',
 
 	// Overview / tabs
-	'overview.title': '概览',
-	'tab.files': '文件',
+	'nav.all': '全部文件',
+	'quota.title': '存储空间',
 	'tab.trashed': '回收站',
 	'count.total': '共 {n} 个',
 	'count.public': '{n} 个公开',
@@ -397,7 +403,6 @@ export const zh = {
 	'site.files': '文件（{n}）',
 	'site.replaceFolder': '用文件夹替换',
 	'site.replaceZip': '用 .zip 替换',
-	'site.replacing': '替换中…',
 	'site.replaceHint': '立即替换站点的全部文件。链接、访问码、可见性和过期设置保持不变。',
 	'site.replaced': '站点内容已替换。',
 
@@ -418,20 +423,23 @@ export const zh = {
 	// List controls
 	'list.searchPlaceholder': '搜索文件…',
 	'list.sort': '排序',
-	'list.visibility': '可见性',
 	'search.scopeTitle': '只搜索你自己的文件',
 	'search.content': '搜索正文',
 	'search.contentTitle': '同时搜索文件正文内容',
 	'search.loading': '搜索中…',
+	'search.clear': '清除搜索',
 	'search.empty': '没有匹配的文件。',
 	'error.search': '搜索失败',
-	'visibility.all': '全部',
+	'error.pageNotFound': '页面不存在。',
+	'error.backHome': '返回 Renderbin',
 	'visibility.public': '公开',
 	'visibility.private': '私有',
 	'sort.recent': '最近',
 	'sort.name': '名称',
 	'sort.success': '成功次数',
 	'sort.failure': '失败次数',
+	'sort.ascending': '升序',
+	'sort.descending': '降序',
 
 	// File row
 	'row.formatTitle': '格式：{kind}',
@@ -481,7 +489,6 @@ export const zh = {
 	'edit.titleLabel': '标题',
 	'edit.slugLabel': '链接标识',
 	'edit.codeLabel': '访问码',
-	'edit.toggleContent': '展开/收起内容编辑器',
 	'source.markdown': 'Markdown 源码',
 	'source.txt': '文本内容',
 	'source.html': 'HTML 源码',
@@ -536,7 +543,6 @@ export const zh = {
 	'error.ttlValue': '请输入不小于 1 的整数，且到期时间不超过 {years} 年。',
 	'error.visibility': '更新可见性失败',
 	'error.saveTags': '保存标签失败',
-	'error.removeTag': '移除标签失败',
 	'error.refreshCode': '刷新访问码失败',
 	'error.delete': '删除失败',
 	'error.rename': '重命名失败',

@@ -10,6 +10,27 @@ upgrading** (Settings → Backup) if you might want to go back.
 
 ## Unreleased
 
+### Changed
+
+- Internal clean-up with no API change: the `reset-password` CLI now applies the
+  same password rules as the web app (a password over bcrypt's 72-byte limit
+  gets a clear message instead of a bcrypt error); a rejected backup upload no
+  longer leaks a database handle; migration `0005` drops an index no query
+  used; `server.New` takes just the connection; the `google/uuid` direct
+  dependency is gone.
+
+- **New look.** The whole UI is redesigned on Gruvbox, with a light and a dark
+  theme (follows the OS until you pick one; toggle in the sidebar/top bar). On
+  wide screens the dashboard gets a sidebar (All / Public / Private / Trash,
+  storage meter) and uses the full width; on phones it becomes a top bar with
+  chips and stacked file rows, and dialogs dock to the bottom as sheets.
+  Faster to load: no webfonts, and only the icons actually used are bundled
+  (JS+CSS went from ~213KB to ~119KB gzipped).
+- A failed request now shows a translated message instead of a raw English
+  "Failed to fetch"; the server's own text is shown only when it answered.
+- The dashboard and settings load their data in parallel, search has a clear
+  (×) button, and several controls got proper accessible names.
+
 ### Added
 
 - **Multi-page sites.** Upload a directory — `index.html` plus the pages,

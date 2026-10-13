@@ -1,30 +1,16 @@
 <script lang="ts">
-	import Icon from '@iconify/svelte';
+	import Icon from './Icon.svelte';
 	import { getLocale, setLocale, t } from '$lib/i18n/index.svelte';
-	import type { Locale } from '$lib/i18n/messages';
 
-	const options: { key: Locale; label: string }[] = [
-		{ key: 'zh', label: '中' },
-		{ key: 'en', label: 'EN' }
-	];
+	// One button that flips between the two languages and names the current one.
 </script>
 
-<div
-	class="flex items-center gap-0.5 rounded-lg px-1 py-1 text-sm text-neutral-400"
+<button
+	onclick={() => setLocale(getLocale() === 'zh' ? 'en' : 'zh')}
 	title={t('switcher.label')}
+	aria-label={t('switcher.label')}
+	class="btn btn-ghost btn-sm gap-1 px-2"
 >
-	<Icon icon="lucide:languages" width="15" height="15" class="mr-1 text-neutral-500" />
-	{#each options as opt (opt.key)}
-		<button
-			onclick={() => setLocale(opt.key)}
-			aria-pressed={getLocale() === opt.key}
-			class={`rounded-md px-2 py-0.5 text-xs font-medium transition-colors ${
-				getLocale() === opt.key
-					? 'bg-neutral-800 text-neutral-100'
-					: 'text-neutral-500 hover:text-neutral-200'
-			}`}
-		>
-			{opt.label}
-		</button>
-	{/each}
-</div>
+	<Icon icon="lucide:languages" width="16" />
+	<span class="text-xs font-semibold">{getLocale() === 'zh' ? '中' : 'EN'}</span>
+</button>
