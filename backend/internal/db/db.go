@@ -27,7 +27,7 @@ var migrationsFS embed.FS
 // 0002 rewrote the rows an earlier build had already stored the old way.
 //
 // LoadLocation("UTC") is resolved by the standard library itself, so this adds
-// no tzdata dependency to the scratch-built binary.
+// no tzdata dependency to the binary.
 func Open(path string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_time_format=sqlite&_timezone=UTC", path)
 	conn, err := sql.Open("sqlite", dsn)
@@ -36,14 +36,14 @@ func Open(path string) (*sql.DB, error) {
 	}
 	conn.SetMaxOpenConns(1)
 
+	// backup.Restore opens untrusted uploads through here, so a failure must not
+	// leave the handle (and its file descriptor) behind.
 	if _, err := conn.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("enable WAL: %w", err)
 	}
-	if _, err := conn.Exec("PRAGMA foreign_keys=ON;"); err != nil {
-		return nil, fmt.Errorf("enable foreign_keys: %w", err)
-	}
-
 	if err := migrate(conn); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 

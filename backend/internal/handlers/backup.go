@@ -31,7 +31,8 @@ func NewBackupHandler(db *sql.DB, logger *slog.Logger) *BackupHandler {
 
 // Download streams a consistent SQLite snapshot at GET /api/backup. The
 // snapshot is a standalone .db file (produced via VACUUM INTO into a temp
-// dir), restorable by replacing app.db.
+// dir). Restoring one goes through POST /api/backup/restore, which copies its
+// rows into the live database rather than swapping the file.
 //
 // Super-admin only, not merely signed-in: the snapshot is the whole database,
 // so it carries every user's files, password hash and MCP API key. 403 rather
@@ -44,23 +45,20 @@ func (h *BackupHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	dir, err := os.MkdirTemp("", "renderbin-backup-")
 	if err != nil {
-		h.logger.Error("backup temp dir", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "backup temp dir", err)
 		return
 	}
 	defer os.RemoveAll(dir)
 
 	dest := filepath.Join(dir, "backup.db")
 	if err := backup.Snapshot(r.Context(), h.db, dest); err != nil {
-		h.logger.Error("backup snapshot", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "backup snapshot", err)
 		return
 	}
 
 	f, err := os.Open(dest)
 	if err != nil {
-		h.logger.Error("open backup snapshot", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "open backup snapshot", err)
 		return
 	}
 	defer f.Close()
@@ -105,8 +103,7 @@ func (h *BackupHandler) Restore(w http.ResponseWriter, r *http.Request) {
 
 	dir, err := os.MkdirTemp("", "renderbin-restore-")
 	if err != nil {
-		h.logger.Error("restore temp dir", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "restore temp dir", err)
 		return
 	}
 	defer os.RemoveAll(dir)
@@ -116,8 +113,7 @@ func (h *BackupHandler) Restore(w http.ResponseWriter, r *http.Request) {
 	uploaded := filepath.Join(dir, "uploaded.db")
 	f, err := os.Create(uploaded)
 	if err != nil {
-		h.logger.Error("create restore temp file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "create restore temp file", err)
 		return
 	}
 	written, copyErr := io.Copy(f, http.MaxBytesReader(w, r.Body, maxRestoreBytes))
@@ -128,8 +124,7 @@ func (h *BackupHandler) Restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if closeErr != nil {
-		h.logger.Error("write restore temp file", "error", closeErr)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "write restore temp file", closeErr)
 		return
 	}
 	if written == 0 {
@@ -146,12 +141,10 @@ func (h *BackupHandler) Restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		h.logger.Error("restore snapshot", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "restore snapshot", err)
 		return
 	}
 	h.logger.Info("database restored", "by_user_id", user.ID, "users", stats.Users, "files", stats.Files)
 
-	w.Header().Set("Content-Type", "application/json")
 	writeJSON(w, restoreResponse{Users: stats.Users, Files: stats.Files})
 }

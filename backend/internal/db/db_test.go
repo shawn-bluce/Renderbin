@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+// TestOpenRunsAllMigrations also covers re-opening: a second Open of the same
+// file must not re-apply anything.
 func TestOpenRunsAllMigrations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.db")
 	conn, err := Open(path)
@@ -56,33 +58,19 @@ func TestOpenRunsAllMigrations(t *testing.T) {
 	); err != nil {
 		t.Fatalf("insert session: %v", err)
 	}
-}
-
-func TestOpenIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "app.db")
-
-	conn, err := Open(path)
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
-	var first int
-	if err := conn.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&first); err != nil {
-		t.Fatalf("count after first open: %v", err)
-	}
-	conn.Close()
 
 	// Re-opening the same file must not re-apply migrations or error.
-	conn2, err := Open(path)
+	conn.Close()
+	again, err := Open(path)
 	if err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
-	defer conn2.Close()
-	var second int
-	if err := conn2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&second); err != nil {
-		t.Fatalf("count after second open: %v", err)
+	defer again.Close()
+	if err := again.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&got); err != nil {
+		t.Fatalf("count after reopen: %v", err)
 	}
-	if first != second {
-		t.Errorf("migration count changed on reopen: first=%d second=%d", first, second)
+	if got != want {
+		t.Errorf("migration count changed on reopen: %d, want %d", got, want)
 	}
 }
 
@@ -149,46 +137,27 @@ func TestTimestampsStoredAsComparableUTC(t *testing.T) {
 	}
 }
 
-// applyFirstMigration brings a fresh database to the state it had before
-// migration 0002, so the rewrite in that file can be tested against rows in the
-// old format rather than against rows it has already fixed.
-func applyFirstMigration(t *testing.T, conn *sql.DB) {
+// openRaw opens a database file with the production DSN but WITHOUT running
+// migrations, so a test can stage the schema of an earlier release by hand.
+func openRaw(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	entries, err := migrationsFS.ReadDir("migrations")
+	conn, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_time_format=sqlite&_timezone=UTC")
 	if err != nil {
-		t.Fatalf("read migrations dir: %v", err)
+		t.Fatalf("sql.Open: %v", err)
 	}
-	first := entries[0].Name()
-	body, err := migrationsFS.ReadFile("migrations/" + first)
-	if err != nil {
-		t.Fatalf("read %s: %v", first, err)
-	}
-	if _, err := conn.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
-		filename TEXT PRIMARY KEY,
-		applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-	);`); err != nil {
-		t.Fatalf("create schema_migrations: %v", err)
-	}
-	if _, err := conn.Exec(string(body)); err != nil {
-		t.Fatalf("apply %s: %v", first, err)
-	}
-	if _, err := conn.Exec(`INSERT INTO schema_migrations (filename) VALUES (?)`, first); err != nil {
-		t.Fatalf("record %s: %v", first, err)
-	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { conn.Close() })
+	return conn
 }
 
 // TestMigrationRewritesLegacyTimestamps exercises migration 0002's rewrite of
 // the timestamps an earlier build stored in Go's own format, on a database that
 // really is in the pre-0002 state.
 func TestMigrationRewritesLegacyTimestamps(t *testing.T) {
-	conn, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "app.db")+
-		"?_pragma=busy_timeout(5000)&_time_format=sqlite&_timezone=UTC")
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	defer conn.Close()
-	conn.SetMaxOpenConns(1)
-	applyFirstMigration(t, conn)
+	// Everything before 0002 is the first migration only: the state the rows
+	// below were written in.
+	conn := openRaw(t, filepath.Join(t.TempDir(), "app.db"))
+	applyMigrationsBefore(t, conn, "0002")
 
 	cases := []struct {
 		name   string
@@ -270,22 +239,6 @@ func TestMigrationRewritesLegacyTimestamps(t *testing.T) {
 	}
 }
 
-func TestOpenEnablesForeignKeys(t *testing.T) {
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer conn.Close()
-
-	var fk int
-	if err := conn.QueryRow(`PRAGMA foreign_keys`).Scan(&fk); err != nil {
-		t.Fatalf("pragma foreign_keys: %v", err)
-	}
-	if fk != 1 {
-		t.Errorf("foreign_keys = %d, want 1", fk)
-	}
-}
-
 // applyMigrationsBefore applies every migration up to but excluding the named
 // one, leaving a database in exactly the state the previous release left it.
 func applyMigrationsBefore(t *testing.T, conn *sql.DB, exclude string) {
@@ -327,13 +280,7 @@ func applyMigrationsBefore(t *testing.T, conn *sql.DB, exclude string) {
 // files and the quota would consider a full account empty.
 func TestMigrationBackfillsContentSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.db")
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_time_format=sqlite&_timezone=UTC"
-
-	legacy, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	legacy.SetMaxOpenConns(1)
+	legacy := openRaw(t, path)
 	applyMigrationsBefore(t, legacy, "0003")
 
 	rows := []struct {
@@ -440,19 +387,92 @@ func TestContentSizeIsSelfCorrecting(t *testing.T) {
 
 	// A counter bump must not be treated as a content change -- /res/{slug}
 	// issues one on every request, and AFTER UPDATE OF html_content is what
-	// keeps those off the trigger.
+	// keeps those off the trigger. Prove it by planting a wrong size (writing
+	// content_size itself does not fire the trigger either): a bump must leave
+	// it alone, and only a content write puts it right again.
+	if _, err := conn.Exec(`UPDATE files SET content_size = 999 WHERE slug = 'legacy'`); err != nil {
+		t.Fatalf("plant a wrong size: %v", err)
+	}
 	if _, err := conn.Exec(
 		`UPDATE files SET success_count = success_count + 1 WHERE slug = 'legacy'`,
 	); err != nil {
 		t.Fatalf("bump counter: %v", err)
 	}
-	var updatedAt, bumped string
-	if err := conn.QueryRow(
-		`SELECT CAST(updated_at AS TEXT), CAST(success_count AS TEXT) FROM files WHERE slug = 'legacy'`,
-	).Scan(&updatedAt, &bumped); err != nil {
-		t.Fatalf("read after bump: %v", err)
+	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'legacy'`).Scan(&size); err != nil {
+		t.Fatalf("read content_size: %v", err)
 	}
-	if bumped != "1" {
-		t.Errorf("success_count = %s, want 1", bumped)
+	if size != 999 {
+		t.Errorf("content_size = %d after a counter bump, want the planted 999: the content trigger fired", size)
+	}
+	if _, err := conn.Exec(`UPDATE files SET html_content = ? WHERE slug = 'legacy'`, longer); err != nil {
+		t.Fatalf("rewrite content: %v", err)
+	}
+	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'legacy'`).Scan(&size); err != nil {
+		t.Fatalf("read content_size: %v", err)
+	}
+	if size != int64(len(longer)) {
+		t.Errorf("content_size = %d after a content write, want %d", size, len(longer))
+	}
+}
+
+// TestContentSizeCountsSiteArchive pins migration 0004's rebuilt triggers: for
+// a site the size is html_content plus the stored zip, on insert and on update
+// of either column. Restore inserts rows with their size already set, so a
+// trigger that only knew html_content would zero every site's size.
+func TestContentSizeCountsSiteArchive(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	sizeOf := func() int64 {
+		t.Helper()
+		var n int64
+		if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'site'`).Scan(&n); err != nil {
+			t.Fatalf("read content_size: %v", err)
+		}
+		return n
+	}
+
+	if _, err := conn.Exec(
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind, archive)
+		 VALUES ('site', 'n', '', 'code', 1, 'site', ?)`, []byte("12345"),
+	); err != nil {
+		t.Fatalf("insert site: %v", err)
+	}
+	if got := sizeOf(); got != 5 {
+		t.Errorf("content_size = %d for a 5-byte archive and no html, want 5", got)
+	}
+
+	if _, err := conn.Exec(`UPDATE files SET archive = ? WHERE slug = 'site'`, []byte("1234567890")); err != nil {
+		t.Fatalf("replace archive: %v", err)
+	}
+	if got := sizeOf(); got != 10 {
+		t.Errorf("content_size = %d after replacing the archive with 10 bytes, want 10", got)
+	}
+
+	// Both columns count: html bytes (not characters) plus archive bytes.
+	if _, err := conn.Exec(`UPDATE files SET html_content = ? WHERE slug = 'site'`, "汉"); err != nil {
+		t.Fatalf("set html: %v", err)
+	}
+	if got := sizeOf(); got != 13 {
+		t.Errorf("content_size = %d for 3 html bytes + 10 archive bytes, want 13", got)
+	}
+
+	// A restore-style insert that already carries a size the triggers disagree
+	// with is corrected rather than trusted.
+	if _, err := conn.Exec(
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind, archive, content_size)
+		 VALUES ('restored', 'n', '', 'code2', 1, 'site', ?, 0)`, []byte("abc"),
+	); err != nil {
+		t.Fatalf("insert restored site: %v", err)
+	}
+	var n int64
+	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'restored'`).Scan(&n); err != nil {
+		t.Fatalf("read restored size: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("restored site content_size = %d, want 3", n)
 	}
 }

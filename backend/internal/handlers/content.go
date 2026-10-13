@@ -65,16 +65,17 @@ func downloadContentType(kind string) string {
 	case KindSite:
 		return "application/zip"
 	default:
-		return "text/html; charset=utf-8"
+		return htmlContentType
 	}
 }
 
 // markdown is the shared, stateless goldmark converter. GFM adds tables,
 // strikethrough, task lists and autolinks. WithUnsafe passes raw HTML in the
-// source through untouched: this app already serves admin-authored HTML files
-// verbatim, so the admin is a trusted author and markdown is just another
-// authoring format for the same content — sanitizing here would buy no safety
-// the "html" kind doesn't already give away.
+// source through untouched: this app already serves uploader-authored HTML
+// files verbatim (contained by the CSP sandbox, see userContentCSP), so
+// uploaders are trusted authors and markdown is just another authoring format
+// for the same content — sanitizing here would buy no safety the "html" kind
+// doesn't already give away.
 var markdown = goldmark.New(
 	goldmark.WithExtensions(extension.GFM),
 	goldmark.WithRendererOptions(ghtml.WithUnsafe()),

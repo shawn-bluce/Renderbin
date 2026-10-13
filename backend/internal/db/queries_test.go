@@ -669,6 +669,33 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			}
 			return len(rows) != 0
 		}},
+		{"GetUserFileSize", func(t *testing.T, q *sqlcgen.Queries) bool {
+			_, err := q.GetUserFileSize(ctx, sqlcgen.GetUserFileSizeParams{Slug: "a", UserID: stranger})
+			return !errors.Is(err, sql.ErrNoRows)
+		}},
+		{"SumUserContentSize", func(t *testing.T, q *sqlcgen.Queries) bool {
+			used, err := q.SumUserContentSize(ctx, stranger)
+			if err != nil {
+				t.Fatalf("SumUserContentSize: %v", err)
+			}
+			return used != 0
+		}},
+		{"SearchUserFilesByName", func(t *testing.T, q *sqlcgen.Queries) bool {
+			rows, err := q.SearchUserFilesByName(ctx, sqlcgen.SearchUserFilesByNameParams{UserID: stranger, NameQuery: "name"})
+			if err != nil {
+				t.Fatalf("SearchUserFilesByName: %v", err)
+			}
+			return len(rows) != 0
+		}},
+		{"SearchUserFilesWithContent", func(t *testing.T, q *sqlcgen.Queries) bool {
+			rows, err := q.SearchUserFilesWithContent(ctx, sqlcgen.SearchUserFilesWithContentParams{
+				UserID: stranger, NameQuery: "name", ContentQuery: "<p>",
+			})
+			if err != nil {
+				t.Fatalf("SearchUserFilesWithContent: %v", err)
+			}
+			return len(rows) != 0
+		}},
 	}
 
 	for _, c := range cases {
@@ -686,6 +713,51 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			if got.Name != "name-a" || got.HtmlContent != "<p>a</p>" || got.AccessCode != "code-a" ||
 				got.IsPublic || got.Tags != "" || got.DeletedAt.Valid {
 				t.Errorf("file was mutated by a foreign-owner query: %+v", got)
+			}
+		})
+	}
+
+	// Site-only statements carry AND kind = 'site', so against a document they
+	// match nothing for anyone -- a stranger's miss would prove nothing. Run
+	// them against a real site, with the owner's own call as the control that
+	// the statement can match at all.
+	for _, c := range []struct {
+		name string
+		run  func(q *sqlcgen.Queries, userID int64) error
+	}{
+		{"UpdateSiteMeta", func(q *sqlcgen.Queries, userID int64) error {
+			_, err := q.UpdateSiteMeta(ctx, sqlcgen.UpdateSiteMetaParams{
+				Name: "hacked", NewSlug: "site", AccessCode: "hacked", Slug: "site", UserID: userID,
+			})
+			return err
+		}},
+		{"ReplaceSiteArchive", func(q *sqlcgen.Queries, userID int64) error {
+			_, err := q.ReplaceSiteArchive(ctx, sqlcgen.ReplaceSiteArchiveParams{
+				Archive: []byte("hacked"), Slug: "site", UserID: userID,
+			})
+			return err
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			q := newQueries(t)
+			createFile(t, q, "a") // seeds user 1
+			if _, err := q.CreateSite(ctx, sqlcgen.CreateSiteParams{
+				Slug: "site", Name: "site", Archive: []byte("original"), AccessCode: "code-site", UserID: owner,
+			}); err != nil {
+				t.Fatalf("CreateSite: %v", err)
+			}
+			if err := c.run(q, stranger); !errors.Is(err, sql.ErrNoRows) {
+				t.Errorf("%s as user %d: err = %v, want no rows", c.name, stranger, err)
+			}
+			got, err := q.GetFileBySlugAnyOwner(ctx, "site")
+			if err != nil {
+				t.Fatalf("site should still exist: %v", err)
+			}
+			if got.Name != "site" || got.AccessCode != "code-site" || string(got.Archive) != "original" {
+				t.Errorf("site was mutated by a foreign-owner statement: %+v", got)
+			}
+			if err := c.run(q, owner); err != nil {
+				t.Errorf("%s as the owner: %v (the statement never matches, so the check above is vacuous)", c.name, err)
 			}
 		})
 	}

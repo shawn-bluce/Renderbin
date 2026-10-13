@@ -32,13 +32,12 @@ type setupStatusResponse struct {
 func (h *SetupHandler) Status(w http.ResponseWriter, r *http.Request) {
 	count, err := h.queries.CountUsers(r.Context())
 	if err != nil {
-		h.logger.Error("count users", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "count users", err)
 		return
 	}
 	writeJSON(w, setupStatusResponse{
 		NeedsSetup:        count == 0,
-		AllowRegistration: configBool(r, h.queries, ConfigAllowRegistration),
+		AllowRegistration: configBool(r.Context(), h.queries, ConfigAllowRegistration),
 	})
 }
 
@@ -62,38 +61,30 @@ func (h *SetupHandler) Setup(w http.ResponseWriter, r *http.Request) {
 	// table is empty, so the "is this the first run" decision happens inside
 	// the write instead of ~80ms of bcrypt before it. Concurrent requests used
 	// to all pass a CountUsers check and create an account each.
-	user, errMsg, err := createUser(r, h.queries, registerRequest{
+	user, err := createUser(r.Context(), h.queries, registerRequest{
 		Username: req.Username,
 		Nickname: req.Nickname,
 		Password: req.Password,
 	}, true)
-	if errMsg != "" {
-		http.Error(w, errMsg, http.StatusBadRequest)
-		return
-	}
 	if errors.Is(err, errFirstUserExists) {
 		http.Error(w, "already set up", http.StatusConflict)
 		return
 	}
 	if err != nil {
-		h.logger.Error("create first user", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeCreateUserError(w, h.logger, "create first user", err)
 		return
 	}
 
-	for key, value := range map[string]string{
-		ConfigAllowRegistration: boolString(req.AllowRegistration),
-		ConfigMCPEnabled:        boolString(req.MCPEnabled),
-	} {
-		if err := h.queries.SetConfig(r.Context(), sqlcgen.SetConfigParams{Key: key, Value: value}); err != nil {
-			h.logger.Error("set config", "key", key, "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
+	if err := setBoolConfigs(r.Context(), h.queries, map[string]bool{
+		ConfigAllowRegistration: req.AllowRegistration,
+		ConfigMCPEnabled:        req.MCPEnabled,
+	}); err != nil {
+		serverError(w, h.logger, "set config", err)
+		return
 	}
 
 	if err := h.auth.startSession(w, r, user.ID); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		internalError(w)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)

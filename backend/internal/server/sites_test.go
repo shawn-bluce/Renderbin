@@ -5,21 +5,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/shawn-bluce/renderbin/backend/internal/db"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
-	"github.com/shawn-bluce/renderbin/backend/internal/server"
 )
 
 // ---------------------------------------------------------------------------
@@ -112,23 +106,7 @@ func (e *testEnv) raw(t *testing.T, method, path string, body []byte, cookie *ht
 	if body != nil {
 		r = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, e.srv.URL+path, r)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	if cookie != nil {
-		req.AddCookie(cookie)
-	}
-	client := *e.srv.Client()
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
-	}
-	return resp
+	return e.send(t, method, path, r, cookie, headers, false)
 }
 
 func (e *testEnv) uploadSite(t *testing.T, cookie *http.Cookie, name string, files map[string]string) siteResp {
@@ -145,25 +123,19 @@ func (e *testEnv) uploadSite(t *testing.T, cookie *http.Cookie, name string, fil
 	return decodeSite(t, resp)
 }
 
-func (e *testEnv) publish(t *testing.T, cookie *http.Cookie, slug string) {
-	t.Helper()
-	resp := e.do(t, http.MethodPatch, "/api/files/"+slug+"/visibility", `{"is_public":true}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
-}
-
+// fileRow reads a live file's row straight from the database, counters and
+// stored sizes included.
 func (e *testEnv) fileRow(t *testing.T, slug string) sqlcgen.File {
 	t.Helper()
-	var f sqlcgen.File
-	err := e.conn.QueryRow(`SELECT success_count, code_success_count, failure_count, view_count,
-		is_public, expired_reason, content_size, COALESCE(length(archive), 0), html_content
-		FROM files WHERE slug = ?`, slug).Scan(&f.SuccessCount, &f.CodeSuccessCount, &f.FailureCount,
-		&f.ViewCount, &f.IsPublic, &f.ExpiredReason, &f.ContentSize, &f.ID, &f.HtmlContent)
+	f, err := e.queries.GetFileBySlugAnyOwner(context.Background(), slug)
 	if err != nil {
 		t.Fatalf("read row %q: %v", slug, err)
 	}
-	return f // ID carries length(archive)
+	return f
 }
+
+// archiveSize is the byte length of a site row's stored zip.
+func archiveSize(f sqlcgen.File) int64 { return int64(len(f.Archive)) }
 
 func wantRedirect(t *testing.T, resp *http.Response, location string) {
 	t.Helper()
@@ -186,6 +158,9 @@ func TestSiteUploadAndNavigation(t *testing.T) {
 	}
 	if s.Name != "Demo Site" {
 		t.Errorf("name = %q, want the <title> of index.html", s.Name)
+	}
+	if u := e.uploadSite(t, cookie, "", map[string]string{"index.html": "<p>hi</p>"}); u.Name != "Untitled" {
+		t.Errorf("name without <title> = %q, want Untitled", u.Name)
 	}
 	// The wrapping "demo/" directory is stripped and __MACOSX dropped.
 	if len(s.Entries) != 9 {
@@ -320,16 +295,21 @@ func TestSiteAccessControl(t *testing.T) {
 		}
 	}
 
-	// The owner is sent into the site with a preview token.
-	resp := e.raw(t, http.MethodGet, "/res/"+s.Slug, nil, cookie, nil)
-	resp.Body.Close()
-	assertStatus(t, resp, http.StatusFound)
-	loc := resp.Header.Get("Location")
+	// The owner is sent into the site with a preview token -- from the bare
+	// URL and from a share link with the access code alike (the dashboard's
+	// "open" link is the share link, and its hop must land on a URL ending in "/").
 	prefix := "/res/" + s.Slug + "/~"
-	if !strings.HasPrefix(loc, prefix) || !strings.HasSuffix(loc, "/") {
-		t.Fatalf("owner redirect = %q, want %s.../", loc, prefix)
+	var previewBase string
+	for _, p := range []string{"/res/" + s.Slug, "/res/" + s.Slug + "?code=" + code} {
+		resp := e.raw(t, http.MethodGet, p, nil, cookie, nil)
+		resp.Body.Close()
+		assertStatus(t, resp, http.StatusFound)
+		loc := resp.Header.Get("Location")
+		if !strings.HasPrefix(loc, prefix) || !strings.HasSuffix(loc, "/") {
+			t.Fatalf("owner redirect for %s = %q, want %s.../", p, loc, prefix)
+		}
+		previewBase = loc
 	}
-	previewBase := loc
 
 	// The preview URL works with no cookie at all -- which is how the
 	// browser will actually fetch the page's subresources.
@@ -349,7 +329,7 @@ func TestSiteAccessControl(t *testing.T) {
 
 	// The site route ignores cookies: the owner's session with a wrong
 	// token is still refused.
-	resp = e.raw(t, http.MethodGet, "/res/"+s.Slug+"/wrong/", nil, cookie, nil)
+	resp := e.raw(t, http.MethodGet, "/res/"+s.Slug+"/wrong/", nil, cookie, nil)
 	resp.Body.Close()
 	assertStatus(t, resp, http.StatusForbidden)
 
@@ -435,9 +415,7 @@ func TestSiteViewCounting(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)
 	s := e.uploadSite(t, cookie, "counted", demoSite())
-	resp := e.do(t, http.MethodPatch, "/api/files/"+s.Slug+"/expiry", `{"max_views":1}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodPatch, "/api/files/"+s.Slug+"/expiry", `{"max_views":1}`, cookie)
 	base := "/res/" + s.Slug + "/" + s.AccessCode + "/"
 
 	get := func(path, dest string) int {
@@ -484,7 +462,7 @@ func TestSiteViewCounting(t *testing.T) {
 
 	// A wrong token counts as a failure only for page requests.
 	before := e.fileRow(t, s.Slug).FailureCount
-	resp = e.raw(t, http.MethodGet, "/res/"+s.Slug+"/bad/css/site.css", nil, nil, map[string]string{"Sec-Fetch-Dest": "style"})
+	resp := e.raw(t, http.MethodGet, "/res/"+s.Slug+"/bad/css/site.css", nil, nil, map[string]string{"Sec-Fetch-Dest": "style"})
 	resp.Body.Close()
 	resp = e.raw(t, http.MethodGet, "/res/"+s.Slug+"/bad/", nil, nil, nil)
 	resp.Body.Close()
@@ -514,8 +492,8 @@ func TestSiteStorageAndEdits(t *testing.T) {
 
 	// content_size is the compressed archive, i.e. what the database holds.
 	row := e.fileRow(t, s.Slug)
-	if row.ContentSize != row.ID || row.ContentSize == 0 {
-		t.Errorf("content_size = %d, archive = %d bytes", row.ContentSize, row.ID)
+	if row.ContentSize != archiveSize(row) || row.ContentSize == 0 {
+		t.Errorf("content_size = %d, archive = %d bytes", row.ContentSize, archiveSize(row))
 	}
 	if row.HtmlContent != "" {
 		t.Errorf("html_content = %q, want empty for a site", row.HtmlContent)
@@ -523,17 +501,13 @@ func TestSiteStorageAndEdits(t *testing.T) {
 	size := row.ContentSize
 
 	// PATCH cannot write a document into a site.
-	resp := e.do(t, http.MethodPatch, "/api/files/"+s.Slug,
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+s.Slug,
 		`{"name":"x","slug":"`+s.Slug+`","html_content":"<p>x</p>","access_code":"`+s.AccessCode+`"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
 	// Without content it renames, re-slugs and re-codes, and the size holds.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+s.Slug,
+	e.expect(t, http.StatusOK, http.MethodPatch, "/api/files/"+s.Slug,
 		`{"name":"renamed","slug":"my-site","access_code":"newcode"}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
-	if r := e.fileRow(t, "my-site"); r.ContentSize != size || r.ID != size {
-		t.Errorf("after PATCH: content_size=%d archive=%d, want %d", r.ContentSize, r.ID, size)
+	if r := e.fileRow(t, "my-site"); r.ContentSize != size || archiveSize(r) != size {
+		t.Errorf("after PATCH: content_size=%d archive=%d, want %d", r.ContentSize, archiveSize(r), size)
 	}
 
 	// Dot segments are refused as slugs and codes: the browser would drop
@@ -543,13 +517,9 @@ func TestSiteStorageAndEdits(t *testing.T) {
 		`{"name":"x","slug":"..","access_code":"abc"}`,
 		`{"name":"x","slug":"ok-slug","access_code":"."}`,
 	} {
-		resp := e.do(t, http.MethodPatch, "/api/files/my-site", body, cookie)
-		assertStatus(t, resp, http.StatusBadRequest)
-		resp.Body.Close()
+		e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/my-site", body, cookie)
 	}
-	resp = e.do(t, http.MethodPatch, "/api/files/"+doc.Slug, `{"name":"x","slug":"..","html_content":"<p>x</p>","access_code":"abc"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+doc.Slug, `{"name":"x","slug":"..","html_content":"<p>x</p>","access_code":"abc"}`, cookie)
 
 	// Replacing the whole site.
 	put := e.raw(t, http.MethodPut, "/api/files/my-site/site",
@@ -561,7 +531,7 @@ func TestSiteStorageAndEdits(t *testing.T) {
 	if replaced.Name != "renamed" || len(replaced.Entries) != 1 {
 		t.Errorf("replace: name %q, %d entries", replaced.Name, len(replaced.Entries))
 	}
-	resp = e.raw(t, http.MethodGet, "/res/my-site/newcode/", nil, nil, nil)
+	resp := e.raw(t, http.MethodGet, "/res/my-site/newcode/", nil, nil, nil)
 	resp.Body.Close()
 	assertStatus(t, resp, http.StatusForbidden) // still private
 	e.publish(t, cookie, "my-site")
@@ -569,8 +539,8 @@ func TestSiteStorageAndEdits(t *testing.T) {
 	if body := bodyString(t, resp); !strings.Contains(body, "v2") {
 		t.Errorf("after replace: %q", body)
 	}
-	if r := e.fileRow(t, "my-site"); r.ContentSize != r.ID {
-		t.Errorf("after replace: content_size=%d archive=%d", r.ContentSize, r.ID)
+	if r := e.fileRow(t, "my-site"); r.ContentSize != archiveSize(r) {
+		t.Errorf("after replace: content_size=%d archive=%d", r.ContentSize, archiveSize(r))
 	}
 
 	// A document cannot be replaced with a zip.
@@ -616,7 +586,7 @@ func TestSiteSurvivesBackupRestore(t *testing.T) {
 	cookie := e.authCookie(t)
 	s := e.uploadSite(t, cookie, "backed up", demoSite())
 	before := e.fileRow(t, s.Slug)
-	snapshot := e.download(t, "/api/backup", cookie)
+	snapshot := e.downloadBackup(t, cookie)
 
 	resp := e.do(t, http.MethodDelete, "/api/files/"+s.Slug, "", cookie)
 	resp.Body.Close()
@@ -628,9 +598,9 @@ func TestSiteSurvivesBackupRestore(t *testing.T) {
 	restored.Body.Close()
 
 	after := e.fileRow(t, s.Slug)
-	if after.ID != before.ID || after.ContentSize != before.ContentSize || after.ContentSize == 0 {
+	if archiveSize(after) != archiveSize(before) || after.ContentSize != before.ContentSize || after.ContentSize == 0 {
 		t.Errorf("restored archive=%d size=%d, want archive=%d size=%d",
-			after.ID, after.ContentSize, before.ID, before.ContentSize)
+			archiveSize(after), after.ContentSize, archiveSize(before), before.ContentSize)
 	}
 	if _, err := e.conn.Exec(`UPDATE files SET is_public = 1 WHERE slug = ?`, s.Slug); err != nil {
 		t.Fatal(err)
@@ -642,23 +612,11 @@ func TestSiteSurvivesBackupRestore(t *testing.T) {
 }
 
 func TestSiteTokensAreRedactedInLogs(t *testing.T) {
-	conn, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	defer conn.Close()
-	var logs bytes.Buffer
-	srv := httptest.NewServer(server.New(sqlcgen.New(conn), conn, slog.New(slog.NewTextHandler(&logs, nil))))
-	defer srv.Close()
-
+	e := newBareEnv(t)
 	for _, p := range []string{"/res/abc/SECRETCODE/css/a.css", "/res/abc/~SECRETPREVIEW/", "/res/abc/SECRETBARE"} {
-		resp, err := srv.Client().Get(srv.URL + p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
+		e.expect(t, http.StatusNotFound, http.MethodGet, p, "", nil)
 	}
-	out := logs.String()
+	out := e.logs.String()
 	if strings.Contains(out, "SECRET") {
 		t.Errorf("a site token reached the log:\n%s", out)
 	}
@@ -688,7 +646,7 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 	e := newEnv(t)
 	key := e.enableMCP(t)
 
-	res := decodeMCPResult(t, e.mcpCall(t, key, "upload_site", map[string]any{
+	res := e.mcpOK(t, key, "upload_site", map[string]any{
 		"files": mcpFiles(map[string]string{
 			"index.html":  `<title>Agent Site</title><a href="b.html">b</a>`,
 			"b.html":      `<link rel=stylesheet href="s.css"><p>bee</p>`,
@@ -696,10 +654,7 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 			"old/x.html":  `<p>old</p>`,
 			"docs/a.html": `<p>a</p>`,
 		}),
-	}))
-	if res.IsError {
-		t.Fatalf("upload_site: %s", res.text())
-	}
+	})
 	out := res.StructuredContent
 	slug, _ := out["slug"].(string)
 	siteURL, _ := out["url"].(string)
@@ -711,25 +666,19 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 	}
 
 	// Published through the ordinary tool, the share URL hops into the site.
-	res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{"slug": slug}))
-	if res.IsError {
-		t.Fatalf("publish_file: %s", res.text())
-	}
+	res = e.mcpOK(t, key, "publish_file", map[string]any{"slug": slug})
 	resp := e.do(t, http.MethodGet, e.pathOf(t, siteURL), "", nil) // follows redirects
 	if body := bodyString(t, resp); !strings.Contains(body, "Agent Site") {
 		t.Errorf("share URL serves %q", body)
 	}
 
 	// A patch touches only what it names.
-	res = decodeMCPResult(t, e.mcpCall(t, key, "update_site", map[string]any{
+	res = e.mcpOK(t, key, "update_site", map[string]any{
 		"slug":   slug,
 		"name":   "Renamed Site",
 		"put":    mcpFiles(map[string]string{"b.html": `<p>bee v2</p>`, "c.html": `<p>sea</p>`}),
 		"delete": []string{"old/x.html"},
-	}))
-	if res.IsError {
-		t.Fatalf("update_site: %s", res.text())
-	}
+	})
 	if res.StructuredContent["name"] != "Renamed Site" {
 		t.Errorf("update_site name = %v", res.StructuredContent["name"])
 	}
@@ -744,8 +693,8 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 			t.Errorf("b.html after update = %q", body)
 		}
 	}
-	if r := e.fileRow(t, slug); r.ContentSize != r.ID {
-		t.Errorf("after update_site: content_size=%d archive=%d", r.ContentSize, r.ID)
+	if r := e.fileRow(t, slug); r.ContentSize != archiveSize(r) {
+		t.Errorf("after update_site: content_size=%d archive=%d", r.ContentSize, archiveSize(r))
 	}
 
 	// Refusals arrive as tool errors that say what to do.
@@ -765,7 +714,7 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 		{"upload_site", map[string]any{"files": mcpFiles(map[string]string{"a.html": "x"})}, "index.html"},
 		{"upload_site", map[string]any{"files": mcpFiles(map[string]string{"index.html": "x", "/abs.html": "x"})}, "absolute"},
 	} {
-		res := decodeMCPResult(t, e.mcpCall(t, key, c.tool, c.args))
+		res := e.mcp(t, key, c.tool, c.args)
 		if !res.IsError || !strings.Contains(res.text(), c.want) {
 			t.Errorf("%s %v: isError=%v %q, want an error mentioning %q", c.tool, c.args, res.IsError, res.text(), c.want)
 		}
@@ -775,7 +724,7 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 	}
 
 	// list_files reports the kind.
-	res = decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
+	res = e.mcp(t, key, "list_files", map[string]any{})
 	if !strings.Contains(res.text(), "[site,") {
 		t.Errorf("list_files does not show the site's kind: %s", res.text())
 	}
@@ -783,9 +732,9 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 	// Another account's site is "not found", exactly like a missing slug.
 	other, _ := e.newUser(t, "other")
 	otherKey := e.apiKeyFor(t, other.ID)
-	res = decodeMCPResult(t, e.mcpCall(t, otherKey, "update_site", map[string]any{
+	res = e.mcp(t, otherKey, "update_site", map[string]any{
 		"slug": slug, "put": mcpFiles(map[string]string{"index.html": "pwned"}),
-	}))
+	})
 	if !res.IsError || !strings.Contains(res.text(), "not found") {
 		t.Errorf("foreign update_site: %q", res.text())
 	}
@@ -801,27 +750,9 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 		{"upload_site", map[string]any{"files": mcpFiles(map[string]string{"index.html": "x"})}},
 		{"update_site", map[string]any{"slug": slug, "put": mcpFiles(map[string]string{"big.txt": strings.Repeat("z", 4096)})}},
 	} {
-		res := decodeMCPResult(t, e.mcpCall(t, key, c.tool, c.args))
+		res := e.mcp(t, key, c.tool, c.args)
 		if !res.IsError || !strings.Contains(res.text(), "quota") {
 			t.Errorf("%s over quota: %q", c.tool, res.text())
 		}
-	}
-}
-
-// TestSiteOwnerOpenLink guards the redirect the dashboard depends on: the
-// owner's "open" link is the ordinary share link, and for its owner the hop
-// must land on a preview URL that ends in "/".
-func TestSiteOwnerOpenLink(t *testing.T) {
-	e := newEnv(t)
-	cookie := e.authCookie(t)
-	s := e.uploadSite(t, cookie, "", map[string]string{"index.html": "<p>hi</p>"})
-	resp := e.raw(t, http.MethodGet, fmt.Sprintf("/res/%s?code=%s", s.Slug, s.AccessCode), nil, cookie, nil)
-	resp.Body.Close()
-	assertStatus(t, resp, http.StatusFound)
-	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/res/"+s.Slug+"/~") || !strings.HasSuffix(loc, "/") {
-		t.Errorf("owner open link redirects to %q", loc)
-	}
-	if s.Name != "Untitled" {
-		t.Errorf("name without <title> = %q, want Untitled", s.Name)
 	}
 }

@@ -107,8 +107,8 @@ func resetPassword(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 		}
 		secret = read
 	}
-	if len(secret) < auth.MinPasswordLen {
-		return fmt.Errorf("password must be at least %d characters", auth.MinPasswordLen)
+	if msg := auth.ValidatePassword(secret); msg != "" {
+		return errors.New(msg)
 	}
 
 	dbPath := envOr("DB_PATH", defaultDBPath)
@@ -132,15 +132,11 @@ func resetPassword(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
-	rows, err := queries.UpdateUserPassword(ctx, sqlcgen.UpdateUserPasswordParams{
+	if _, err := queries.UpdateUserPassword(ctx, sqlcgen.UpdateUserPasswordParams{
 		PasswordHash: hash,
 		ID:           user.ID,
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("update password: %w", err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("no account named %q", *username)
 	}
 	// Same reasoning as the super admin's reset endpoint: this is reached for
 	// lockouts and compromises, and both want current sessions ended.

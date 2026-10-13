@@ -108,7 +108,7 @@ func NewMCPHandler(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) 
 // requireMCPEnabled 403s every /mcp request while the mcp_enabled config is off.
 func (m *MCPHandler) requireMCPEnabled(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !configBool(r, m.queries, ConfigMCPEnabled) {
+		if !configBool(r.Context(), m.queries, ConfigMCPEnabled) {
 			http.Error(w, "MCP is disabled", http.StatusForbidden)
 			return
 		}
@@ -128,17 +128,15 @@ func capRequestBody(next http.Handler) http.Handler {
 // (surfaced as req.Extra.TokenInfo) — the SDK's supported identity path; the
 // tool-handler ctx does not carry HTTP middleware values.
 func (m *MCPHandler) verifyAPIKey(ctx context.Context, token string, r *http.Request) (*mcpauth.TokenInfo, error) {
-	user, err := m.queries.GetUserByAPIKey(ctx, sql.NullString{String: token, Valid: true})
+	// Same rule as the REST API's Bearer auth, including that a suspended
+	// account's key is dead: otherwise suspension would close the browser door
+	// and leave the agent one open.
+	user, err := userByAPIKey(ctx, m.queries, token)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, mcpauth.ErrInvalidToken
 	}
 	if err != nil {
 		return nil, err
-	}
-	// A suspended account's key is as dead as its password. Without this,
-	// suspension would close the browser door and leave the agent one open.
-	if user.DisabledAt.Valid {
-		return nil, mcpauth.ErrInvalidToken
 	}
 	return &mcpauth.TokenInfo{
 		UserID: strconv.FormatInt(user.ID, 10),
@@ -168,20 +166,33 @@ func accessURL(baseURL string, f sqlcgen.File) string {
 	return baseURL + "/res/" + f.Slug + "?code=" + f.AccessCode
 }
 
-// ownedFile loads the user's own non-deleted file. Ownership is enforced by
-// the query itself, so a missing slug and someone else's slug are literally
-// the same case: no row, hence the same errFileNotFound.
-func (m *MCPHandler) ownedFile(ctx context.Context, user sqlcgen.User, slug string) (sqlcgen.File, error) {
-	file, err := m.queries.GetUserFileBySlug(ctx, sqlcgen.GetUserFileBySlugParams{
+// toolError turns a failure into what the agent gets to see. Problems with
+// the agent's own input (a site that fails validation, an over-quota write, a
+// slug that is not theirs) pass through as the tool error; anything else is
+// logged and shown only as "internal error". sql.ErrNoRows means "not found in
+// this project" because every query is owner-scoped: a missing slug and
+// someone else's slug are literally the same case.
+func (m *MCPHandler) toolError(op string, err error, args ...any) error {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return errFileNotFound
+	case site.IsUserError(err), errors.Is(err, errOverQuota), errors.Is(err, errFileNotFound):
+		return err
+	}
+	m.logger.Error("mcp "+op, append(args[:len(args):len(args)], "error", err)...)
+	return errors.New("internal error")
+}
+
+// ownedFile loads the user's own non-deleted file through q (the plain
+// queries, or a transaction's). Ownership is enforced by the query itself, so
+// a missing slug and someone else's slug are the same errFileNotFound.
+func (m *MCPHandler) ownedFile(ctx context.Context, q *sqlcgen.Queries, user sqlcgen.User, slug string) (sqlcgen.File, error) {
+	file, err := q.GetUserFileBySlug(ctx, sqlcgen.GetUserFileBySlugParams{
 		Slug:   slug,
 		UserID: user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		return sqlcgen.File{}, errFileNotFound
-	}
 	if err != nil {
-		m.logger.Error("mcp get file", "error", err)
-		return sqlcgen.File{}, errors.New("internal error")
+		return sqlcgen.File{}, m.toolError("get file", err)
 	}
 	return file, nil
 }
@@ -230,36 +241,25 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 	if !ok {
 		return sqlcgen.File{}, errors.New("kind must be markdown or html")
 	}
-	if in.Content == "" {
-		return sqlcgen.File{}, errors.New("content is required")
+	if _, msg := contentProblem("content", in.Content); msg != "" {
+		return sqlcgen.File{}, errors.New(msg)
 	}
-	if len(in.Content) > maxHTMLBytes {
-		return sqlcgen.File{}, errors.New("content exceeds 5MB")
-	}
-	name := strings.TrimSpace(in.Name)
-	if name == "" {
-		name = "Untitled"
-	}
-	// The same bound the HTTP path applies. Without it an agent could store a
-	// multi-kilobyte name that later turns every download of that file into a
-	// 502 from the reverse proxy, whose header buffer it overflows.
-	if len(name) > maxNameBytes {
-		return sqlcgen.File{}, fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	// The same name bound the HTTP path applies. Without it an agent could
+	// store a multi-kilobyte name that later turns every download of that file
+	// into a 502 from the reverse proxy, whose header buffer it overflows.
+	name, err := cleanName(in.Name)
+	if err != nil {
+		return sqlcgen.File{}, err
 	}
 	// Storage limits are per account, not per protocol: an API key that could
 	// ignore them would make users.quota_bytes decorative.
 	if err := enforceQuota(ctx, m.queries, user, int64(len(in.Content)), 0); err != nil {
-		if errors.Is(err, errOverQuota) {
-			return sqlcgen.File{}, err
-		}
-		m.logger.Error("mcp check quota", "user_id", user.ID, "error", err)
-		return sqlcgen.File{}, errors.New("internal error")
+		return sqlcgen.File{}, m.toolError("check quota", err, "user_id", user.ID)
 	}
 
 	accessCode, err := auth.NewAccessCode()
 	if err != nil {
-		m.logger.Error("mcp generate access code", "error", err)
-		return sqlcgen.File{}, errors.New("internal error")
+		return sqlcgen.File{}, m.toolError("generate access code", err)
 	}
 	file, err := createFileWithFreshSlug(ctx, m.queries, sqlcgen.CreateFileParams{
 		Name:        name,
@@ -273,26 +273,21 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 		UserID:     user.ID,
 	})
 	if err != nil {
-		m.logger.Error("mcp create file", "error", err)
-		return sqlcgen.File{}, errors.New("internal error")
+		return sqlcgen.File{}, m.toolError("create file", err)
 	}
 	return file, nil
 }
 
-type uploadFileOutput struct {
-	mcpFileInfo
-}
-
-func (m *MCPHandler) uploadFile(ctx context.Context, req *mcp.CallToolRequest, in mcpUploadInput) (*mcp.CallToolResult, uploadFileOutput, error) {
+func (m *MCPHandler) uploadFile(ctx context.Context, req *mcp.CallToolRequest, in mcpUploadInput) (*mcp.CallToolResult, mcpFileInfo, error) {
 	user, baseURL, err := mcpIdentity(req)
 	if err != nil {
-		return nil, uploadFileOutput{}, err
+		return nil, mcpFileInfo{}, err
 	}
 	file, err := m.createUpload(ctx, user, in)
 	if err != nil {
-		return nil, uploadFileOutput{}, err
+		return nil, mcpFileInfo{}, err
 	}
-	out := uploadFileOutput{fileInfo(baseURL, file)}
+	out := fileInfo(baseURL, file)
 	return textResult("Uploaded %q (private). URL: %s — call publish_file with slug %q to make it publicly viewable.",
 		out.Name, out.URL, out.Slug), out, nil
 }
@@ -369,8 +364,7 @@ func (m *MCPHandler) listFiles(ctx context.Context, req *mcp.CallToolRequest, _ 
 
 	rows, err := m.queries.ListUserFiles(ctx, user.ID)
 	if err != nil {
-		m.logger.Error("mcp list files", "error", err)
-		return nil, listFilesOutput{}, errors.New("internal error")
+		return nil, listFilesOutput{}, m.toolError("list files", err)
 	}
 	files := make([]sqlcgen.File, 0, len(rows))
 	for _, row := range rows {
@@ -448,8 +442,7 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 		ContentQuery: q,
 	})
 	if err != nil {
-		m.logger.Error("mcp search files", "error", err)
-		return nil, searchFilesOutput{}, errors.New("internal error")
+		return nil, searchFilesOutput{}, m.toolError("search files", err)
 	}
 
 	if len(rows) == 0 {
@@ -487,11 +480,13 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if in.Name == "" && in.Content == "" {
 		return nil, mcpFileInfo{}, errors.New("provide a new name, new content, or both")
 	}
-	if len(in.Content) > maxHTMLBytes {
-		return nil, mcpFileInfo{}, errors.New("content exceeds 5MB")
+	if in.Content != "" {
+		if _, msg := contentProblem("content", in.Content); msg != "" {
+			return nil, mcpFileInfo{}, errors.New(msg)
+		}
 	}
 
-	file, err := m.ownedFile(ctx, user, in.Slug)
+	file, err := m.ownedFile(ctx, m.queries, user, in.Slug)
 	if err != nil {
 		return nil, mcpFileInfo{}, err
 	}
@@ -507,8 +502,8 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if in.Name != "" {
 		name = strings.TrimSpace(in.Name)
 	}
-	if len(name) > maxNameBytes {
-		return nil, mcpFileInfo{}, fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	if err := nameTooLong(name); err != nil {
+		return nil, mcpFileInfo{}, err
 	}
 	content := file.HtmlContent
 	if in.Content != "" {
@@ -517,11 +512,7 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	// file.ContentSize is what this write replaces, so rewriting a document
 	// with one of the same size is not charged twice.
 	if err := enforceQuota(ctx, m.queries, user, int64(len(content)), file.ContentSize); err != nil {
-		if errors.Is(err, errOverQuota) {
-			return nil, mcpFileInfo{}, err
-		}
-		m.logger.Error("mcp check quota", "user_id", user.ID, "error", err)
-		return nil, mcpFileInfo{}, errors.New("internal error")
+		return nil, mcpFileInfo{}, m.toolError("check quota", err, "user_id", user.ID)
 	}
 	updated, err := m.queries.UpdateFile(ctx, sqlcgen.UpdateFileParams{
 		Name:        name,
@@ -532,8 +523,7 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 		UserID:      user.ID,
 	})
 	if err != nil {
-		m.logger.Error("mcp update file", "error", err)
-		return nil, mcpFileInfo{}, errors.New("internal error")
+		return nil, mcpFileInfo{}, m.toolError("update file", err)
 	}
 
 	out := fileInfo(baseURL, updated)
@@ -544,7 +534,7 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 
 type publishFileInput struct {
 	Slug string `json:"slug" jsonschema:"the document's slug (the path segment of its URL)"`
-	// Pointers, so "field omitted" is distinguishable from "24h"/0 and the
+	// Pointers, so "field omitted" is distinguishable from an explicit empty/zero value and the
 	// mutual-exclusion check below sees what the caller actually sent.
 	TTL      *string `json:"ttl,omitempty" jsonschema:"optional link lifetime as a number plus a unit - h, d, w, mo or y (e.g. 36h, 1d, 2w, 6mo, 1y), at most 10 years. Mutually exclusive with max_views"`
 	MaxViews *int64  `json:"max_views,omitempty" jsonschema:"optional number of anonymous views the link allows before going private. Mutually exclusive with ttl"`
@@ -555,14 +545,10 @@ func (m *MCPHandler) publishFile(ctx context.Context, req *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, mcpFileInfo{}, err
 	}
-	// Validated before the lookup so a bad ttl can't publish the file anyway.
+	// Validated before anything is written so a bad ttl can't publish the file anyway.
 	limit, errMsg := parseExpiryLimit(in.TTL, in.MaxViews)
 	if errMsg != "" {
 		return nil, mcpFileInfo{}, errors.New(errMsg)
-	}
-	file, err := m.ownedFile(ctx, user, in.Slug)
-	if err != nil {
-		return nil, mcpFileInfo{}, err
 	}
 
 	// SetFileExpiry publishes as part of setting a limit, so a limited publish
@@ -573,19 +559,20 @@ func (m *MCPHandler) publishFile(ctx context.Context, req *mcp.CallToolRequest, 
 		published, err = m.queries.SetFileExpiry(ctx, sqlcgen.SetFileExpiryParams{
 			ExpiresAt: limit.expiresAt,
 			MaxViews:  limit.maxViews,
-			Slug:      file.Slug,
+			Slug:      in.Slug,
 			UserID:    user.ID,
 		})
 	} else {
 		published, err = m.queries.SetFileVisibility(ctx, sqlcgen.SetFileVisibilityParams{
 			IsPublic: true,
-			Slug:     file.Slug,
+			Slug:     in.Slug,
 			UserID:   user.ID,
 		})
 	}
+	// Both statements are owner-scoped and match only live files, so "no row"
+	// is the same errFileNotFound a separate lookup would have produced.
 	if err != nil {
-		m.logger.Error("mcp publish file", "error", err)
-		return nil, mcpFileInfo{}, errors.New("internal error")
+		return nil, mcpFileInfo{}, m.toolError("publish file", err)
 	}
 
 	out := fileInfo(baseURL, published)
@@ -607,19 +594,13 @@ func (m *MCPHandler) unpublishFile(ctx context.Context, req *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpFileInfo{}, err
 	}
-	file, err := m.ownedFile(ctx, user, in.Slug)
-	if err != nil {
-		return nil, mcpFileInfo{}, err
-	}
-
 	updated, err := m.queries.SetFileVisibility(ctx, sqlcgen.SetFileVisibilityParams{
 		IsPublic: false,
-		Slug:     file.Slug,
+		Slug:     in.Slug,
 		UserID:   user.ID,
 	})
 	if err != nil {
-		m.logger.Error("mcp unpublish file", "error", err)
-		return nil, mcpFileInfo{}, errors.New("internal error")
+		return nil, mcpFileInfo{}, m.toolError("unpublish file", err)
 	}
 
 	out := fileInfo(baseURL, updated)
@@ -645,7 +626,7 @@ func (m *MCPHandler) deleteFile(ctx context.Context, req *mcp.CallToolRequest, i
 	}
 	// Re-verify ownership on both phases: the server is stateless, so the
 	// confirm=true call must stand on its own.
-	file, err := m.ownedFile(ctx, user, in.Slug)
+	file, err := m.ownedFile(ctx, m.queries, user, in.Slug)
 	if err != nil {
 		return nil, deleteFileOutput{}, err
 	}
@@ -661,8 +642,7 @@ func (m *MCPHandler) deleteFile(ctx context.Context, req *mcp.CallToolRequest, i
 		UserID: user.ID,
 	})
 	if err != nil {
-		m.logger.Error("mcp delete file", "error", err)
-		return nil, deleteFileOutput{}, errors.New("internal error")
+		return nil, deleteFileOutput{}, m.toolError("delete file", err)
 	}
 	if rows == 0 {
 		// Trashed between the ownedFile lookup and here.
@@ -697,16 +677,6 @@ func siteEntries(files []mcpSiteFile) []site.Entry {
 	return entries
 }
 
-// siteToolError passes a problem with the agent's input through as the tool
-// error and logs anything else, which the agent only sees as "internal error".
-func (m *MCPHandler) siteToolError(op string, err error) error {
-	if site.IsUserError(err) || errors.Is(err, errOverQuota) {
-		return err
-	}
-	m.logger.Error("mcp "+op, "error", err)
-	return errors.New("internal error")
-}
-
 func (m *MCPHandler) uploadSite(ctx context.Context, req *mcp.CallToolRequest, in uploadSiteInput) (*mcp.CallToolResult, siteOutput, error) {
 	user, baseURL, err := mcpIdentity(req)
 	if err != nil {
@@ -725,7 +695,7 @@ func (m *MCPHandler) uploadSite(ctx context.Context, req *mcp.CallToolRequest, i
 	// Private, like every MCP upload: publish_file is the consent step.
 	file, err := storeNewSite(ctx, m.queries, user, name, entries, false)
 	if err != nil {
-		return nil, siteOutput{}, m.siteToolError("upload site", err)
+		return nil, siteOutput{}, m.toolError("upload site", err)
 	}
 
 	out := siteOutput{mcpFileInfo: fileInfo(baseURL, file), Files: site.Infos(entries)}
@@ -749,8 +719,8 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 	if name == "" && len(in.Put) == 0 && len(in.Delete) == 0 {
 		return nil, siteOutput{}, errors.New("provide name, put or delete")
 	}
-	if len(name) > maxNameBytes {
-		return nil, siteOutput{}, fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	if err := nameTooLong(name); err != nil {
+		return nil, siteOutput{}, err
 	}
 
 	// Read, merge and write back in one transaction. The server runs a single
@@ -759,17 +729,14 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 	// this transaction holds.
 	tx, err := m.conn.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, siteOutput{}, m.siteToolError("begin update site", err)
+		return nil, siteOutput{}, m.toolError("begin update site", err)
 	}
 	defer tx.Rollback()
 	q := m.queries.WithTx(tx)
 
-	file, err := q.GetUserFileBySlug(ctx, sqlcgen.GetUserFileBySlugParams{Slug: in.Slug, UserID: user.ID})
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, siteOutput{}, errFileNotFound
-	}
+	file, err := m.ownedFile(ctx, q, user, in.Slug)
 	if err != nil {
-		return nil, siteOutput{}, m.siteToolError("get site", err)
+		return nil, siteOutput{}, err
 	}
 	if file.Kind != KindSite {
 		return nil, siteOutput{}, errors.New("this is a single document, not a site; use update_file")
@@ -777,13 +744,13 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 
 	arc, err := site.Open(file.Archive)
 	if err != nil {
-		return nil, siteOutput{}, m.siteToolError("open site", err)
+		return nil, siteOutput{}, m.toolError("open site", err)
 	}
 	listing := arc.List()
 	if len(in.Put) > 0 || len(in.Delete) > 0 {
 		old, err := arc.Entries()
 		if err != nil {
-			return nil, siteOutput{}, m.siteToolError("read site", err)
+			return nil, siteOutput{}, m.toolError("read site", err)
 		}
 		merged, err := site.Merge(old, siteEntries(in.Put), in.Delete)
 		if err != nil {
@@ -791,25 +758,25 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 		}
 		archive, err := site.Pack(merged)
 		if err != nil {
-			return nil, siteOutput{}, m.siteToolError("pack site", err)
+			return nil, siteOutput{}, m.toolError("pack site", err)
 		}
 		if err := enforceQuota(ctx, q, user, int64(len(archive)), file.ContentSize); err != nil {
-			return nil, siteOutput{}, m.siteToolError("check quota", err)
+			return nil, siteOutput{}, m.toolError("check quota", err)
 		}
 		file, err = q.ReplaceSiteArchive(ctx, sqlcgen.ReplaceSiteArchiveParams{Archive: archive, Slug: file.Slug, UserID: user.ID})
 		if err != nil {
-			return nil, siteOutput{}, m.siteToolError("replace site", err)
+			return nil, siteOutput{}, m.toolError("replace site", err)
 		}
 		listing = site.Infos(merged)
 	}
 	if name != "" {
 		file, err = q.RenameFile(ctx, sqlcgen.RenameFileParams{Name: name, Slug: file.Slug, UserID: user.ID})
 		if err != nil {
-			return nil, siteOutput{}, m.siteToolError("rename site", err)
+			return nil, siteOutput{}, m.toolError("rename site", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, siteOutput{}, m.siteToolError("commit update site", err)
+		return nil, siteOutput{}, m.toolError("commit update site", err)
 	}
 
 	out := siteOutput{mcpFileInfo: fileInfo(baseURL, file), Files: listing}

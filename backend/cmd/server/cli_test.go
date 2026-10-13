@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,10 +13,21 @@ import (
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
-// seedAccount creates a database at a temp path with one account, points
-// DB_PATH at it (the subcommands read the same env var the server does) and
-// returns the queries handle for assertions.
-func seedAccount(t *testing.T, username, password string) *sqlcgen.Queries {
+const seedPassword = "original-pass"
+
+// One bcrypt hash per test binary: the tests only verify it.
+var seedHash = sync.OnceValue(func() string {
+	h, err := auth.HashPassword(seedPassword)
+	if err != nil {
+		panic(err)
+	}
+	return h
+})
+
+// seedAccount creates a database at a temp path with one account ("admin",
+// seedPassword), points DB_PATH at it (the subcommands read the same env var
+// the server does) and returns the queries handle for assertions.
+func seedAccount(t *testing.T) *sqlcgen.Queries {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.db")
 	t.Setenv("DB_PATH", path)
@@ -26,15 +38,11 @@ func seedAccount(t *testing.T, username, password string) *sqlcgen.Queries {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	hash, err := auth.HashPassword(password)
-	if err != nil {
-		t.Fatalf("HashPassword: %v", err)
-	}
 	queries := sqlcgen.New(conn)
 	user, err := queries.CreateUser(context.Background(), sqlcgen.CreateUserParams{
-		Username:     username,
-		Nickname:     username,
-		PasswordHash: hash,
+		Username:     "admin",
+		Nickname:     "admin",
+		PasswordHash: seedHash(),
 	})
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
@@ -94,7 +102,7 @@ func TestVersionAndUnknownCommand(t *testing.T) {
 }
 
 func TestResetPasswordFromStdin(t *testing.T) {
-	queries := seedAccount(t, "admin", "original-pass")
+	queries := seedAccount(t)
 
 	code, handled, out, errOut := run(t, "brand-new-pass\n", "reset-password", "--user=admin")
 	if !handled || code != 0 {
@@ -111,7 +119,7 @@ func TestResetPasswordFromStdin(t *testing.T) {
 	if !auth.VerifyPassword(user.PasswordHash, "brand-new-pass") {
 		t.Error("the new password does not verify")
 	}
-	if auth.VerifyPassword(user.PasswordHash, "original-pass") {
+	if auth.VerifyPassword(user.PasswordHash, seedPassword) {
 		t.Error("the old password still verifies")
 	}
 	// Same rule as the super admin's reset endpoint: a reset ends the account's
@@ -122,7 +130,7 @@ func TestResetPasswordFromStdin(t *testing.T) {
 }
 
 func TestResetPasswordFlagForm(t *testing.T) {
-	queries := seedAccount(t, "admin", "original-pass")
+	queries := seedAccount(t)
 
 	if code, _, _, errOut := run(t, "", "reset-password", "--user=admin", "--password=flag-pass"); code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, errOut)
@@ -145,11 +153,14 @@ func TestResetPasswordRejections(t *testing.T) {
 		{"missing user", "x\n", []string{"reset-password"}, "--user is required"},
 		{"unknown user", "long-enough\n", []string{"reset-password", "--user=ghost"}, "no account named"},
 		{"too short", "abc\n", []string{"reset-password", "--user=admin"}, "at least 6 characters"},
+		// bcrypt's own ceiling: this used to get past the length check and die
+		// in the hasher with an opaque error.
+		{"too long", strings.Repeat("x", 73) + "\n", []string{"reset-password", "--user=admin"}, "at most 72 bytes"},
 		{"empty stdin", "", []string{"reset-password", "--user=admin"}, "no password on stdin"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			queries := seedAccount(t, "admin", "original-pass")
+			queries := seedAccount(t)
 
 			code, handled, _, errOut := run(t, c.stdin, c.args...)
 			if !handled || code != 1 {
@@ -163,7 +174,7 @@ func TestResetPasswordRejections(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetUserByUsername: %v", err)
 			}
-			if !auth.VerifyPassword(user.PasswordHash, "original-pass") {
+			if !auth.VerifyPassword(user.PasswordHash, seedPassword) {
 				t.Error("a rejected reset changed the password anyway")
 			}
 		})
@@ -173,7 +184,7 @@ func TestResetPasswordRejections(t *testing.T) {
 // Resetting a suspended account's password works, but says so: someone reaching
 // for this tool could easily assume it also restores access.
 func TestResetPasswordWarnsOnDisabledAccount(t *testing.T) {
-	queries := seedAccount(t, "admin", "original-pass")
+	queries := seedAccount(t)
 	if _, err := queries.DisableUser(context.Background(), 1); err != nil {
 		t.Fatalf("DisableUser: %v", err)
 	}

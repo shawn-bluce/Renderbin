@@ -17,11 +17,7 @@ import (
 
 func TestSnapshotProducesRestorableCopy(t *testing.T) {
 	// Open a migrated source DB and insert a row.
-	src, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	defer src.Close()
+	src := openDB(t)
 	if _, err := src.Exec(
 		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('s', 'n', '<p>hi</p>', 'code', 1)`,
 	); err != nil {
@@ -29,10 +25,7 @@ func TestSnapshotProducesRestorableCopy(t *testing.T) {
 	}
 
 	// Snapshot to a fresh path.
-	dest := filepath.Join(t.TempDir(), "backup.db")
-	if err := backup.Snapshot(context.Background(), src, dest); err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
+	dest := snapshotOf(t, src)
 
 	// The snapshot must be a standalone, openable DB containing the row.
 	restored, err := sql.Open("sqlite", "file:"+dest)
@@ -60,22 +53,44 @@ func TestSnapshotProducesRestorableCopy(t *testing.T) {
 	}
 }
 
-// seed opens a migrated database and fills it with one account and the given
-// file slugs, so a restore can be checked for having replaced real content.
-func seed(t *testing.T, username string, slugs ...string) (*sql.DB, string) {
+// openDB opens a fresh migrated database that is closed when the test ends.
+func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "app.db")
-	conn, err := db.Open(path)
+	conn, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
+	return conn
+}
 
+// snapshotOf writes a snapshot of conn to a fresh path and returns the path.
+func snapshotOf(t *testing.T, conn *sql.DB) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "snap.db")
+	if err := backup.Snapshot(context.Background(), conn, path); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	return path
+}
+
+// seedUser gives a database the one account Restore insists a snapshot has.
+func seedUser(t *testing.T, conn *sql.DB, username string) {
+	t.Helper()
 	if _, err := conn.Exec(
 		`INSERT INTO users (username, nickname, password_hash) VALUES (?, ?, 'hash')`, username, username,
 	); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
+}
+
+// seed opens a migrated database and fills it with one account and the given
+// file slugs, so a restore can be checked for having replaced real content.
+func seed(t *testing.T, username string, slugs ...string) *sql.DB {
+	t.Helper()
+	conn := openDB(t)
+	seedUser(t, conn, username)
+
 	for _, slug := range slugs {
 		if _, err := conn.Exec(
 			`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES (?, ?, '<p>x</p>', 'code', 1)`,
@@ -84,7 +99,7 @@ func seed(t *testing.T, username string, slugs ...string) (*sql.DB, string) {
 			t.Fatalf("seed file %q: %v", slug, err)
 		}
 	}
-	return conn, path
+	return conn
 }
 
 func slugsIn(t *testing.T, conn *sql.DB) []string {
@@ -107,13 +122,10 @@ func slugsIn(t *testing.T, conn *sql.DB) []string {
 
 func TestRestoreReplacesLiveContents(t *testing.T) {
 	// A snapshot of one database, restored over a different one.
-	source, _ := seed(t, "from-snapshot", "kept-a", "kept-b")
-	snapshot := filepath.Join(t.TempDir(), "snap.db")
-	if err := backup.Snapshot(context.Background(), source, snapshot); err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
+	source := seed(t, "from-snapshot", "kept-a", "kept-b")
+	snapshot := snapshotOf(t, source)
 
-	live, _ := seed(t, "live-user", "gone-1", "gone-2", "gone-3")
+	live := seed(t, "live-user", "gone-1", "gone-2", "gone-3")
 
 	stats, err := backup.Restore(context.Background(), live, snapshot)
 	if err != nil {
@@ -141,13 +153,10 @@ func TestRestoreReplacesLiveContents(t *testing.T) {
 // over a smaller one otherwise leaves the live sequence behind the restored
 // data, and the next insert collides with an id that already exists.
 func TestRestoreCarriesTheIDSequence(t *testing.T) {
-	source, _ := seed(t, "big", "s1", "s2", "s3", "s4", "s5")
-	snapshot := filepath.Join(t.TempDir(), "snap.db")
-	if err := backup.Snapshot(context.Background(), source, snapshot); err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
+	source := seed(t, "big", "s1", "s2", "s3", "s4", "s5")
+	snapshot := snapshotOf(t, source)
 
-	live, _ := seed(t, "small", "only-one")
+	live := seed(t, "small", "only-one")
 	if _, err := backup.Restore(context.Background(), live, snapshot); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -202,7 +211,7 @@ func TestRestoreMigratesAnOlderSnapshot(t *testing.T) {
 	}
 	conn.Close()
 
-	live, _ := seed(t, "current", "will-go")
+	live := seed(t, "current", "will-go")
 	if _, err := backup.Restore(context.Background(), live, old); err != nil {
 		t.Fatalf("Restore of an older snapshot: %v", err)
 	}
@@ -243,7 +252,7 @@ func TestRestoreRejectsBadInput(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			live, _ := seed(t, "live-user", "untouched-1", "untouched-2")
+			live := seed(t, "live-user", "untouched-1", "untouched-2")
 
 			_, err := backup.Restore(context.Background(), live, c.path)
 			if !errors.Is(err, c.want) {
@@ -267,11 +276,7 @@ func TestRestoreIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	if _, err := broken.Exec(
-		`INSERT INTO users (username, nickname, password_hash) VALUES ('someone', 'S', 'hash')`,
-	); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
+	seedUser(t, broken, "someone")
 	// Drop a column the live schema still has, so INSERT ... SELECT on that
 	// table fails after earlier tables have already been cleared.
 	if _, err := broken.Exec(`ALTER TABLE files DROP COLUMN tags`); err != nil {
@@ -279,7 +284,7 @@ func TestRestoreIsAtomic(t *testing.T) {
 	}
 	broken.Close()
 
-	live, _ := seed(t, "live-user", "keep-1", "keep-2")
+	live := seed(t, "live-user", "keep-1", "keep-2")
 	_, err = backup.Restore(context.Background(), live, brokenPath)
 	if !errors.Is(err, backup.ErrSchemaMismatch) {
 		t.Fatalf("err = %v, want ErrSchemaMismatch", err)
@@ -303,13 +308,10 @@ func TestRestoreIsAtomic(t *testing.T) {
 // Two restores in a row on the same *sql.DB: the attachment from the first must
 // not linger and collide with the second.
 func TestRestoreTwiceInARow(t *testing.T) {
-	source, _ := seed(t, "snap-user", "a")
-	snapshot := filepath.Join(t.TempDir(), "snap.db")
-	if err := backup.Snapshot(context.Background(), source, snapshot); err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
+	source := seed(t, "snap-user", "a")
+	snapshot := snapshotOf(t, source)
 
-	live, _ := seed(t, "live-user", "b")
+	live := seed(t, "live-user", "b")
 	for i := range 2 {
 		if _, err := backup.Restore(context.Background(), live, snapshot); err != nil {
 			t.Fatalf("Restore %d: %v", i+1, err)
@@ -321,11 +323,7 @@ func TestRestoreTwiceInARow(t *testing.T) {
 }
 
 func TestSnapshotFailsIfDestinationExists(t *testing.T) {
-	src, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	defer src.Close()
+	src := openDB(t)
 
 	// VACUUM INTO refuses to overwrite an existing file.
 	dest := filepath.Join(t.TempDir(), "exists.db")
@@ -348,23 +346,11 @@ func TestSnapshotFailsIfDestinationExists(t *testing.T) {
 // leaving every query that touches the new column failing at runtime. It is a
 // realistic sequence: pull a new image, roll back to the old tag, restore.
 func TestRestoreKeepsTheLiveMigrationLedger(t *testing.T) {
-	live, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("db.Open(live): %v", err)
-	}
-	defer live.Close()
+	live := openDB(t)
 
-	snapPath := filepath.Join(t.TempDir(), "snapshot.db")
-	snapSrc, err := db.Open(filepath.Join(t.TempDir(), "src.db"))
-	if err != nil {
-		t.Fatalf("db.Open(src): %v", err)
-	}
+	snapSrc := openDB(t)
 	// Restore refuses a snapshot with no accounts, so give it one.
-	if _, err := snapSrc.Exec(
-		`INSERT INTO users (username, nickname, password_hash) VALUES ('admin', 'Admin', 'hash')`,
-	); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
+	seedUser(t, snapSrc, "admin")
 	// Stand in for a snapshot taken by a future build: it claims a migration
 	// this binary has never heard of.
 	if _, err := snapSrc.Exec(
@@ -372,10 +358,7 @@ func TestRestoreKeepsTheLiveMigrationLedger(t *testing.T) {
 	); err != nil {
 		t.Fatalf("seed future migration: %v", err)
 	}
-	if err := backup.Snapshot(context.Background(), snapSrc, snapPath); err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	snapSrc.Close()
+	snapPath := snapshotOf(t, snapSrc)
 
 	if _, err := backup.Restore(context.Background(), live, snapPath); err != nil {
 		t.Fatalf("Restore: %v", err)

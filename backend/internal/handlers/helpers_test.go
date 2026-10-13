@@ -100,17 +100,34 @@ func TestDownloadDisposition(t *testing.T) {
 	}
 }
 
-func TestSlugPattern(t *testing.T) {
-	valid := []string{"a", "abc-123_.X", strings.Repeat("a", 128)}
-	for _, s := range valid {
-		if !slugPattern.MatchString(s) {
-			t.Errorf("slugPattern rejected valid slug %q", s)
+// A slug (or access code) is a URL path segment: the charset is what keeps it
+// one, and "." / ".." pass the charset but a browser drops them from a URL
+// before requesting it, so validPathToken refuses those two on top.
+func TestSlugPatternAndPathToken(t *testing.T) {
+	for _, c := range []struct {
+		in             string
+		pattern, token bool
+	}{
+		{"a", true, true},
+		{"abc-123_.X", true, true},
+		{strings.Repeat("a", 128), true, true},
+		{"...", true, true},
+		{".a", true, true},
+		{"a.b", true, true},
+		{".", true, false},
+		{"..", true, false},
+		{"", false, false},
+		{"a b", false, false},
+		{"a/b", false, false},
+		{"a!b", false, false},
+		{"日本", false, false},
+		{strings.Repeat("a", 129), false, false},
+	} {
+		if got := slugPattern.MatchString(c.in); got != c.pattern {
+			t.Errorf("slugPattern(%q) = %v, want %v", c.in, got, c.pattern)
 		}
-	}
-	invalid := []string{"", "a b", "a/b", "a!b", "日本", strings.Repeat("a", 129)}
-	for _, s := range invalid {
-		if slugPattern.MatchString(s) {
-			t.Errorf("slugPattern accepted invalid slug %q", s)
+		if got := validPathToken(c.in); got != c.token {
+			t.Errorf("validPathToken(%q) = %v, want %v", c.in, got, c.token)
 		}
 	}
 }

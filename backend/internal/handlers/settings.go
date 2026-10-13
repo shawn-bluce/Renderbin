@@ -29,9 +29,9 @@ type settingsResponse struct {
 
 func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, settingsResponse{
-		AllowRegistration:   configBool(r, h.queries, ConfigAllowRegistration),
-		MCPEnabled:          configBool(r, h.queries, ConfigMCPEnabled),
-		UploadDefaultPublic: configBool(r, h.queries, ConfigUploadDefaultPublic),
+		AllowRegistration:   configBool(r.Context(), h.queries, ConfigAllowRegistration),
+		MCPEnabled:          configBool(r.Context(), h.queries, ConfigMCPEnabled),
+		UploadDefaultPublic: configBool(r.Context(), h.queries, ConfigUploadDefaultPublic),
 	})
 }
 
@@ -53,20 +53,19 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updates := map[string]*bool{
+	updates := map[string]bool{}
+	for key, value := range map[string]*bool{
 		ConfigAllowRegistration:   req.AllowRegistration,
 		ConfigMCPEnabled:          req.MCPEnabled,
 		ConfigUploadDefaultPublic: req.UploadDefaultPublic,
+	} {
+		if value != nil {
+			updates[key] = *value
+		}
 	}
-	for key, value := range updates {
-		if value == nil {
-			continue
-		}
-		if err := h.queries.SetConfig(r.Context(), sqlcgen.SetConfigParams{Key: key, Value: boolString(*value)}); err != nil {
-			h.logger.Error("set config", "key", key, "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
+	if err := setBoolConfigs(r.Context(), h.queries, updates); err != nil {
+		serverError(w, h.logger, "set config", err)
+		return
 	}
 
 	h.Get(w, r)
@@ -101,8 +100,7 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 			Nickname: nickname,
 			ID:       user.ID,
 		}); err != nil {
-			h.logger.Error("update nickname", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "update nickname", err)
 			return
 		}
 	}
@@ -118,8 +116,7 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 		}
 		hash, err := auth.HashPassword(req.NewPassword)
 		if err != nil {
-			h.logger.Error("hash password", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "hash password", err)
 			return
 		}
 		// The affected-row count is ignored on purpose: requireAuth resolved
@@ -129,8 +126,7 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 			PasswordHash: hash,
 			ID:           user.ID,
 		}); err != nil {
-			h.logger.Error("update password", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "update password", err)
 			return
 		}
 	}
@@ -159,8 +155,7 @@ func (h *SettingsHandler) Usage(w http.ResponseWriter, r *http.Request) {
 	}
 	used, err := h.queries.SumUserContentSize(r.Context(), user.ID)
 	if err != nil {
-		h.logger.Error("sum user content size", "user_id", user.ID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "sum user content size", err, "user_id", user.ID)
 		return
 	}
 	writeJSON(w, usageResponse{UsedBytes: used, QuotaBytes: user.QuotaBytes})
@@ -186,7 +181,7 @@ func (h *SettingsHandler) serveAPIKey(w http.ResponseWriter, r *http.Request, re
 	if !ok {
 		return
 	}
-	if !configBool(r, h.queries, ConfigMCPEnabled) {
+	if !configBool(r.Context(), h.queries, ConfigMCPEnabled) {
 		http.Error(w, "MCP is disabled", http.StatusConflict)
 		return
 	}
@@ -195,16 +190,14 @@ func (h *SettingsHandler) serveAPIKey(w http.ResponseWriter, r *http.Request, re
 	if reset || !user.ApiKey.Valid || key == "" {
 		newKey, err := auth.NewAPIKey()
 		if err != nil {
-			h.logger.Error("generate api key", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "generate api key", err)
 			return
 		}
 		if err := h.queries.SetUserAPIKey(r.Context(), sqlcgen.SetUserAPIKeyParams{
 			ApiKey: sql.NullString{String: newKey, Valid: true},
 			ID:     user.ID,
 		}); err != nil {
-			h.logger.Error("set api key", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "set api key", err)
 			return
 		}
 		key = newKey

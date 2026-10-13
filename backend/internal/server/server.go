@@ -18,9 +18,9 @@ import (
 	"github.com/shawn-bluce/renderbin/backend/internal/web"
 )
 
-func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handler {
+func New(conn *sql.DB, logger *slog.Logger) http.Handler {
+	queries := sqlcgen.New(conn)
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeaders)
 	r.Use(slogRequestLogger(logger))
@@ -226,16 +226,9 @@ func redactPath(p string) string {
 func spaHandler(distFS fs.FS) http.HandlerFunc {
 	fileServer := http.FileServer(http.FS(distFS))
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := fs.Stat(distFS, trimLeadingSlash(r.URL.Path)); err != nil {
+		if _, err := fs.Stat(distFS, strings.TrimPrefix(r.URL.Path, "/")); err != nil {
 			r.URL.Path = "/"
 		}
 		fileServer.ServeHTTP(w, r)
 	}
-}
-
-func trimLeadingSlash(p string) string {
-	if len(p) > 0 && p[0] == '/' {
-		return p[1:]
-	}
-	return p
 }

@@ -1,12 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -29,24 +31,25 @@ const (
 )
 
 // configBool reads a boolean config; missing keys and read errors are false.
-func configBool(r *http.Request, queries *sqlcgen.Queries, key string) bool {
-	v, err := queries.GetConfig(r.Context(), key)
+func configBool(ctx context.Context, queries *sqlcgen.Queries, key string) bool {
+	v, err := queries.GetConfig(ctx, key)
 	return err == nil && v == "true"
 }
 
-func boolString(b bool) string {
-	if b {
-		return "true"
+// setBoolConfigs writes boolean configs in one pass (order is unspecified).
+// Not atomic: a failure partway leaves the earlier keys written, which is fine
+// for independent toggles.
+func setBoolConfigs(ctx context.Context, queries *sqlcgen.Queries, values map[string]bool) error {
+	for key, value := range values {
+		if err := queries.SetConfig(ctx, sqlcgen.SetConfigParams{Key: key, Value: strconv.FormatBool(value)}); err != nil {
+			return fmt.Errorf("set config %q: %w", key, err)
+		}
 	}
-	return "false"
+	return nil
 }
 
 // usernamePattern keeps usernames short and unambiguous; nicknames are free-form.
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
-
-// The password policy lives in internal/auth, shared with the reset-password
-// CLI subcommand; this alias keeps the call sites in this package short.
-const minPasswordLen = auth.MinPasswordLen
 
 type AuthHandler struct {
 	queries *sqlcgen.Queries
@@ -77,8 +80,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		h.logger.Error("get user by username", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "get user by username", err)
 		return
 	}
 	if !auth.VerifyPassword(user.PasswordHash, req.Password) {
@@ -94,7 +96,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.startSession(w, r, user.ID); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		internalError(w)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -111,15 +113,14 @@ type registerRequest struct {
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	count, err := h.queries.CountUsers(r.Context())
 	if err != nil {
-		h.logger.Error("count users", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "count users", err)
 		return
 	}
 	if count == 0 {
 		http.Error(w, "setup required", http.StatusConflict)
 		return
 	}
-	if !configBool(r, h.queries, ConfigAllowRegistration) {
+	if !configBool(r.Context(), h.queries, ConfigAllowRegistration) {
 		http.Error(w, "registration is disabled", http.StatusForbidden)
 		return
 	}
@@ -129,23 +130,14 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, errMsg, err := createUser(r, h.queries, req, false)
-	if errMsg != "" {
-		status := http.StatusBadRequest
-		if errMsg == "username already taken" {
-			status = http.StatusConflict
-		}
-		http.Error(w, errMsg, status)
-		return
-	}
+	user, err := createUser(r.Context(), h.queries, req, false)
 	if err != nil {
-		h.logger.Error("create user", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeCreateUserError(w, h.logger, "create user", err)
 		return
 	}
 
 	if err := h.startSession(w, r, user.ID); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		internalError(w)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -170,44 +162,69 @@ func validateNickname(nickname string) (string, string) {
 // matched nothing because some other request already created the super admin.
 var errFirstUserExists = errors.New("a user already exists")
 
-// createUser validates a registration payload and inserts the user. It
-// returns a client-facing message for validation failures (empty when the
-// user was created) and err for unexpected database errors.
+// userInputError is a createUser failure that is the caller's to fix: msg is
+// client-facing and status the HTTP code it maps to.
+type userInputError struct {
+	status int
+	msg    string
+}
+
+func (e *userInputError) Error() string { return e.msg }
+
+func badUserInput(msg string) error { return &userInputError{http.StatusBadRequest, msg} }
+
+// errUsernameTaken is the one input failure that is a 409 rather than a 400.
+var errUsernameTaken = &userInputError{http.StatusConflict, "username already taken"}
+
+// writeCreateUserError answers a failed createUser: the caller's mistakes as
+// their own status and message, anything else as a logged 500.
+func writeCreateUserError(w http.ResponseWriter, logger *slog.Logger, op string, err error) {
+	var input *userInputError
+	if errors.As(err, &input) {
+		http.Error(w, input.msg, input.status)
+		return
+	}
+	serverError(w, logger, op, err)
+}
+
+// createUser validates a registration payload and inserts the user. A
+// *userInputError means the payload was unusable (or the username taken);
+// anything else is an unexpected failure.
 //
 // first selects the atomic first-run insert (CreateFirstUser, which only
 // applies while the users table is empty) over the ordinary one. Setup cannot
 // use a count-then-insert here: the bcrypt hash above sits inside that window
 // and made the check useless under concurrency.
-func createUser(r *http.Request, queries *sqlcgen.Queries, req registerRequest, first bool) (sqlcgen.User, string, error) {
+func createUser(ctx context.Context, queries *sqlcgen.Queries, req registerRequest, first bool) (sqlcgen.User, error) {
 	req.Username = strings.TrimSpace(req.Username)
 	if !usernamePattern.MatchString(req.Username) {
-		return sqlcgen.User{}, "username must be 1-64 chars of letters, digits, '.', '_' or '-'", nil
+		return sqlcgen.User{}, badUserInput("username must be 1-64 chars of letters, digits, '.', '_' or '-'")
 	}
 	nickname, errMsg := validateNickname(req.Nickname)
 	if errMsg != "" {
-		return sqlcgen.User{}, errMsg, nil
+		return sqlcgen.User{}, badUserInput(errMsg)
 	}
 	if errMsg := auth.ValidatePassword(req.Password); errMsg != "" {
-		return sqlcgen.User{}, errMsg, nil
+		return sqlcgen.User{}, badUserInput(errMsg)
 	}
 
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
-		return sqlcgen.User{}, "", err
+		return sqlcgen.User{}, err
 	}
 
 	var user sqlcgen.User
 	if first {
-		user, err = queries.CreateFirstUser(r.Context(), sqlcgen.CreateFirstUserParams{
+		user, err = queries.CreateFirstUser(ctx, sqlcgen.CreateFirstUserParams{
 			Username:     req.Username,
 			Nickname:     nickname,
 			PasswordHash: hash,
 		})
 		if errors.Is(err, sql.ErrNoRows) {
-			return sqlcgen.User{}, "", errFirstUserExists
+			return sqlcgen.User{}, errFirstUserExists
 		}
 	} else {
-		user, err = queries.CreateUser(r.Context(), sqlcgen.CreateUserParams{
+		user, err = queries.CreateUser(ctx, sqlcgen.CreateUserParams{
 			Username:     req.Username,
 			Nickname:     nickname,
 			PasswordHash: hash,
@@ -215,11 +232,11 @@ func createUser(r *http.Request, queries *sqlcgen.Queries, req registerRequest, 
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
-			return sqlcgen.User{}, "username already taken", nil
+			return sqlcgen.User{}, errUsernameTaken
 		}
-		return sqlcgen.User{}, "", err
+		return sqlcgen.User{}, err
 	}
-	return user, "", nil
+	return user, nil
 }
 
 // startSession issues a session token for the user, persists it, and sets the

@@ -21,9 +21,3 @@ func TestHashAndVerifyPassword(t *testing.T) {
 		t.Error("expected empty hash to never verify")
 	}
 }
-
-func TestBurnPasswordCheckAlwaysFalse(t *testing.T) {
-	if BurnPasswordCheck("rb-no-such-user") {
-		t.Error("BurnPasswordCheck must always report false")
-	}
-}

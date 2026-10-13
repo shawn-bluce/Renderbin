@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,7 +16,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
@@ -63,19 +61,6 @@ func validPathToken(s string) bool {
 	return slugPattern.MatchString(s) && s != "." && s != ".."
 }
 
-// newShortSlug returns an 8-character slug: the first 6 characters of a random
-// UUID, base64-encoded. 24 bits of entropy — short shareable URLs over
-// collision headroom; createFileWithFreshSlug retries on UNIQUE conflicts to
-// compensate. RawURLEncoding is required: its output always satisfies
-// slugPattern, unlike StdEncoding's '+' and '/'.
-func newShortSlug() (string, error) {
-	u, err := uuid.NewRandom()
-	if err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString([]byte(u.String()[:6])), nil
-}
-
 // withFreshSlug runs insert under a freshly generated short slug, retrying up
 // to 5 times on UNIQUE collisions — 8-char slugs carry only 24 bits of
 // entropy, so a collision is a realistic event once enough files (including
@@ -84,7 +69,7 @@ func newShortSlug() (string, error) {
 func withFreshSlug(insert func(slug string) (sqlcgen.File, error)) (sqlcgen.File, error) {
 	const maxSlugAttempts = 5
 	for attempt := 1; ; attempt++ {
-		slug, err := newShortSlug()
+		slug, err := auth.NewShortToken()
 		if err != nil {
 			return sqlcgen.File{}, err
 		}
@@ -107,14 +92,6 @@ func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, para
 	})
 }
 
-// createSiteWithFreshSlug is createFileWithFreshSlug for a directory site.
-func createSiteWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, params sqlcgen.CreateSiteParams) (sqlcgen.File, error) {
-	return withFreshSlug(func(slug string) (sqlcgen.File, error) {
-		params.Slug = slug
-		return queries.CreateSite(ctx, params)
-	})
-}
-
 type FilesHandler struct {
 	queries *sqlcgen.Queries
 	logger  *slog.Logger
@@ -133,8 +110,9 @@ type fileResponse struct {
 	Kind        string `json:"kind"`
 	HTMLContent string `json:"html_content,omitempty"`
 	// Size is the stored source's length in bytes (for a site, its compressed
-	// archive). The listings read it from the files.content_size column; the
-	// single-file endpoints, which hold the content anyway, measure it directly.
+	// archive), read from the files.content_size column the INSERT and UPDATE
+	// statements keep current. It is the one source of truth for every
+	// endpoint, including the listings, whose rows carry no content to measure.
 	Size             int64   `json:"size"`
 	IsPublic         bool    `json:"is_public"`
 	AccessCode       string  `json:"access_code"`
@@ -165,7 +143,7 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 		Name:             f.Name,
 		Kind:             f.Kind,
 		HTMLContent:      f.HtmlContent,
-		Size:             int64(len(f.HtmlContent) + len(f.Archive)),
+		Size:             f.ContentSize,
 		IsPublic:         f.IsPublic,
 		AccessCode:       f.AccessCode,
 		Tags:             f.Tags,
@@ -177,19 +155,41 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 		ViewCount:        f.ViewCount,
 		ExpiredReason:    f.ExpiredReason,
 	}
-	if f.ExpiresAt.Valid {
-		s := f.ExpiresAt.Time.Format(timeLayout)
-		resp.ExpiresAt = &s
-	}
+	resp.ExpiresAt = fmtNullTime(f.ExpiresAt)
+	resp.ExpiredAt = fmtNullTime(f.ExpiredAt)
 	if f.MaxViews.Valid {
 		v := f.MaxViews.Int64
 		resp.MaxViews = &v
 	}
-	if f.ExpiredAt.Valid {
-		s := f.ExpiredAt.Time.Format(timeLayout)
-		resp.ExpiredAt = &s
-	}
 	return resp
+}
+
+// fmtNullTime renders a nullable timestamp as the wire's nullable string.
+func fmtNullTime(t sql.NullTime) *string {
+	if !t.Valid {
+		return nil
+	}
+	s := t.Time.Format(timeLayout)
+	return &s
+}
+
+// fileMetaResponse is toFileResponse without the document source: what every
+// endpoint but Get returns for a file it just wrote.
+func fileMetaResponse(f sqlcgen.File) fileResponse {
+	resp := toFileResponse(f)
+	resp.HTMLContent = ""
+	return resp
+}
+
+// writeFile finishes a handler whose last step is one query returning the
+// file's row: no row is the usual 404, any other error is a logged 500, and
+// success answers with the row's metadata.
+func (h *FilesHandler) writeFile(w http.ResponseWriter, op string, file sqlcgen.File, err error) {
+	if err != nil {
+		queryError(w, h.logger, op, err)
+		return
+	}
+	writeJSON(w, fileMetaResponse(file))
 }
 
 // normalizeTags trims whitespace around each comma-separated tag, drops
@@ -213,37 +213,15 @@ func normalizeTags(raw string) string {
 
 // The listing and search queries deliberately don't select html_content (see
 // queries/files.sql), so sqlc emits a distinct row struct for each of them
-// instead of the shared File model. These four converters funnel those rows
-// back into one File with an empty HtmlContent, so toFileResponse stays the
-// single place that formats a file for the wire.
+// instead of the shared File model. These converters funnel those rows back
+// into one File with an empty HtmlContent, so toFileResponse stays the single
+// place that formats a file for the wire.
 //
-// They are struct literals with named fields, so adding a column to the
-// listings compiles fine here and is silently zeroed -- the same gap this
-// codebase already accepts for sqlc's ...Params structs. Add the field to all
-// four when you add a column.
+// The list, trash and name-search rows are field-for-field the same struct, so
+// they share listRowToFile through a type conversion -- which, unlike a
+// struct literal, stops compiling if one of them gains a column the others
+// lack. Only the content search has extra fields, and keeps its own.
 func listRowToFile(r sqlcgen.ListUserFilesRow) sqlcgen.File {
-	return sqlcgen.File{
-		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
-		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
-		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
-		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
-		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
-	}
-}
-
-func deletedRowToFile(r sqlcgen.ListUserDeletedFilesRow) sqlcgen.File {
-	return sqlcgen.File{
-		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
-		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
-		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
-		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
-		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
-	}
-}
-
-func nameSearchRowToFile(r sqlcgen.SearchUserFilesByNameRow) sqlcgen.File {
 	return sqlcgen.File{
 		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
 		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
@@ -265,48 +243,33 @@ func contentSearchRowToFile(r sqlcgen.SearchUserFilesWithContentRow) sqlcgen.Fil
 	}
 }
 
-// listResponse formats a listing row: the stored size comes from the
-// content_size column, since these rows carry no content to measure.
-func listResponse(f sqlcgen.File) fileResponse {
-	item := toFileResponse(f)
-	item.Size = f.ContentSize
-	return item
-}
-
 func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	var files []sqlcgen.File
+	var resp []fileResponse
 	if r.URL.Query().Get("deleted") == "true" {
 		rows, err := h.queries.ListUserDeletedFiles(r.Context(), user.ID)
 		if err != nil {
-			h.logger.Error("list deleted files", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "list deleted files", err)
 			return
 		}
-		files = make([]sqlcgen.File, 0, len(rows))
+		resp = make([]fileResponse, 0, len(rows))
 		for _, row := range rows {
-			files = append(files, deletedRowToFile(row))
+			resp = append(resp, toFileResponse(listRowToFile(sqlcgen.ListUserFilesRow(row))))
 		}
 	} else {
 		rows, err := h.queries.ListUserFiles(r.Context(), user.ID)
 		if err != nil {
-			h.logger.Error("list files", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "list files", err)
 			return
 		}
-		files = make([]sqlcgen.File, 0, len(rows))
+		resp = make([]fileResponse, 0, len(rows))
 		for _, row := range rows {
-			files = append(files, listRowToFile(row))
+			resp = append(resp, toFileResponse(listRowToFile(row)))
 		}
-	}
-
-	resp := make([]fileResponse, 0, len(files))
-	for _, f := range files {
-		resp = append(resp, listResponse(f))
 	}
 
 	writeJSON(w, resp)
@@ -344,13 +307,12 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 			ContentQuery: q,
 		})
 		if err != nil {
-			h.logger.Error("search files", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "search files", err)
 			return
 		}
 		for _, row := range rows {
 			res := searchResultResponse{
-				fileResponse:   listResponse(contentSearchRowToFile(row)),
+				fileResponse:   toFileResponse(contentSearchRowToFile(row)),
 				MatchedName:    containsFold(row.Name, q),
 				MatchedContent: row.MatchPos > 0,
 			}
@@ -369,13 +331,12 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 			NameQuery: q,
 		})
 		if err != nil {
-			h.logger.Error("search files", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "search files", err)
 			return
 		}
 		for _, row := range rows {
 			resp = append(resp, searchResultResponse{
-				fileResponse: listResponse(nameSearchRowToFile(row)),
+				fileResponse: toFileResponse(listRowToFile(sqlcgen.ListUserFilesRow(row))),
 				MatchedName:  true,
 			})
 		}
@@ -440,29 +401,55 @@ type createFileRequest struct {
 	HTMLContent string `json:"html_content"`
 }
 
-// validateContent applies the two rules every stored document has to satisfy.
-// Returns false after writing the response.
-func validateContent(w http.ResponseWriter, content string) bool {
-	if content == "" {
-		http.Error(w, "html_content is required", http.StatusBadRequest)
-		return false
+// contentProblem applies the two rules every stored document has to satisfy
+// and returns the status and message for the first one it breaks (0, "" when
+// the content is fine). field names the input in the message, since the web API
+// calls it html_content and MCP calls it content. Shared by both protocols so
+// the limit and its wording are stated once.
+func contentProblem(field, content string) (int, string) {
+	switch {
+	case content == "":
+		return http.StatusBadRequest, field + " is required"
+	case len(content) > maxHTMLBytes:
+		return http.StatusRequestEntityTooLarge, field + " exceeds 5MB"
 	}
-	if len(content) > maxHTMLBytes {
-		http.Error(w, "html_content exceeds 5MB", http.StatusRequestEntityTooLarge)
+	return 0, ""
+}
+
+// validateContent is contentProblem for an HTTP handler: it writes the
+// response and returns false when the content is unusable.
+func validateContent(w http.ResponseWriter, content string) bool {
+	if status, msg := contentProblem("html_content", content); status != 0 {
+		http.Error(w, msg, status)
 		return false
 	}
 	return true
 }
 
-// normalizeName trims a display name, defaults it, and enforces maxNameBytes.
-// Returns false after writing the response.
-func normalizeName(w http.ResponseWriter, name string) (string, bool) {
+// nameTooLong enforces maxNameBytes on a display name that is already trimmed.
+func nameTooLong(name string) error {
+	if len(name) > maxNameBytes {
+		return fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	}
+	return nil
+}
+
+// cleanName trims a display name, defaults it to "Untitled", and enforces
+// maxNameBytes. The pure core of normalizeName and of MCP's uploads.
+func cleanName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "Untitled"
 	}
-	if len(name) > maxNameBytes {
-		http.Error(w, fmt.Sprintf("name must be at most %d bytes", maxNameBytes), http.StatusBadRequest)
+	return name, nameTooLong(name)
+}
+
+// normalizeName is cleanName for an HTTP handler: it writes the response and
+// returns false when the name is unusable.
+func normalizeName(w http.ResponseWriter, name string) (string, bool) {
+	name, err := cleanName(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return "", false
 	}
 	return name, true
@@ -509,8 +496,7 @@ func (h *FilesHandler) checkQuota(w http.ResponseWriter, r *http.Request, user s
 	case errors.Is(err, errOverQuota):
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 	default:
-		h.logger.Error("check quota", "user_id", user.ID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "check quota", err, "user_id", user.ID)
 	}
 	return false
 }
@@ -545,8 +531,7 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	accessCode, err := auth.NewAccessCode()
 	if err != nil {
-		h.logger.Error("generate access code", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "generate access code", err)
 		return
 	}
 
@@ -557,7 +542,7 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		// The instance-wide default visibility. Deliberately not a request
 		// field: visibility changes are their own endpoint, and a per-request
 		// override here would let one protocol bypass the policy the admin set.
-		IsPublic:   configBool(r, h.queries, ConfigUploadDefaultPublic),
+		IsPublic:   configBool(r.Context(), h.queries, ConfigUploadDefaultPublic),
 		AccessCode: accessCode,
 		UserID:     user.ID,
 	})
@@ -566,14 +551,42 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "slug already taken", http.StatusConflict)
 			return
 		}
-		h.logger.Error("create file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "create file", err)
 		return
 	}
 
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSONStatus(w, http.StatusCreated, item)
+	writeJSONStatus(w, http.StatusCreated, fileMetaResponse(file))
+}
+
+// userFile loads the caller's own live file by slug, answering 404 (a slug
+// that is missing, trashed or someone else's is one and the same case) or 500
+// itself and reporting whether the caller should continue.
+func (h *FilesHandler) userFile(w http.ResponseWriter, r *http.Request, user sqlcgen.User, slug string) (sqlcgen.File, bool) {
+	file, err := h.queries.GetUserFileBySlug(r.Context(), sqlcgen.GetUserFileBySlugParams{
+		Slug:   slug,
+		UserID: user.ID,
+	})
+	if err != nil {
+		queryError(w, h.logger, "get file", err)
+		return sqlcgen.File{}, false
+	}
+	return file, true
+}
+
+// ownedFileSize is the lookup an edit starts with: what the write is about to
+// replace (for the quota) and the file's kind. A slug that matches nothing 404s
+// here rather than after the quota check, which keeps a missing file from being
+// reported as a full one.
+func (h *FilesHandler) ownedFileSize(w http.ResponseWriter, r *http.Request, user sqlcgen.User, slug string) (sqlcgen.GetUserFileSizeRow, bool) {
+	old, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
+		Slug:   slug,
+		UserID: user.ID,
+	})
+	if err != nil {
+		queryError(w, h.logger, "get file size", err)
+		return sqlcgen.GetUserFileSizeRow{}, false
+	}
+	return old, true
 }
 
 // Get returns a single file including its html_content, at GET
@@ -585,19 +598,8 @@ func (h *FilesHandler) Get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	slug := chi.URLParam(r, "slug")
-
-	file, err := h.queries.GetUserFileBySlug(r.Context(), sqlcgen.GetUserFileBySlugParams{
-		Slug:   slug,
-		UserID: user.ID,
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("get file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	file, ok := h.userFile(w, r, user, chi.URLParam(r, "slug"))
+	if !ok {
 		return
 	}
 
@@ -607,8 +609,7 @@ func (h *FilesHandler) Get(w http.ResponseWriter, r *http.Request) {
 		// holds instead, read from the zip's central directory alone.
 		entries, err := site.List(file.Archive)
 		if err != nil {
-			h.logger.Error("list site entries", "slug", file.Slug, "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			serverError(w, h.logger, "list site entries", err, "slug", file.Slug)
 			return
 		}
 		resp.Entries = entries
@@ -660,23 +661,16 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	req.Name = name
 
 	// What this edit replaces, so an in-place edit isn't charged twice against
-	// the quota. A slug that matches nothing 404s here rather than after the
-	// quota check, which keeps a missing file from being reported as a full one.
-	old, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
-		Slug:   oldSlug,
-		UserID: user.ID,
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("get file size", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	// the quota.
+	old, ok := h.ownedFileSize(w, r, user, oldSlug)
+	if !ok {
 		return
 	}
 
-	var file sqlcgen.File
+	var (
+		file sqlcgen.File
+		err  error
+	)
 	if old.Kind == KindSite {
 		if req.HTMLContent != "" {
 			http.Error(w, "a site's content is replaced as a whole zip at PUT /api/files/{slug}/site", http.StatusBadRequest)
@@ -705,23 +699,11 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 			UserID:      user.ID,
 		})
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+		http.Error(w, "slug already taken", http.StatusConflict)
 		return
 	}
-	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			http.Error(w, "slug already taken", http.StatusConflict)
-			return
-		}
-		h.logger.Error("update file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "update file", file, err)
 }
 
 // Restore un-deletes a soft-deleted file at POST /api/files/{slug}/restore.
@@ -736,19 +718,7 @@ func (h *FilesHandler) Restore(w http.ResponseWriter, r *http.Request) {
 		Slug:   slug,
 		UserID: user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("restore file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "restore file", file, err)
 }
 
 // A ttl is "<positive integer><unit>", e.g. 1d, 36h, 2w, 6mo, 1y — the same
@@ -848,7 +818,7 @@ type setExpiryRequest struct {
 }
 
 // SetExpiry configures a file's link expiry at PATCH /api/files/{slug}/expiry.
-// A TTL preset and a max-view count are mutually exclusive; setting either
+// A ttl and a max-view count are mutually exclusive; setting either
 // forces the file Public. Sending neither clears any existing limit without
 // changing visibility. Expiry itself is enforced lazily in Render.
 func (h *FilesHandler) SetExpiry(w http.ResponseWriter, r *http.Request) {
@@ -885,19 +855,7 @@ func (h *FilesHandler) SetExpiry(w http.ResponseWriter, r *http.Request) {
 			UserID: user.ID,
 		})
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("set expiry", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "set expiry", file, err)
 }
 
 type renameFileRequest struct {
@@ -920,8 +878,8 @@ func (h *FilesHandler) Rename(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	if len(name) > maxNameBytes {
-		http.Error(w, fmt.Sprintf("name must be at most %d bytes", maxNameBytes), http.StatusBadRequest)
+	if err := nameTooLong(name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -930,19 +888,7 @@ func (h *FilesHandler) Rename(w http.ResponseWriter, r *http.Request) {
 		Slug:   slug,
 		UserID: user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("rename file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "rename file", file, err)
 }
 
 type setVisibilityRequest struct {
@@ -966,19 +912,7 @@ func (h *FilesHandler) SetVisibility(w http.ResponseWriter, r *http.Request) {
 		Slug:     slug,
 		UserID:   user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("set file visibility", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "set file visibility", file, err)
 }
 
 type setTagsRequest struct {
@@ -1006,19 +940,7 @@ func (h *FilesHandler) SetTags(w http.ResponseWriter, r *http.Request) {
 		Slug:   slug,
 		UserID: user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("set file tags", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "set file tags", file, err)
 }
 
 func (h *FilesHandler) RefreshCode(w http.ResponseWriter, r *http.Request) {
@@ -1030,8 +952,7 @@ func (h *FilesHandler) RefreshCode(w http.ResponseWriter, r *http.Request) {
 
 	accessCode, err := auth.NewAccessCode()
 	if err != nil {
-		h.logger.Error("generate access code", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "generate access code", err)
 		return
 	}
 
@@ -1040,19 +961,7 @@ func (h *FilesHandler) RefreshCode(w http.ResponseWriter, r *http.Request) {
 		Slug:       slug,
 		UserID:     user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("refresh access code", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	item := toFileResponse(file)
-	item.HTMLContent = ""
-	writeJSON(w, item)
+	h.writeFile(w, "refresh access code", file, err)
 }
 
 // Delete moves a file to the trash at DELETE /api/files/{slug}. A slug that
@@ -1070,12 +979,11 @@ func (h *FilesHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		UserID: user.ID,
 	})
 	if err != nil {
-		h.logger.Error("delete file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "delete file", err)
 		return
 	}
 	if rows == 0 {
-		http.Error(w, "not found", http.StatusNotFound)
+		notFound(w)
 		return
 	}
 
@@ -1098,12 +1006,11 @@ func (h *FilesHandler) HardDelete(w http.ResponseWriter, r *http.Request) {
 		UserID: user.ID,
 	})
 	if err != nil {
-		h.logger.Error("hard delete file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "hard delete file", err)
 		return
 	}
 	if rows == 0 {
-		http.Error(w, "not found", http.StatusNotFound)
+		notFound(w)
 		return
 	}
 
@@ -1130,8 +1037,7 @@ func (h *FilesHandler) EmptyTrash(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.queries.HardDeleteUserTrash(r.Context(), user.ID)
 	if err != nil {
-		h.logger.Error("empty trash", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "empty trash", err)
 		return
 	}
 	h.logger.Info("trash emptied", "user_id", user.ID, "files", rows)
@@ -1207,38 +1113,13 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
 	file, err := h.queries.GetFileBySlugAnyOwner(r.Context(), slug)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	if err != nil {
-		h.logger.Error("get file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		queryError(w, h.logger, "get file", err)
 		return
 	}
 
-	// Lazy expiry: a public file whose TTL has passed or whose view quota is
-	// used up is flipped to private at access time (no cron). This clears the
-	// limit columns, records which limit fired so the owner's dashboard can say
-	// why the link stopped working, and does not touch updated_at.
-	if file.IsPublic {
-		reason := ""
-		switch {
-		case file.ExpiresAt.Valid && !time.Now().Before(file.ExpiresAt.Time):
-			reason = ExpiryReasonTTL
-		case file.MaxViews.Valid && file.ViewCount >= file.MaxViews.Int64:
-			reason = ExpiryReasonViews
-		}
-		if reason != "" {
-			if err := h.queries.ExpireFile(r.Context(), sqlcgen.ExpireFileParams{
-				ExpiredReason: reason,
-				Slug:          file.Slug,
-			}); err != nil {
-				h.logger.Warn("expire file", "error", err)
-			}
-			file.IsPublic = false
-		}
-	}
+	// Lazy expiry (see lazyExpire); a plain document view is always a view.
+	h.lazyExpire(r.Context(), &file, true)
 
 	// Only the owner's session bypasses the code check. A signed-in stranger
 	// falls through to the public+code path, exactly like an anonymous
@@ -1250,39 +1131,86 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if owner || (file.IsPublic && accessCodeMatches(file.AccessCode, r.URL.Query().Get("code"))) {
-		if owner {
-			if err := h.queries.IncrementFileSuccessCount(r.Context(), file.Slug); err != nil {
-				h.logger.Warn("increment success count", "error", err)
-			}
-		} else {
-			if err := h.queries.IncrementFileCodeSuccessCount(r.Context(), file.Slug); err != nil {
-				h.logger.Warn("increment code success count", "error", err)
-			}
-		}
-		// Only code-based access consumes the view quota; the owner's own
-		// views never count against a max-views limit.
-		if !owner && file.MaxViews.Valid {
-			if err := h.queries.IncrementFileViewCount(r.Context(), file.Slug); err != nil {
-				h.logger.Warn("increment view count", "error", err)
-			}
-		}
-		setUserContentHeaders(w, htmlContentType)
-		w.Write(renderContent(file.Kind, file.Name, file.HtmlContent))
+		h.recordView(r.Context(), file, owner)
+		writeUserHTML(w, http.StatusOK, renderContent(file.Kind, file.Name, file.HtmlContent))
 		return
 	}
 
-	if err := h.queries.IncrementFileFailureCount(r.Context(), file.Slug); err != nil {
-		h.logger.Warn("increment failure count", "error", err)
+	h.deny(w, r, file, true)
+}
+
+// lazyExpire flips a public file whose TTL has passed, or whose view quota is
+// used up, to private at access time (there is no cron). It clears the limit
+// columns, records which limit fired so the owner's dashboard can say why the
+// link stopped working, and does not touch updated_at. file is updated in
+// place so the caller sees the post-expiry state.
+//
+// countViews says whether this request is a view: a site's stylesheets and
+// scripts are not, so the page that uses up the last view still loads its own
+// assets. The deadline applies to every request regardless.
+func (h *FilesHandler) lazyExpire(ctx context.Context, file *sqlcgen.File, countViews bool) {
+	if !file.IsPublic {
+		return
 	}
+	reason := ""
+	switch {
+	case file.ExpiresAt.Valid && !time.Now().Before(file.ExpiresAt.Time):
+		reason = ExpiryReasonTTL
+	case countViews && file.MaxViews.Valid && file.ViewCount >= file.MaxViews.Int64:
+		reason = ExpiryReasonViews
+	}
+	if reason == "" {
+		return
+	}
+	if err := h.queries.ExpireFile(ctx, sqlcgen.ExpireFileParams{
+		ExpiredReason: reason,
+		Slug:          file.Slug,
+	}); err != nil {
+		h.logger.Warn("expire file", "error", err)
+	}
+	file.IsPublic = false
+}
+
+// bump runs one of the Increment* counter statements. Counters are analytics,
+// so a failure is logged and never fails the request being served.
+func (h *FilesHandler) bump(ctx context.Context, op string, increment func(context.Context, string) error, slug string) {
+	if err := increment(ctx, slug); err != nil {
+		h.logger.Warn(op, "error", err)
+	}
+}
+
+// recordView counts one successful view: success_count for the owner,
+// code_success_count for anyone arriving by access code. Only code-based
+// access consumes a max-views quota; the owner's own views never do.
+func (h *FilesHandler) recordView(ctx context.Context, file sqlcgen.File, owner bool) {
+	if owner {
+		h.bump(ctx, "increment success count", h.queries.IncrementFileSuccessCount, file.Slug)
+		return
+	}
+	h.bump(ctx, "increment code success count", h.queries.IncrementFileCodeSuccessCount, file.Slug)
+	if file.MaxViews.Valid {
+		h.bump(ctx, "increment view count", h.queries.IncrementFileViewCount, file.Slug)
+	}
+}
+
+// deny answers a blocked /res request with the sandboxed 403 page, counting it
+// as a failed access when count is set (a site only counts page views).
+func (h *FilesHandler) deny(w http.ResponseWriter, r *http.Request, file sqlcgen.File, count bool) {
+	if count {
+		h.bump(r.Context(), "increment failure count", h.queries.IncrementFileFailureCount, file.Slug)
+	}
+	writeUserHTML(w, http.StatusForbidden, []byte(accessDeniedBody))
+}
+
+// writeUserHTML writes a response made of uploader-influenced HTML under the
+// sandbox headers (setUserContentHeaders) with an explicit status.
+func writeUserHTML(w http.ResponseWriter, status int, body []byte) {
 	setUserContentHeaders(w, htmlContentType)
-	w.WriteHeader(http.StatusForbidden)
-	w.Write([]byte(accessDeniedBody))
+	w.WriteHeader(status)
+	w.Write(body)
 }
 
 func accessCodeMatches(want, got string) bool {
-	if len(want) != len(got) {
-		return false
-	}
 	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
 }
 
@@ -1299,19 +1227,8 @@ func (h *FilesHandler) Download(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	slug := chi.URLParam(r, "slug")
-
-	file, err := h.queries.GetUserFileBySlug(r.Context(), sqlcgen.GetUserFileBySlugParams{
-		Slug:   slug,
-		UserID: user.ID,
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("get file", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	file, ok := h.userFile(w, r, user, chi.URLParam(r, "slug"))
+	if !ok {
 		return
 	}
 

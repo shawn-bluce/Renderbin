@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
 	"github.com/shawn-bluce/renderbin/backend/internal/db"
-	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/server"
 )
 
@@ -35,7 +35,7 @@ func main() {
 	addr := envOr("LISTEN_ADDR", defaultListenAddr)
 	dbPath := envOr("DB_PATH", defaultDBPath)
 
-	if err := os.MkdirAll(dirOf(dbPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		logger.Error("create db dir", "error", err)
 		os.Exit(1)
 	}
@@ -47,8 +47,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	queries := sqlcgen.New(conn)
-	handler := server.New(queries, conn, logger)
+	handler := server.New(conn, logger)
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -95,13 +94,4 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func dirOf(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			return path[:i]
-		}
-	}
-	return "."
 }

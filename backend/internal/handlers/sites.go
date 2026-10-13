@@ -140,12 +140,7 @@ func (h *FilesHandler) redirectIntoSite(w http.ResponseWriter, r *http.Request, 
 		setUserContentHeaders(w, htmlContentType)
 		http.Redirect(w, r, sitePath(file.Slug, file.AccessCode, ""), http.StatusFound)
 	default:
-		if err := h.queries.IncrementFileFailureCount(r.Context(), file.Slug); err != nil {
-			h.logger.Warn("increment failure count", "error", err)
-		}
-		setUserContentHeaders(w, htmlContentType)
-		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte(accessDeniedBody))
+		h.deny(w, r, file, true)
 	}
 }
 
@@ -191,15 +186,13 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	tok, sub, hasSlash := strings.Cut(rest, "/")
 
 	file, err := h.queries.GetFileBySlugAnyOwner(r.Context(), slug)
-	if errors.Is(err, sql.ErrNoRows) || (err == nil && file.Kind != KindSite) {
-		// Deliberately without setUserContentHeaders: nothing user-authored is
-		// served, and the app's own X-Frame-Options: DENY stays on.
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+	if err == nil && file.Kind != KindSite {
+		err = sql.ErrNoRows
 	}
 	if err != nil {
-		h.logger.Error("get site", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		// A miss is deliberately without setUserContentHeaders: nothing
+		// user-authored is served, and the app's own X-Frame-Options: DENY stays on.
+		queryError(w, h.logger, "get site", err)
 		return
 	}
 
@@ -209,39 +202,21 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	}
 	doc := isDocumentRequest(r, entry)
 
-	// Lazy expiry, as in Render. The deadline applies to every request; the
-	// view limit only to page views, so the page that uses up the last view
-	// still loads its stylesheets and scripts.
-	if file.IsPublic {
-		reason := ""
-		switch {
-		case file.ExpiresAt.Valid && !time.Now().Before(file.ExpiresAt.Time):
-			reason = ExpiryReasonTTL
-		case doc && file.MaxViews.Valid && file.ViewCount >= file.MaxViews.Int64:
-			reason = ExpiryReasonViews
-		}
-		if reason != "" {
-			if err := h.queries.ExpireFile(r.Context(), sqlcgen.ExpireFileParams{
-				ExpiredReason: reason,
-				Slug:          file.Slug,
-			}); err != nil {
-				h.logger.Warn("expire file", "error", err)
-			}
-			file.IsPublic = false
-		}
-	}
+	// Lazy expiry, as in Render: the deadline applies to every request, the
+	// view limit only to page views.
+	h.lazyExpire(r.Context(), &file, doc)
 
 	preview := false
 	switch {
 	case strings.HasPrefix(tok, previewPrefix):
 		preview = h.verifyPreview(r.Context(), tok, file)
 		if !preview {
-			h.denySite(w, r, file, doc)
+			h.deny(w, r, file, doc)
 			return
 		}
 	case file.IsPublic && accessCodeMatches(file.AccessCode, tok):
 	default:
-		h.denySite(w, r, file, doc)
+		h.deny(w, r, file, doc)
 		return
 	}
 
@@ -254,14 +229,12 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 
 	arc, err := site.Open(file.Archive)
 	if err != nil {
-		h.logger.Error("open site archive", "slug", file.Slug, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "open site archive", err, "slug", file.Slug)
 		return
 	}
 	data, found, err := arc.Read(entry)
 	if err != nil {
-		h.logger.Error("read site entry", "slug", file.Slug, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "read site entry", err, "slug", file.Slug)
 		return
 	}
 	if !found {
@@ -271,28 +244,13 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, sitePath(slug, tok, sub+"/")+queryPart(r), http.StatusFound)
 			return
 		}
-		setUserContentHeaders(w, htmlContentType)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(siteNotFoundBody))
+		writeUserHTML(w, http.StatusNotFound, []byte(siteNotFoundBody))
 		return
 	}
 
 	if doc {
-		if preview {
-			if err := h.queries.IncrementFileSuccessCount(r.Context(), file.Slug); err != nil {
-				h.logger.Warn("increment success count", "error", err)
-			}
-		} else {
-			if err := h.queries.IncrementFileCodeSuccessCount(r.Context(), file.Slug); err != nil {
-				h.logger.Warn("increment code success count", "error", err)
-			}
-			if file.MaxViews.Valid {
-				if err := h.queries.IncrementFileViewCount(r.Context(), file.Slug); err != nil {
-					h.logger.Warn("increment view count", "error", err)
-				}
-			}
-		}
+		h.recordView(r.Context(), file, preview)
 	}
 
 	setUserContentHeaders(w, site.ContentType(entry, data))
@@ -310,17 +268,6 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", file.UpdatedAt, bytes.NewReader(data))
 }
 
-func (h *FilesHandler) denySite(w http.ResponseWriter, r *http.Request, file sqlcgen.File, doc bool) {
-	if doc {
-		if err := h.queries.IncrementFileFailureCount(r.Context(), file.Slug); err != nil {
-			h.logger.Warn("increment failure count", "error", err)
-		}
-	}
-	setUserContentHeaders(w, htmlContentType)
-	w.WriteHeader(http.StatusForbidden)
-	w.Write([]byte(accessDeniedBody))
-}
-
 func queryPart(r *http.Request) string {
 	if r.URL.RawQuery == "" {
 		return ""
@@ -335,10 +282,7 @@ func queryPart(r *http.Request) string {
 func siteName(requested string, entries []site.Entry) (string, error) {
 	name := strings.TrimSpace(requested)
 	if name != "" {
-		if len(name) > maxNameBytes {
-			return "", fmt.Errorf("name must be at most %d bytes", maxNameBytes)
-		}
-		return name, nil
+		return name, nameTooLong(name)
 	}
 	name = site.Title(entries)
 	for len(name) > maxNameBytes {
@@ -366,12 +310,15 @@ func storeNewSite(ctx context.Context, queries *sqlcgen.Queries, user sqlcgen.Us
 	if err != nil {
 		return sqlcgen.File{}, fmt.Errorf("generate access code: %w", err)
 	}
-	return createSiteWithFreshSlug(ctx, queries, sqlcgen.CreateSiteParams{
-		Name:       name,
-		Archive:    archive,
-		IsPublic:   isPublic,
-		AccessCode: accessCode,
-		UserID:     user.ID,
+	return withFreshSlug(func(slug string) (sqlcgen.File, error) {
+		return queries.CreateSite(ctx, sqlcgen.CreateSiteParams{
+			Slug:       slug,
+			Name:       name,
+			Archive:    archive,
+			IsPublic:   isPublic,
+			AccessCode: accessCode,
+			UserID:     user.ID,
+		})
 	})
 }
 
@@ -429,14 +376,13 @@ func (h *FilesHandler) CreateSite(w http.ResponseWriter, r *http.Request) {
 
 	// Same default-visibility policy as a document upload over HTTP.
 	file, err := storeNewSite(r.Context(), h.queries, user, name, entries,
-		configBool(r, h.queries, ConfigUploadDefaultPublic))
+		configBool(r.Context(), h.queries, ConfigUploadDefaultPublic))
 	if err != nil {
 		if errors.Is(err, errOverQuota) {
 			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		h.logger.Error("create site", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "create site", err)
 		return
 	}
 
@@ -455,17 +401,8 @@ func (h *FilesHandler) ReplaceSite(w http.ResponseWriter, r *http.Request) {
 	}
 	slug := chi.URLParam(r, "slug")
 
-	old, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
-		Slug:   slug,
-		UserID: user.ID,
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		h.logger.Error("get file size", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	old, ok := h.ownedFileSize(w, r, user, slug)
+	if !ok {
 		return
 	}
 	if old.Kind != KindSite {
@@ -479,8 +416,7 @@ func (h *FilesHandler) ReplaceSite(w http.ResponseWriter, r *http.Request) {
 	}
 	archive, err := site.Pack(entries)
 	if err != nil {
-		h.logger.Error("pack site", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "pack site", err)
 		return
 	}
 	if !h.checkQuota(w, r, user, int64(len(archive)), old.ContentSize) {
@@ -492,13 +428,8 @@ func (h *FilesHandler) ReplaceSite(w http.ResponseWriter, r *http.Request) {
 		Slug:    slug,
 		UserID:  user.ID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	if err != nil {
-		h.logger.Error("replace site", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		queryError(w, h.logger, "replace site", err)
 		return
 	}
 

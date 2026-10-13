@@ -89,43 +89,51 @@ func apiKeyUser(r *http.Request, queries *sqlcgen.Queries) (sqlcgen.User, bool) 
 	if !found || token == "" {
 		return sqlcgen.User{}, false
 	}
-	if !configBool(r, queries, ConfigMCPEnabled) {
+	if !configBool(r.Context(), queries, ConfigMCPEnabled) {
 		return sqlcgen.User{}, false
 	}
-	user, err := queries.GetUserByAPIKey(r.Context(), sql.NullString{String: token, Valid: true})
-	if err != nil {
-		return sqlcgen.User{}, false
-	}
-	if user.DisabledAt.Valid {
-		return sqlcgen.User{}, false
-	}
-	return user, true
+	user, err := userByAPIKey(r.Context(), queries, token)
+	return user, err == nil
 }
 
-// userContextKey is unexported so nothing outside this package can plant a
-// user in the context; only WithIdentity can.
-type userContextKey struct{}
+// userByAPIKey resolves an API key to its account, the one rule shared by the
+// REST API and MCP so the two cannot drift: an unknown key and a suspended
+// account's key are both sql.ErrNoRows (a suspended account's key is as dead as
+// its password), and any other error is a real failure.
+func userByAPIKey(ctx context.Context, queries *sqlcgen.Queries, token string) (sqlcgen.User, error) {
+	user, err := queries.GetUserByAPIKey(ctx, sql.NullString{String: token, Valid: true})
+	if err != nil {
+		return sqlcgen.User{}, err
+	}
+	if user.DisabledAt.Valid {
+		return sqlcgen.User{}, sql.ErrNoRows
+	}
+	return user, nil
+}
 
-// apiKeyAuthContextKey marks a request authenticated by API key rather than
-// session, so requireSuperAdmin can tell the two apart.
-type apiKeyAuthContextKey struct{}
+// identityContextKey is unexported so nothing outside this package can plant an
+// identity in the context; only WithIdentity can.
+type identityContextKey struct{}
+
+// identity is who a request is, and how they proved it: viaAPIKey lets
+// requireSuperAdmin tell a session from a key.
+type identity struct {
+	user      sqlcgen.User
+	viaAPIKey bool
+}
 
 // WithIdentity returns r carrying user (and how they authenticated) in its
 // context. The requireAuth middleware in internal/server is the only intended
 // caller.
 func WithIdentity(r *http.Request, user sqlcgen.User, viaAPIKey bool) *http.Request {
-	ctx := context.WithValue(r.Context(), userContextKey{}, user)
-	if viaAPIKey {
-		ctx = context.WithValue(ctx, apiKeyAuthContextKey{}, true)
-	}
-	return r.WithContext(ctx)
+	return r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity{user, viaAPIKey}))
 }
 
 // isAPIKeyAuth reports whether the request authenticated with an API key
 // instead of a session cookie.
 func isAPIKeyAuth(r *http.Request) bool {
-	v, _ := r.Context().Value(apiKeyAuthContextKey{}).(bool)
-	return v
+	id, _ := r.Context().Value(identityContextKey{}).(identity)
+	return id.viaAPIKey
 }
 
 // requireUser is the standard preamble for every handler behind requireAuth:
@@ -140,12 +148,12 @@ func isAPIKeyAuth(r *http.Request) bool {
 // rejected the request first — but it fails closed if a route is ever mounted
 // outside the middleware group by mistake.
 func requireUser(w http.ResponseWriter, r *http.Request) (sqlcgen.User, bool) {
-	user, ok := r.Context().Value(userContextKey{}).(sqlcgen.User)
+	id, ok := r.Context().Value(identityContextKey{}).(identity)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return sqlcgen.User{}, false
 	}
-	return user, true
+	return id.user, true
 }
 
 // requireSuperAdmin is the preamble for every super-admin-only handler

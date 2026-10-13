@@ -71,16 +71,3 @@ func TestIsDocumentRequest(t *testing.T) {
 		}
 	}
 }
-
-func TestValidPathToken(t *testing.T) {
-	for _, s := range []string{".", "..", "", "a/b"} {
-		if validPathToken(s) {
-			t.Errorf("validPathToken(%q) = true", s)
-		}
-	}
-	for _, s := range []string{"...", ".a", "a.b", "abc"} {
-		if !validPathToken(s) {
-			t.Errorf("validPathToken(%q) = false", s)
-		}
-	}
-}

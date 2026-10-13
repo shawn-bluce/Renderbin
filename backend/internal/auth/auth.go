@@ -76,10 +76,10 @@ func VerifyPassword(hash, password string) bool {
 // enumerated through response timing.
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("rb-no-such-user"), bcrypt.DefaultCost)
 
-// BurnPasswordCheck spends one bcrypt verification's worth of CPU and always
-// reports false. Used to equalize login timing for nonexistent usernames.
-func BurnPasswordCheck(password string) bool {
-	return bcrypt.CompareHashAndPassword(dummyHash, []byte(password)) == nil && false
+// BurnPasswordCheck spends one bcrypt verification's worth of CPU and reports
+// nothing. Used to equalize login timing for nonexistent usernames.
+func BurnPasswordCheck(password string) {
+	_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 }
 
 // NewSessionToken returns a 64-character hex string (32 random bytes).
@@ -87,18 +87,24 @@ func NewSessionToken() (string, error) {
 	return randomHex(32)
 }
 
-// NewAccessCode returns an 8-character string: the first 6 characters of a
+// NewShortToken returns an 8-character string: the first 6 characters of a
 // random hex string, base64-encoded. That is 24 bits of entropy — a deliberate
 // choice trading strength for short shareable URLs; the admin can set a longer
-// custom code per file when it matters. RawURLEncoding keeps the result
-// URL-query-safe and padding-free (StdEncoding's '+', '/', '=' would need
-// escaping in ?code= and violate the slug charset).
-func NewAccessCode() (string, error) {
+// custom code per file when it matters, and slug generation retries on UNIQUE
+// conflicts to compensate. RawURLEncoding keeps the result URL-query-safe and
+// padding-free (StdEncoding's '+', '/', '=' would need escaping in ?code= and
+// violate the slug charset). Used for both file slugs and access codes.
+func NewShortToken() (string, error) {
 	h, err := randomHex(16)
 	if err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString([]byte(h[:6])), nil
+}
+
+// NewAccessCode returns a fresh default access code for a file.
+func NewAccessCode() (string, error) {
+	return NewShortToken()
 }
 
 // generatedPasswordAlphabet omits the characters people misread when copying a

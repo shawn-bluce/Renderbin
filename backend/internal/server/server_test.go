@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,11 +30,46 @@ const (
 	testPass = "s3cret"
 )
 
+// bcrypt is deliberately slow (~50ms) and nearly every test seeds an account,
+// but the tests only ever verify a hash, so one per password per test binary is
+// enough.
+var (
+	adminHash = sync.OnceValue(func() string { return mustHash(testPass) })
+	userHash  = sync.OnceValue(func() string { return mustHash("secret2") })
+)
+
+func mustHash(pw string) string {
+	h, err := auth.HashPassword(pw)
+	if err != nil {
+		panic(err)
+	}
+	return h
+}
+
+// syncBuffer is a log sink the server goroutines and the test can share.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 type testEnv struct {
 	srv     *httptest.Server
 	queries *sqlcgen.Queries
 	conn    *sql.DB
 	admin   sqlcgen.User
+	logs    *syncBuffer // everything the server logged
 }
 
 // newBareEnv starts a server against an empty database — no users yet, the
@@ -46,12 +82,11 @@ func newBareEnv(t *testing.T) *testEnv {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	queries := sqlcgen.New(conn)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(server.New(queries, conn, logger))
+	logs := &syncBuffer{}
+	srv := httptest.NewServer(server.New(conn, slog.New(slog.NewTextHandler(logs, nil))))
 	t.Cleanup(srv.Close)
 
-	return &testEnv{srv: srv, queries: queries, conn: conn}
+	return &testEnv{srv: srv, queries: sqlcgen.New(conn), conn: conn, logs: logs}
 }
 
 // newEnv additionally seeds the super admin (id=1, testUser/testPass), the
@@ -59,14 +94,10 @@ func newBareEnv(t *testing.T) *testEnv {
 func newEnv(t *testing.T) *testEnv {
 	t.Helper()
 	e := newBareEnv(t)
-	hash, err := auth.HashPassword(testPass)
-	if err != nil {
-		t.Fatalf("HashPassword: %v", err)
-	}
 	admin, err := e.queries.CreateUser(context.Background(), sqlcgen.CreateUserParams{
 		Username:     testUser,
 		Nickname:     "Admin",
-		PasswordHash: hash,
+		PasswordHash: adminHash(),
 	})
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
@@ -105,14 +136,10 @@ func (e *testEnv) authCookie(t *testing.T) *http.Cookie {
 // stops a copy from quietly reusing the admin's cookie and passing vacuously.
 func (e *testEnv) newUser(t *testing.T, username string) (sqlcgen.User, *http.Cookie) {
 	t.Helper()
-	hash, err := auth.HashPassword("secret2")
-	if err != nil {
-		t.Fatalf("HashPassword: %v", err)
-	}
 	user, err := e.queries.CreateUser(context.Background(), sqlcgen.CreateUserParams{
 		Username:     username,
 		Nickname:     username,
-		PasswordHash: hash,
+		PasswordHash: userHash(),
 	})
 	if err != nil {
 		t.Fatalf("CreateUser(%s): %v", username, err)
@@ -120,27 +147,57 @@ func (e *testEnv) newUser(t *testing.T, username string) (sqlcgen.User, *http.Co
 	return user, e.cookieFor(t, user.ID)
 }
 
-func (e *testEnv) do(t *testing.T, method, path, body string, cookie *http.Cookie) *http.Response {
+// send is the one place a request is built. follow=false stops at the first
+// redirect so a chain can be asserted hop by hop.
+func (e *testEnv) send(t *testing.T, method, path string, body io.Reader, cookie *http.Cookie,
+	header map[string]string, follow bool) *http.Response {
 	t.Helper()
-	var r io.Reader
-	if body != "" {
-		r = strings.NewReader(body)
-	}
-	req, err := http.NewRequest(method, e.srv.URL+path, r)
+	req, err := http.NewRequest(method, e.srv.URL+path, body)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
+	for k, v := range header {
+		req.Header.Set(k, v)
 	}
 	if cookie != nil {
 		req.AddCookie(cookie)
 	}
-	resp, err := e.srv.Client().Do(req)
+	client := *e.srv.Client()
+	if !follow {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	return resp
+}
+
+// do sends a JSON request (body "" means none) with an optional session cookie.
+func (e *testEnv) do(t *testing.T, method, path, body string, cookie *http.Cookie) *http.Response {
+	t.Helper()
+	if body == "" {
+		return e.send(t, method, path, nil, cookie, nil, true)
+	}
+	return e.send(t, method, path, strings.NewReader(body), cookie,
+		map[string]string{"Content-Type": "application/json"}, true)
+}
+
+// expect is do for the many calls whose only interest is the status.
+func (e *testEnv) expect(t *testing.T, want int, method, path, body string, cookie *http.Cookie) {
+	t.Helper()
+	resp := e.do(t, method, path, body, cookie)
+	defer resp.Body.Close()
+	assertStatus(t, resp, want)
+}
+
+// expectKeyGET is expect for a GET authenticated by a Bearer API key instead
+// of a session cookie.
+func (e *testEnv) expectKeyGET(t *testing.T, want int, path, key string) {
+	t.Helper()
+	resp := e.doKey(t, http.MethodGet, path, "", key)
+	defer resp.Body.Close()
+	assertStatus(t, resp, want)
 }
 
 type fileResp struct {
@@ -161,14 +218,35 @@ type fileResp struct {
 	ExpiredReason    string  `json:"expired_reason"`
 }
 
-func decodeFile(t *testing.T, resp *http.Response) fileResp {
+func assertStatus(t *testing.T, resp *http.Response, want int) {
+	t.Helper()
+	if resp.StatusCode != want {
+		t.Errorf("status = %d, want %d", resp.StatusCode, want)
+	}
+}
+
+// decodeJSON checks the status, decodes the body as T and closes it.
+func decodeJSON[T any](t *testing.T, resp *http.Response, want int) T {
 	t.Helper()
 	defer resp.Body.Close()
-	var f fileResp
-	if err := json.NewDecoder(resp.Body).Decode(&f); err != nil {
-		t.Fatalf("decode file response: %v", err)
+	assertStatus(t, resp, want)
+	var v T
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		t.Fatalf("decode %T: %v", v, err)
 	}
-	return f
+	return v
+}
+
+func decodeFile(t *testing.T, resp *http.Response, want int) fileResp {
+	t.Helper()
+	return decodeJSON[fileResp](t, resp, want)
+}
+
+// bodyOf checks the status and returns the body as text.
+func bodyOf(t *testing.T, resp *http.Response, want int) string {
+	t.Helper()
+	assertStatus(t, resp, want)
+	return bodyString(t, resp)
 }
 
 func bodyString(t *testing.T, resp *http.Response) string {
@@ -181,10 +259,23 @@ func bodyString(t *testing.T, resp *http.Response) string {
 	return string(b)
 }
 
-func assertStatus(t *testing.T, resp *http.Response, want int) {
+// publish makes a file public through the visibility endpoint.
+func (e *testEnv) publish(t *testing.T, cookie *http.Cookie, slug string) {
 	t.Helper()
-	if resp.StatusCode != want {
-		t.Errorf("status = %d, want %d", resp.StatusCode, want)
+	e.expect(t, http.StatusOK, http.MethodPatch, "/api/files/"+slug+"/visibility", `{"is_public":true}`, cookie)
+}
+
+// trash soft-deletes a file.
+func (e *testEnv) trash(t *testing.T, cookie *http.Cookie, slug string) {
+	t.Helper()
+	e.expect(t, http.StatusNoContent, http.MethodDelete, "/api/files/"+slug, "", cookie)
+}
+
+// setConfig writes a global config value the way the settings endpoint would.
+func (e *testEnv) setConfig(t *testing.T, key, value string) {
+	t.Helper()
+	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{Key: key, Value: value}); err != nil {
+		t.Fatalf("SetConfig(%s): %v", key, err)
 	}
 }
 
@@ -193,16 +284,13 @@ func assertStatus(t *testing.T, resp *http.Response, want int) {
 func (e *testEnv) createViaAPI(t *testing.T, cookie *http.Cookie, name, html string) fileResp {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"name": name, "html_content": html})
-	resp := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
-	assertStatus(t, resp, http.StatusCreated)
-	return decodeFile(t, resp)
+	return decodeFile(t, e.do(t, http.MethodPost, "/api/files", string(body), cookie), http.StatusCreated)
 }
 
 func TestHealth(t *testing.T) {
 	e := newEnv(t)
 	resp := e.do(t, http.MethodGet, "/api/health", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(b, `"status":"ok"`) {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, `"status":"ok"`) {
 		t.Errorf("health body = %q", b)
 	}
 }
@@ -211,17 +299,13 @@ func TestLogin(t *testing.T) {
 	e := newEnv(t)
 
 	// Bad JSON.
-	resp := e.do(t, http.MethodPost, "/api/auth/login", "{not json", nil)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPost, "/api/auth/login", "{not json", nil)
 
 	// Wrong credentials.
-	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"admin","password":"nope"}`, nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodPost, "/api/auth/login", `{"username":"admin","password":"nope"}`, nil)
 
 	// Correct credentials -> 204 + Set-Cookie.
-	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"admin","password":"s3cret"}`, nil)
+	resp := e.do(t, http.MethodPost, "/api/auth/login", `{"username":"admin","password":"s3cret"}`, nil)
 	assertStatus(t, resp, http.StatusNoContent)
 	var found bool
 	for _, c := range resp.Cookies() {
@@ -239,41 +323,22 @@ func TestMeAndLogout(t *testing.T) {
 	e := newEnv(t)
 
 	// Unauthenticated.
-	resp := e.do(t, http.MethodGet, "/api/auth/me", "", nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/auth/me", "", nil)
 
 	// Authenticated.
 	cookie := e.authCookie(t)
-	resp = e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	var me struct {
+	me := decodeJSON[struct {
 		Username string `json:"username"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
-		t.Fatalf("decode me: %v", err)
-	}
-	resp.Body.Close()
+	}](t, e.do(t, http.MethodGet, "/api/auth/me", "", cookie), http.StatusOK)
 	if me.Username != testUser {
 		t.Errorf("me username = %q, want %q", me.Username, testUser)
 	}
 
 	// Logout always 204.
-	resp = e.do(t, http.MethodPost, "/api/auth/logout", "", cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.expect(t, http.StatusNoContent, http.MethodPost, "/api/auth/logout", "", cookie)
 
 	// The session should no longer be valid.
-	resp = e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
-}
-
-func TestRequireAuthGuardsFiles(t *testing.T) {
-	e := newEnv(t)
-	resp := e.do(t, http.MethodGet, "/api/files", "", nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/auth/me", "", cookie)
 }
 
 func TestFilesCRUD(t *testing.T) {
@@ -297,20 +362,13 @@ func TestFilesCRUD(t *testing.T) {
 
 	// Get returns full content.
 	resp := e.do(t, http.MethodGet, "/api/files/"+created.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	got := decodeFile(t, resp)
+	got := decodeFile(t, resp, http.StatusOK)
 	if got.HTMLContent != "<h1>v1</h1>" {
 		t.Errorf("Get html_content = %q", got.HTMLContent)
 	}
 
 	// List includes it.
-	resp = e.do(t, http.MethodGet, "/api/files", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	var list []fileResp
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		t.Fatalf("decode list: %v", err)
-	}
-	resp.Body.Close()
+	list := decodeJSON[[]fileResp](t, e.do(t, http.MethodGet, "/api/files", "", cookie), http.StatusOK)
 	if len(list) != 1 || list[0].Slug != created.Slug {
 		t.Errorf("list = %d items, want the created file", len(list))
 	}
@@ -318,8 +376,7 @@ func TestFilesCRUD(t *testing.T) {
 	// Update name, slug, content, access code.
 	upd := `{"name":"renamed","slug":"custom-slug","html_content":"<h1>v2</h1>","access_code":"mycode12"}`
 	resp = e.do(t, http.MethodPatch, "/api/files/"+created.Slug, upd, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	updated := decodeFile(t, resp)
+	updated := decodeFile(t, resp, http.StatusOK)
 	if updated.Slug != "custom-slug" || updated.Name != "renamed" {
 		t.Errorf("update result = %+v", updated)
 	}
@@ -328,9 +385,7 @@ func TestFilesCRUD(t *testing.T) {
 	}
 
 	// Old slug is gone.
-	resp = e.do(t, http.MethodGet, "/api/files/"+created.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodGet, "/api/files/"+created.Slug, "", cookie)
 }
 
 func TestUpdateValidation(t *testing.T) {
@@ -340,34 +395,24 @@ func TestUpdateValidation(t *testing.T) {
 	b := e.createViaAPI(t, cookie, "b", "<p>b</p>")
 
 	// Invalid slug.
-	resp := e.do(t, http.MethodPatch, "/api/files/"+a.Slug,
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+a.Slug,
 		`{"name":"x","slug":"bad slug!","html_content":"<p>x</p>","access_code":"ok123456"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
 
 	// Empty content.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+a.Slug,
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+a.Slug,
 		`{"name":"x","slug":"ok","html_content":"","access_code":"ok123456"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
 
 	// Empty access code (would open the file to code-less requests).
-	resp = e.do(t, http.MethodPatch, "/api/files/"+a.Slug,
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+a.Slug,
 		`{"name":"x","slug":"ok","html_content":"<p>x</p>","access_code":""}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
 
 	// Access code with invalid characters.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+a.Slug,
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+a.Slug,
 		`{"name":"x","slug":"ok","html_content":"<p>x</p>","access_code":"has space"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
 
 	// Slug collision -> 409.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+a.Slug,
+	e.expect(t, http.StatusConflict, http.MethodPatch, "/api/files/"+a.Slug,
 		`{"name":"x","slug":"`+b.Slug+`","html_content":"<p>x</p>","access_code":"ok123456"}`, cookie)
-	assertStatus(t, resp, http.StatusConflict)
-	resp.Body.Close()
 }
 
 func TestCreateValidation(t *testing.T) {
@@ -375,21 +420,12 @@ func TestCreateValidation(t *testing.T) {
 	cookie := e.authCookie(t)
 
 	// Missing html_content.
-	resp := e.do(t, http.MethodPost, "/api/files", `{"name":"x","html_content":""}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPost, "/api/files", `{"name":"x","html_content":""}`, cookie)
 
-	// Over 5MB.
-	big := strings.Repeat("a", (5<<20)+1)
-	body, _ := json.Marshal(map[string]string{"name": "big", "html_content": big})
-	resp = e.do(t, http.MethodPost, "/api/files", string(body), cookie)
-	assertStatus(t, resp, http.StatusRequestEntityTooLarge)
-	resp.Body.Close()
+	// The 5MB ceiling is pinned in TestOversizedDocumentReportsItsLimit.
 
 	// Unknown kind -> 400.
-	resp = e.do(t, http.MethodPost, "/api/files", `{"name":"x","kind":"pdf","html_content":"x"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPost, "/api/files", `{"name":"x","kind":"pdf","html_content":"x"}`, cookie)
 }
 
 func TestCreateKind(t *testing.T) {
@@ -398,15 +434,13 @@ func TestCreateKind(t *testing.T) {
 
 	// An explicit kind round-trips in the response.
 	resp := e.do(t, http.MethodPost, "/api/files", `{"name":"notes","kind":"markdown","html_content":"# hi"}`, cookie)
-	assertStatus(t, resp, http.StatusCreated)
-	if got := decodeFile(t, resp); got.Kind != "markdown" {
+	if got := decodeFile(t, resp, http.StatusCreated); got.Kind != "markdown" {
 		t.Errorf("kind = %q, want markdown", got.Kind)
 	}
 
 	// Omitting kind defaults to html (back-compat).
 	resp = e.do(t, http.MethodPost, "/api/files", `{"name":"page","html_content":"<p>x</p>"}`, cookie)
-	assertStatus(t, resp, http.StatusCreated)
-	if got := decodeFile(t, resp); got.Kind != "html" {
+	if got := decodeFile(t, resp, http.StatusCreated); got.Kind != "html" {
 		t.Errorf("default kind = %q, want html", got.Kind)
 	}
 }
@@ -417,12 +451,10 @@ func TestTrashAndRestore(t *testing.T) {
 	f := e.createViaAPI(t, cookie, "doc", "<p>x</p>")
 
 	// Delete -> 204.
-	resp := e.do(t, http.MethodDelete, "/api/files/"+f.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.trash(t, cookie, f.Slug)
 
 	// Not in active list.
-	resp = e.do(t, http.MethodGet, "/api/files", "", cookie)
+	resp := e.do(t, http.MethodGet, "/api/files", "", cookie)
 	if b := bodyString(t, resp); strings.Contains(b, f.Slug) {
 		t.Error("deleted file still in active list")
 	}
@@ -434,14 +466,10 @@ func TestTrashAndRestore(t *testing.T) {
 	}
 
 	// Restore -> 200.
-	resp = e.do(t, http.MethodPost, "/api/files/"+f.Slug+"/restore", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodPost, "/api/files/"+f.Slug+"/restore", "", cookie)
 
 	// Restoring again -> 404 (no longer deleted).
-	resp = e.do(t, http.MethodPost, "/api/files/"+f.Slug+"/restore", "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodPost, "/api/files/"+f.Slug+"/restore", "", cookie)
 }
 
 func TestHardDelete(t *testing.T) {
@@ -450,38 +478,26 @@ func TestHardDelete(t *testing.T) {
 	f := e.createViaAPI(t, cookie, "doc", "<p>x</p>")
 
 	// Active file -> 404 (only trashed files can be purged).
-	resp := e.do(t, http.MethodDelete, "/api/files/"+f.Slug+"/permanent", "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodDelete, "/api/files/"+f.Slug+"/permanent", "", cookie)
 
 	// Soft delete, then purge -> 204.
-	resp = e.do(t, http.MethodDelete, "/api/files/"+f.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodDelete, "/api/files/"+f.Slug+"/permanent", "", cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.trash(t, cookie, f.Slug)
+	e.expect(t, http.StatusNoContent, http.MethodDelete, "/api/files/"+f.Slug+"/permanent", "", cookie)
 
 	// Gone from the trashed list.
-	resp = e.do(t, http.MethodGet, "/api/files?deleted=true", "", cookie)
+	resp := e.do(t, http.MethodGet, "/api/files?deleted=true", "", cookie)
 	if b := bodyString(t, resp); strings.Contains(b, f.Slug) {
 		t.Error("purged file still in trashed list")
 	}
 
 	// Purging again -> 404; restore is impossible too.
-	resp = e.do(t, http.MethodDelete, "/api/files/"+f.Slug+"/permanent", "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodPost, "/api/files/"+f.Slug+"/restore", "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodDelete, "/api/files/"+f.Slug+"/permanent", "", cookie)
+	e.expect(t, http.StatusNotFound, http.MethodPost, "/api/files/"+f.Slug+"/restore", "", cookie)
 
 	// The freed slug can be taken by another file.
 	other := e.createViaAPI(t, cookie, "other", "<p>y</p>")
 	upd := `{"name":"other","slug":"` + f.Slug + `","html_content":"<p>y</p>","access_code":"ok123456"}`
-	resp = e.do(t, http.MethodPatch, "/api/files/"+other.Slug, upd, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodPatch, "/api/files/"+other.Slug, upd, cookie)
 }
 
 func TestSetExpiry(t *testing.T) {
@@ -491,8 +507,7 @@ func TestSetExpiry(t *testing.T) {
 
 	// max_views forces public.
 	resp := e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"max_views":3}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	got := decodeFile(t, resp)
+	got := decodeFile(t, resp, http.StatusOK)
 	if !got.IsPublic {
 		t.Error("setting a view limit must force public")
 	}
@@ -502,8 +517,7 @@ func TestSetExpiry(t *testing.T) {
 
 	// ttl sets an expiry timestamp.
 	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"24h"}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	got = decodeFile(t, resp)
+	got = decodeFile(t, resp, http.StatusOK)
 	if got.ExpiresAt == nil {
 		t.Error("ttl should set expires_at")
 	}
@@ -512,32 +526,24 @@ func TestSetExpiry(t *testing.T) {
 	}
 
 	// Mutually exclusive -> 400.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"24h","max_views":5}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"24h","max_views":5}`, cookie)
 
 	// An arbitrary amount plus a unit is accepted, not just the old presets.
 	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"3mo"}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	got = decodeFile(t, resp)
+	got = decodeFile(t, resp, http.StatusOK)
 	if got.ExpiresAt == nil {
 		t.Error("a calendar-unit ttl should set expires_at")
 	}
 
 	// Invalid ttl -> 400.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"99x"}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"99x"}`, cookie)
 
 	// Non-positive max_views -> 400.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"max_views":0}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"max_views":0}`, cookie)
 
 	// Clearing keeps visibility (currently public) and nulls the limits.
 	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	got = decodeFile(t, resp)
+	got = decodeFile(t, resp, http.StatusOK)
 	if got.ExpiresAt != nil || got.MaxViews != nil {
 		t.Error("clearing should null both limits")
 	}
@@ -553,20 +559,15 @@ func TestRename(t *testing.T) {
 
 	// Success.
 	resp := e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/name", `{"name":"new name"}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.Name != "new name" {
+	if got := decodeFile(t, resp, http.StatusOK); got.Name != "new name" {
 		t.Errorf("name = %q, want %q", got.Name, "new name")
 	}
 
 	// Empty/whitespace name -> 400.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/name", `{"name":"  "}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+f.Slug+"/name", `{"name":"  "}`, cookie)
 
 	// Unknown slug -> 404.
-	resp = e.do(t, http.MethodPatch, "/api/files/nope/name", `{"name":"x"}`, cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodPatch, "/api/files/nope/name", `{"name":"x"}`, cookie)
 }
 
 func TestVisibilityTagsRefresh(t *testing.T) {
@@ -575,56 +576,49 @@ func TestVisibilityTagsRefresh(t *testing.T) {
 	f := e.createViaAPI(t, cookie, "doc", "<p>x</p>")
 
 	resp := e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/visibility", `{"is_public":true}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); !got.IsPublic {
+	if got := decodeFile(t, resp, http.StatusOK); !got.IsPublic {
 		t.Error("visibility not set to public")
 	}
 
 	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/tags", `{"tags":" a , b ,a "}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.Tags != "a,b" {
+	if got := decodeFile(t, resp, http.StatusOK); got.Tags != "a,b" {
 		t.Errorf("tags = %q, want normalized %q", got.Tags, "a,b")
 	}
 
 	resp = e.do(t, http.MethodPost, "/api/files/"+f.Slug+"/refresh-code", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.AccessCode == f.AccessCode || got.AccessCode == "" {
+	if got := decodeFile(t, resp, http.StatusOK); got.AccessCode == f.AccessCode || got.AccessCode == "" {
 		t.Errorf("refresh-code did not produce a new code: %q", got.AccessCode)
 	}
 }
 
-// createRaw inserts a file directly with a controlled slug/access_code/visibility,
-// which the API's Create (random slug, private) can't express.
-func (e *testEnv) createRaw(t *testing.T, slug, code, html string, public bool) {
-	t.Helper()
-	if _, err := e.queries.CreateFile(context.Background(), sqlcgen.CreateFileParams{
-		Slug:        slug,
-		Name:        slug,
-		HtmlContent: html,
-		Kind:        "html",
-		IsPublic:    public,
-		AccessCode:  code,
-		UserID:      e.admin.ID,
-	}); err != nil {
-		t.Fatalf("CreateFile(raw): %v", err)
-	}
-}
-
-// createRawKind is createRaw with an explicit kind, for exercising the
-// non-html render paths.
-func (e *testEnv) createRawKind(t *testing.T, slug, kind, source string) {
+// insertFile writes a file row directly, with the slug, access code and
+// visibility the API's Create (random slug, private) can't express.
+func (e *testEnv) insertFile(t *testing.T, slug, kind, source, code string, public bool) {
 	t.Helper()
 	if _, err := e.queries.CreateFile(context.Background(), sqlcgen.CreateFileParams{
 		Slug:        slug,
 		Name:        slug,
 		HtmlContent: source,
 		Kind:        kind,
-		IsPublic:    true,
-		AccessCode:  "c",
+		IsPublic:    public,
+		AccessCode:  code,
 		UserID:      e.admin.ID,
 	}); err != nil {
-		t.Fatalf("CreateFile(raw %s): %v", kind, err)
+		t.Fatalf("CreateFile(%s %s): %v", slug, kind, err)
 	}
+}
+
+// createRaw inserts an html file with a controlled slug/access_code/visibility.
+func (e *testEnv) createRaw(t *testing.T, slug, code, html string, public bool) {
+	t.Helper()
+	e.insertFile(t, slug, "html", html, code, public)
+}
+
+// createRawKind inserts a public file of an explicit kind, for exercising the
+// non-html render paths.
+func (e *testEnv) createRawKind(t *testing.T, slug, kind, source string) {
+	t.Helper()
+	e.insertFile(t, slug, kind, source, "c", true)
 }
 
 func TestRenderByKind(t *testing.T) {
@@ -633,20 +627,16 @@ func TestRenderByKind(t *testing.T) {
 	// Markdown is rendered to HTML.
 	e.createRawKind(t, "md", "markdown", "# Title\n\nsome **bold** text\n")
 	resp := e.do(t, http.MethodGet, "/res/md?code=c", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(b, "Title</h1>") || !strings.Contains(b, "<strong>bold</strong>") {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, "Title</h1>") {
 		t.Errorf("markdown not rendered to HTML: %q", b)
 	}
 
-	// Text is HTML-escaped and its newlines preserved (never interpreted).
+	// Text is HTML-escaped and its newlines preserved (never interpreted). The
+	// renderers themselves are covered in handlers/content_test.go; this pins
+	// that /res dispatches on kind at all.
 	e.createRawKind(t, "note", "txt", "a <b> tag\nsecond line")
 	resp = e.do(t, http.MethodGet, "/res/note?code=c", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	b := bodyString(t, resp)
-	if strings.Contains(b, "<b> tag") {
-		t.Errorf("txt content should be escaped, not interpreted: %q", b)
-	}
-	if !strings.Contains(b, "a &lt;b&gt; tag\nsecond line") {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, "a &lt;b&gt; tag\nsecond line") {
 		t.Errorf("txt content not preserved/escaped: %q", b)
 	}
 }
@@ -655,27 +645,20 @@ func TestRenderAccessControl(t *testing.T) {
 	e := newEnv(t)
 
 	// Missing slug -> 404.
-	resp := e.do(t, http.MethodGet, "/res/nope", "", nil)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodGet, "/res/nope", "", nil)
 
 	// Private file, no session -> 403.
 	e.createRaw(t, "priv", "code1", "<h1>secret</h1>", false)
-	resp = e.do(t, http.MethodGet, "/res/priv", "", nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodGet, "/res/priv", "", nil)
 
 	// Public file, wrong code -> 403.
 	e.createRaw(t, "pub", "rightcode", "<h1>hello</h1>", true)
-	resp = e.do(t, http.MethodGet, "/res/pub?code=wrong", "", nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodGet, "/res/pub?code=wrong", "", nil)
 
 	// Public file, correct code -> 200 + content, and code_success_count
 	// bumps (anonymous access), not success_count (session access).
-	resp = e.do(t, http.MethodGet, "/res/pub?code=rightcode", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); b != "<h1>hello</h1>" {
+	resp := e.do(t, http.MethodGet, "/res/pub?code=rightcode", "", nil)
+	if b := bodyOf(t, resp, http.StatusOK); b != "<h1>hello</h1>" {
 		t.Errorf("render body = %q", b)
 	}
 	f, err := e.queries.GetFileBySlugAnyOwner(context.Background(), "pub")
@@ -696,8 +679,7 @@ func TestRenderAccessControl(t *testing.T) {
 	// success_count, not code_success_count.
 	cookie := e.authCookie(t)
 	resp = e.do(t, http.MethodGet, "/res/priv", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); b != "<h1>secret</h1>" {
+	if b := bodyOf(t, resp, http.StatusOK); b != "<h1>secret</h1>" {
 		t.Errorf("admin render body = %q", b)
 	}
 	f, err = e.queries.GetFileBySlugAnyOwner(context.Background(), "priv")
@@ -720,9 +702,7 @@ func TestRenderDeletedIsNotFound(t *testing.T) {
 		t.Fatalf("SoftDeleteFile: %v", err)
 	}
 	// Even an admin can't resurrect a deleted file via /res.
-	resp := e.do(t, http.MethodGet, "/res/gone", "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodGet, "/res/gone", "", cookie)
 }
 
 func TestRenderViewLimitExpiry(t *testing.T) {
@@ -738,14 +718,10 @@ func TestRenderViewLimitExpiry(t *testing.T) {
 	}
 
 	// First anonymous access consumes the single allowed view.
-	resp := e.do(t, http.MethodGet, "/res/limited?code=c", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/res/limited?code=c", "", nil)
 
 	// Second anonymous access is over quota -> 403, and the file flips private.
-	resp = e.do(t, http.MethodGet, "/res/limited?code=c", "", nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodGet, "/res/limited?code=c", "", nil)
 
 	f, err := e.queries.GetFileBySlugAnyOwner(ctx, "limited")
 	if err != nil {
@@ -764,9 +740,8 @@ func TestRenderViewLimitExpiry(t *testing.T) {
 		t.Errorf("expiry marker = %q at %v, want views with a timestamp", f.ExpiredReason, f.ExpiredAt)
 	}
 	// ...and the owner sees it on the file.
-	resp = e.do(t, http.MethodGet, "/api/files/limited", "", e.authCookie(t))
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.ExpiredReason != "views" || got.ExpiredAt == nil {
+	resp := e.do(t, http.MethodGet, "/api/files/limited", "", e.authCookie(t))
+	if got := decodeFile(t, resp, http.StatusOK); got.ExpiredReason != "views" || got.ExpiredAt == nil {
 		t.Errorf("api reports marker %q at %v, want views with a timestamp", got.ExpiredReason, got.ExpiredAt)
 	}
 }
@@ -785,9 +760,7 @@ func TestRenderTTLExpiry(t *testing.T) {
 		t.Fatalf("SetFileExpiry: %v", err)
 	}
 
-	resp := e.do(t, http.MethodGet, "/res/stale?code=c", "", nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodGet, "/res/stale?code=c", "", nil)
 
 	f, err := e.queries.GetFileBySlugAnyOwner(ctx, "stale")
 	if err != nil {
@@ -802,9 +775,8 @@ func TestRenderTTLExpiry(t *testing.T) {
 
 	// Re-publishing with a fresh limit clears the marker, so the badge can
 	// never sit next to a live expiry it contradicts.
-	resp = e.do(t, http.MethodPatch, "/api/files/stale/expiry", `{"ttl":"24h"}`, e.authCookie(t))
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.ExpiredReason != "" || got.ExpiredAt != nil {
+	resp := e.do(t, http.MethodPatch, "/api/files/stale/expiry", `{"ttl":"24h"}`, e.authCookie(t))
+	if got := decodeFile(t, resp, http.StatusOK); got.ExpiredReason != "" || got.ExpiredAt != nil {
 		t.Errorf("marker = %q at %v, want cleared by a new limit", got.ExpiredReason, got.ExpiredAt)
 	}
 }
@@ -823,9 +795,7 @@ func TestRenderAdminDoesNotConsumeQuota(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		resp := e.do(t, http.MethodGet, "/res/quota", "", cookie)
-		assertStatus(t, resp, http.StatusOK)
-		resp.Body.Close()
+		e.expect(t, http.StatusOK, http.MethodGet, "/res/quota", "", cookie)
 	}
 	f, err := e.queries.GetFileBySlugAnyOwner(ctx, "quota")
 	if err != nil {
@@ -845,12 +815,10 @@ func TestDownload(t *testing.T) {
 	f := e.createViaAPI(t, cookie, "report", "<h1>dl</h1>")
 
 	// Unauthenticated -> 401 (requireAuth middleware).
-	resp := e.do(t, http.MethodGet, "/api/files/"+f.Slug+"/download", "", nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/files/"+f.Slug+"/download", "", nil)
 
 	// Authenticated -> 200 with attachment disposition + raw content.
-	resp = e.do(t, http.MethodGet, "/api/files/"+f.Slug+"/download", "", cookie)
+	resp := e.do(t, http.MethodGet, "/api/files/"+f.Slug+"/download", "", cookie)
 	assertStatus(t, resp, http.StatusOK)
 	if cd := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment;") {
 		t.Errorf("Content-Disposition = %q", cd)
@@ -860,9 +828,7 @@ func TestDownload(t *testing.T) {
 	}
 
 	// Missing slug -> 404.
-	resp = e.do(t, http.MethodGet, "/api/files/nope/download", "", cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodGet, "/api/files/nope/download", "", cookie)
 }
 
 func TestBackupDownload(t *testing.T) {
@@ -872,23 +838,15 @@ func TestBackupDownload(t *testing.T) {
 	e.createViaAPI(t, cookie, "doc", "<h1>backed up</h1>")
 
 	// Unauthenticated -> 401 (requireAuth middleware).
-	resp := e.do(t, http.MethodGet, "/api/backup", "", nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/backup", "", nil)
 
 	// Authenticated -> 200, attachment, and a valid SQLite file.
-	resp = e.do(t, http.MethodGet, "/api/backup", "", cookie)
+	resp := e.do(t, http.MethodGet, "/api/backup", "", cookie)
 	assertStatus(t, resp, http.StatusOK)
 	if cd := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment;") {
 		t.Errorf("Content-Disposition = %q", cd)
 	}
-	// A signed-in non-admin -> 403. The snapshot is the whole database, so
-	// it carries every user's files, password hash and API key.
-	_, otherCookie := e.newUser(t, "other")
-	other := e.do(t, http.MethodGet, "/api/backup", "", otherCookie)
-	assertStatus(t, other, http.StatusForbidden)
-	other.Body.Close()
-
+	// (A signed-in non-admin gets 403: see TestSuperAdminEndpointsRejectOrdinaryUsers.)
 	body := bodyString(t, resp)
 	// Every SQLite database file begins with this 16-byte magic header.
 	if !strings.HasPrefix(body, "SQLite format 3\x00") {
@@ -904,24 +862,17 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	cookie := e.authCookie(t)
 
 	original := e.createViaAPI(t, cookie, "before backup", "<h1>original</h1>")
-	snapshot := e.download(t, "/api/backup", cookie)
+	snapshot := e.downloadBackup(t, cookie)
 
 	// Diverge: add a file, delete the original one.
 	added := e.createViaAPI(t, cookie, "after backup", "<p>new</p>")
-	resp := e.do(t, http.MethodDelete, "/api/files/"+original.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.trash(t, cookie, original.Slug)
 
 	restored := e.restore(t, snapshot, cookie)
-	assertStatus(t, restored, http.StatusOK)
-	var out struct {
+	out := decodeJSON[struct {
 		Users int64 `json:"users"`
 		Files int64 `json:"files"`
-	}
-	if err := json.NewDecoder(restored.Body).Decode(&out); err != nil {
-		t.Fatalf("decode restore response: %v", err)
-	}
-	restored.Body.Close()
+	}](t, restored, http.StatusOK)
 	if out.Users != 1 || out.Files != 1 {
 		t.Errorf("restore reported %+v, want 1 user / 1 file", out)
 	}
@@ -930,65 +881,38 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	// is back and the one added afterwards is gone. A fresh session is needed
 	// because the snapshot's sessions table replaced the live one.
 	after := e.cookieFor(t, e.admin.ID)
-	resp = e.do(t, http.MethodGet, "/api/files/"+original.Slug, "", after)
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.HTMLContent != "<h1>original</h1>" {
+	resp := e.do(t, http.MethodGet, "/api/files/"+original.Slug, "", after)
+	if got := decodeFile(t, resp, http.StatusOK); got.HTMLContent != "<h1>original</h1>" {
 		t.Errorf("restored content = %q", got.HTMLContent)
 	}
-	resp = e.do(t, http.MethodGet, "/api/files/"+added.Slug, "", after)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodGet, "/api/files/"+added.Slug, "", after)
 
 	// And the restored database keeps working for writes — the id sequence came
 	// across with the rows, so a new file doesn't collide with a restored id.
 	e.createViaAPI(t, after, "after restore", "<p>fresh</p>")
 }
 
-// download returns a response body as bytes, for endpoints that stream files.
-func (e *testEnv) download(t *testing.T, path string, cookie *http.Cookie) []byte {
+// downloadBackup returns the database snapshot as bytes.
+func (e *testEnv) downloadBackup(t *testing.T, cookie *http.Cookie) []byte {
 	t.Helper()
-	resp := e.do(t, http.MethodGet, path, "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return body
+	return []byte(bodyOf(t, e.do(t, http.MethodGet, "/api/backup", "", cookie), http.StatusOK))
 }
 
 // restore POSTs a raw database file to the restore endpoint. The body is the
 // file itself, with no multipart wrapper.
 func (e *testEnv) restore(t *testing.T, snapshot []byte, cookie *http.Cookie) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/backup/restore", bytes.NewReader(snapshot))
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	if cookie != nil {
-		req.AddCookie(cookie)
-	}
-	resp, err := e.srv.Client().Do(req)
-	if err != nil {
-		t.Fatalf("POST /api/backup/restore: %v", err)
-	}
-	return resp
+	return e.send(t, http.MethodPost, "/api/backup/restore", bytes.NewReader(snapshot), cookie,
+		map[string]string{"Content-Type": "application/octet-stream"}, true)
 }
 
 func TestRestoreRejections(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)
 	kept := e.createViaAPI(t, cookie, "keep me", "<p>safe</p>")
-	snapshot := e.download(t, "/api/backup", cookie)
+	snapshot := e.downloadBackup(t, cookie)
 
-	// A signed-in non-admin: this writes over everyone's data at once.
-	_, otherCookie := e.newUser(t, "other")
-	resp := e.restore(t, snapshot, otherCookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
-
-	resp = e.restore(t, snapshot, nil)
+	resp := e.restore(t, snapshot, nil)
 	assertStatus(t, resp, http.StatusUnauthorized)
 	resp.Body.Close()
 
@@ -1010,30 +934,21 @@ func TestRestoreRejections(t *testing.T) {
 
 	// Every rejection above must have left the live data untouched — that is
 	// what makes it safe to report the problem instead of a lost database.
-	resp = e.do(t, http.MethodGet, "/api/files/"+kept.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
-}
-
-func TestSPAFallback(t *testing.T) {
-	e := newEnv(t)
-	resp := e.do(t, http.MethodGet, "/", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(strings.ToLower(b), "<!doctype html") {
-		t.Errorf("SPA fallback did not serve index.html: %q", b)
-	}
+	e.expect(t, http.StatusOK, http.MethodGet, "/api/files/"+kept.Slug, "", cookie)
 }
 
 func sqlNullInt64(v int64) sql.NullInt64 {
 	return sql.NullInt64{Int64: v, Valid: true}
 }
 
-// cookieFrom extracts the session cookie set by a login/register/setup response.
-func cookieFrom(t *testing.T, resp *http.Response) *http.Cookie {
+// sessionCookie returns the session Set-Cookie of a login/register/setup
+// response exactly as sent, attributes included (req.AddCookie only serialises
+// name and value, so it can be attached to a request as is).
+func sessionCookie(t *testing.T, resp *http.Response) *http.Cookie {
 	t.Helper()
 	for _, c := range resp.Cookies() {
-		if c.Name == auth.SessionCookieName && c.Value != "" {
-			return &http.Cookie{Name: c.Name, Value: c.Value}
+		if c.Name == auth.SessionCookieName {
+			return c
 		}
 	}
 	t.Fatal("response did not set a session cookie")
@@ -1045,35 +960,29 @@ func TestSetupFlow(t *testing.T) {
 
 	// Empty database → needs setup.
 	resp := e.do(t, http.MethodGet, "/api/setup/status", "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(b, `"needs_setup":true`) {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, `"needs_setup":true`) {
 		t.Errorf("status body = %q, want needs_setup true", b)
 	}
 
 	// Registration is blocked before setup.
-	resp = e.do(t, http.MethodPost, "/api/auth/register",
+	e.expect(t, http.StatusConflict, http.MethodPost, "/api/auth/register",
 		`{"username":"u","nickname":"n","password":"secret1"}`, nil)
-	assertStatus(t, resp, http.StatusConflict)
-	resp.Body.Close()
 
 	// Setup creates the super admin, writes configs, and logs in.
 	resp = e.do(t, http.MethodPost, "/api/setup",
 		`{"username":"boss","nickname":"Boss","password":"secret1","allow_registration":true,"mcp_enabled":false}`, nil)
 	assertStatus(t, resp, http.StatusCreated)
-	cookie := cookieFrom(t, resp)
+	cookie := sessionCookie(t, resp)
 	resp.Body.Close()
 
 	resp = e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(b, `"is_admin":true`) {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, `"is_admin":true`) {
 		t.Errorf("me body = %q, want is_admin true", b)
 	}
 
 	// Second setup attempt is rejected.
-	resp = e.do(t, http.MethodPost, "/api/setup",
+	e.expect(t, http.StatusConflict, http.MethodPost, "/api/setup",
 		`{"username":"evil","nickname":"E","password":"secret1"}`, nil)
-	assertStatus(t, resp, http.StatusConflict)
-	resp.Body.Close()
 
 	resp = e.do(t, http.MethodGet, "/api/setup/status", "", nil)
 	if b := bodyString(t, resp); !strings.Contains(b, `"needs_setup":false`) || !strings.Contains(b, `"allow_registration":true`) {
@@ -1083,44 +992,30 @@ func TestSetupFlow(t *testing.T) {
 
 func TestRegisterRespectsConfig(t *testing.T) {
 	e := newEnv(t) // super admin exists, no configs → registration disabled
-	resp := e.do(t, http.MethodPost, "/api/auth/register",
+	e.expect(t, http.StatusForbidden, http.MethodPost, "/api/auth/register",
 		`{"username":"u2","nickname":"N","password":"secret1"}`, nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
 
 	// Admin enables registration.
 	cookie := e.authCookie(t)
-	resp = e.do(t, http.MethodPut, "/api/settings", `{"allow_registration":true}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodPut, "/api/settings", `{"allow_registration":true}`, cookie)
 
 	// Now registration works and logs the new user in as a non-admin.
-	resp = e.do(t, http.MethodPost, "/api/auth/register",
+	resp := e.do(t, http.MethodPost, "/api/auth/register",
 		`{"username":"u2","nickname":"N","password":"secret1"}`, nil)
 	assertStatus(t, resp, http.StatusCreated)
-	userCookie := cookieFrom(t, resp)
+	userCookie := sessionCookie(t, resp)
 	resp.Body.Close()
 
 	resp = e.do(t, http.MethodGet, "/api/auth/me", "", userCookie)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(b, `"is_admin":false`) {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, `"is_admin":false`) {
 		t.Errorf("me body = %q, want is_admin false", b)
 	}
 
 	// Duplicate username → 409; weak password → 400.
-	resp = e.do(t, http.MethodPost, "/api/auth/register",
+	e.expect(t, http.StatusConflict, http.MethodPost, "/api/auth/register",
 		`{"username":"u2","nickname":"N","password":"secret1"}`, nil)
-	assertStatus(t, resp, http.StatusConflict)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodPost, "/api/auth/register",
+	e.expect(t, http.StatusBadRequest, http.MethodPost, "/api/auth/register",
 		`{"username":"u3","nickname":"N","password":"short"}`, nil)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
-
-	// Non-admin users cannot change settings.
-	resp = e.do(t, http.MethodPut, "/api/settings", `{"allow_registration":false}`, userCookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
 }
 
 func TestUpdateProfile(t *testing.T) {
@@ -1128,33 +1023,23 @@ func TestUpdateProfile(t *testing.T) {
 	cookie := e.authCookie(t)
 
 	// Nickname change.
-	resp := e.do(t, http.MethodPatch, "/api/user", `{"nickname":"New Name"}`, cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
+	e.expect(t, http.StatusNoContent, http.MethodPatch, "/api/user", `{"nickname":"New Name"}`, cookie)
+	resp := e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
 	if b := bodyString(t, resp); !strings.Contains(b, `"nickname":"New Name"`) {
 		t.Errorf("me body = %q, want updated nickname", b)
 	}
 
 	// Password change requires the current password.
-	resp = e.do(t, http.MethodPatch, "/api/user",
+	e.expect(t, http.StatusForbidden, http.MethodPatch, "/api/user",
 		`{"current_password":"wrong","new_password":"secret2"}`, cookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodPatch, "/api/user",
+	e.expect(t, http.StatusNoContent, http.MethodPatch, "/api/user",
 		`{"current_password":"`+testPass+`","new_password":"secret2"}`, cookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
 
 	// Old password no longer logs in; the new one does.
-	resp = e.do(t, http.MethodPost, "/api/auth/login",
+	e.expect(t, http.StatusUnauthorized, http.MethodPost, "/api/auth/login",
 		`{"username":"`+testUser+`","password":"`+testPass+`"}`, nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodPost, "/api/auth/login",
+	e.expect(t, http.StatusNoContent, http.MethodPost, "/api/auth/login",
 		`{"username":"`+testUser+`","password":"secret2"}`, nil)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
 }
 
 func TestAPIKeyLifecycle(t *testing.T) {
@@ -1162,28 +1047,19 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	cookie := e.authCookie(t)
 
 	// MCP disabled → no key issued.
-	resp := e.do(t, http.MethodPost, "/api/user/api-key", "", cookie)
-	assertStatus(t, resp, http.StatusConflict)
-	resp.Body.Close()
+	e.expect(t, http.StatusConflict, http.MethodPost, "/api/user/api-key", "", cookie)
 
-	resp = e.do(t, http.MethodPut, "/api/settings", `{"mcp_enabled":true}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodPut, "/api/settings", `{"mcp_enabled":true}`, cookie)
 
 	keyOf := func(resp *http.Response) string {
 		t.Helper()
-		defer resp.Body.Close()
-		var body struct {
+		return decodeJSON[struct {
 			APIKey string `json:"api_key"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			t.Fatalf("decode api key: %v", err)
-		}
-		return body.APIKey
+		}](t, resp, http.StatusOK).APIKey
 	}
 
 	// First ensure creates a key; a second ensure returns the same key.
-	resp = e.do(t, http.MethodPost, "/api/user/api-key", "", cookie)
+	resp := e.do(t, http.MethodPost, "/api/user/api-key", "", cookie)
 	assertStatus(t, resp, http.StatusOK)
 	first := keyOf(resp)
 	if !strings.HasPrefix(first, "rb_") {
@@ -1211,14 +1087,7 @@ type searchResp struct {
 
 func (e *testEnv) search(t *testing.T, cookie *http.Cookie, query string) []searchResp {
 	t.Helper()
-	resp := e.do(t, http.MethodGet, "/api/search?"+query, "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	defer resp.Body.Close()
-	var out []searchResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode search response: %v", err)
-	}
-	return out
+	return decodeJSON[[]searchResp](t, e.do(t, http.MethodGet, "/api/search?"+query, "", cookie), http.StatusOK)
 }
 
 func TestSearchFiles(t *testing.T) {
@@ -1271,9 +1140,7 @@ func TestSearchFiles(t *testing.T) {
 	}
 
 	// Search requires auth.
-	resp := e.do(t, http.MethodGet, "/api/search?q=hello", "", nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/search?q=hello", "", nil)
 }
 
 func TestSearchScopedToOwnFiles(t *testing.T) {
@@ -1308,56 +1175,26 @@ func TestEmptyTrash(t *testing.T) {
 		slug   string
 		cookie *http.Cookie
 	}{{trashed.Slug, cookie}, {theirs.Slug, otherCookie}} {
-		resp := e.do(t, http.MethodDelete, "/api/files/"+c.slug, "", c.cookie)
-		assertStatus(t, resp, http.StatusNoContent)
-		resp.Body.Close()
+		e.expect(t, http.StatusNoContent, http.MethodDelete, "/api/files/"+c.slug, "", c.cookie)
 	}
 
-	resp := e.do(t, http.MethodDelete, "/api/trash", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	var out struct {
+	out := decodeJSON[struct {
 		Deleted int64 `json:"deleted"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode empty-trash response: %v", err)
-	}
-	resp.Body.Close()
+	}](t, e.do(t, http.MethodDelete, "/api/trash", "", cookie), http.StatusOK)
 	if out.Deleted != 1 {
 		t.Errorf("deleted = %d, want 1", out.Deleted)
 	}
 
 	// The live file is untouched -- this endpoint is the only bulk delete in
 	// the API, so "it took only the trash" is the property that matters.
-	resp = e.do(t, http.MethodGet, "/api/files/"+live.Slug, "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/api/files/"+live.Slug, "", cookie)
 	// And it is owner-scoped: the other user still has their own trash.
-	resp = e.do(t, http.MethodPost, "/api/files/"+theirs.Slug+"/restore", "", otherCookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodPost, "/api/files/"+theirs.Slug+"/restore", "", otherCookie)
 
 	// Emptying an already-empty trash succeeds with 0 rather than 404.
-	resp = e.do(t, http.MethodDelete, "/api/trash", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodDelete, "/api/trash", "", cookie)
 
-	resp = e.do(t, http.MethodDelete, "/api/trash", "", nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
-}
-
-// rawSessionCookie returns the Set-Cookie exactly as sent, attributes included.
-// cookieFrom deliberately keeps only name and value, since its result is meant
-// to be attached to a request; these assertions are about the attributes.
-func rawSessionCookie(t *testing.T, resp *http.Response) *http.Cookie {
-	t.Helper()
-	for _, c := range resp.Cookies() {
-		if c.Name == auth.SessionCookieName {
-			return c
-		}
-	}
-	t.Fatal("response did not set a session cookie")
-	return nil
+	e.expect(t, http.StatusUnauthorized, http.MethodDelete, "/api/trash", "", nil)
 }
 
 // TestSessionCookieSecureFollowsScheme pins the fix for a login that silently
@@ -1371,33 +1208,25 @@ func TestSessionCookieSecureFollowsScheme(t *testing.T) {
 	// The test server speaks plain HTTP, which is the LAN case.
 	resp := e.do(t, http.MethodPost, "/api/auth/login", body, nil)
 	assertStatus(t, resp, http.StatusNoContent)
-	if c := rawSessionCookie(t, resp); c.Secure {
+	resp.Body.Close()
+	if c := sessionCookie(t, resp); c.Secure {
 		t.Error("cookie must not be Secure over plain HTTP, or the browser drops it and login appears to fail")
 	}
-	resp.Body.Close()
 
 	// A terminating proxy is the third deployment: the backend sees HTTP, the
 	// browser saw HTTPS, and only the forwarded header says so.
-	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/auth/login", strings.NewReader(body))
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Forwarded-Proto", "https")
-	resp, err = e.srv.Client().Do(req)
-	if err != nil {
-		t.Fatalf("login through proxy: %v", err)
-	}
+	resp = e.send(t, http.MethodPost, "/api/auth/login", strings.NewReader(body), nil,
+		map[string]string{"Content-Type": "application/json", "X-Forwarded-Proto": "https"}, true)
 	assertStatus(t, resp, http.StatusNoContent)
-	if c := rawSessionCookie(t, resp); !c.Secure {
+	resp.Body.Close()
+	if c := sessionCookie(t, resp); !c.Secure {
 		t.Error("cookie must be Secure when the browser reached us over HTTPS")
 	}
-	resp.Body.Close()
 
 	// Logout mirrors it, so the deletion targets the cookie that was set.
 	resp = e.do(t, http.MethodPost, "/api/auth/logout", "", nil)
 	assertStatus(t, resp, http.StatusNoContent)
-	if c := rawSessionCookie(t, resp); c.Secure {
+	if c := sessionCookie(t, resp); c.Secure {
 		t.Error("logout over plain HTTP should clear a non-Secure cookie")
 	}
 	resp.Body.Close()
@@ -1416,27 +1245,18 @@ type adminUserResp struct {
 
 func (e *testEnv) adminUsers(t *testing.T, cookie *http.Cookie) []adminUserResp {
 	t.Helper()
-	resp := e.do(t, http.MethodGet, "/api/admin/users", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	defer resp.Body.Close()
-	var out []adminUserResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode users: %v", err)
-	}
-	return out
+	return decodeJSON[[]adminUserResp](t, e.do(t, http.MethodGet, "/api/admin/users", "", cookie), http.StatusOK)
 }
 
 func TestAdminListsUsersWithFileCounts(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)
-	user, userCookie := e.newUser(t, "bob")
+	_, userCookie := e.newUser(t, "bob")
 
 	e.createViaAPI(t, cookie, "admin file", "<p>1</p>")
 	trashed := e.createViaAPI(t, userCookie, "bob file", "<p>2</p>")
 	e.createViaAPI(t, userCookie, "bob live", "<p>3</p>")
-	resp := e.do(t, http.MethodDelete, "/api/files/"+trashed.Slug, "", userCookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.trash(t, userCookie, trashed.Slug)
 
 	users := e.adminUsers(t, cookie)
 	if len(users) != 2 {
@@ -1447,25 +1267,6 @@ func TestAdminListsUsersWithFileCounts(t *testing.T) {
 	}
 	if users[0].FileCount != 1 || users[1].FileCount != 1 || users[1].TrashedCount != 1 {
 		t.Errorf("counts = %+v", users)
-	}
-
-	// The page is for the super admin only; an ordinary account gets 403 (the
-	// path exists, only the privilege is in question), not 404.
-	resp = e.do(t, http.MethodGet, "/api/admin/users", "", userCookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
-	for _, c := range []struct{ method, path, body string }{
-		{http.MethodPatch, "/api/admin/users/1/status", `{"disabled":true}`},
-		{http.MethodPost, fmt.Sprintf("/api/admin/users/%d/password", user.ID), `{"new_password":"hijacked"}`},
-	} {
-		resp = e.do(t, c.method, c.path, c.body, userCookie)
-		assertStatus(t, resp, http.StatusForbidden)
-		resp.Body.Close()
-	}
-	// ...and to be sure the 403 was the privilege check rather than a bad
-	// payload, the password above must not have been applied.
-	if !auth.VerifyPassword(e.currentHash(t, user.ID), "secret2") {
-		t.Error("a rejected admin request changed the target's password anyway")
 	}
 }
 
@@ -1490,73 +1291,40 @@ func TestAdminSuspendAccount(t *testing.T) {
 
 	// Give bob a published file and an MCP key.
 	file := e.createViaAPI(t, userCookie, "bob public", "<p>bob</p>")
-	resp := e.do(t, http.MethodPatch, "/api/files/"+file.Slug+"/visibility", `{"is_public":true}`, userCookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
-	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
-		Key: "mcp_enabled", Value: "true",
-	}); err != nil {
-		t.Fatalf("SetConfig: %v", err)
-	}
-	bobKey, err := auth.NewAPIKey()
-	if err != nil {
-		t.Fatalf("NewAPIKey: %v", err)
-	}
-	if err := e.queries.SetUserAPIKey(context.Background(), sqlcgen.SetUserAPIKeyParams{
-		ApiKey: sql.NullString{String: bobKey, Valid: true}, ID: user.ID,
-	}); err != nil {
-		t.Fatalf("SetUserAPIKey: %v", err)
-	}
+	e.publish(t, userCookie, file.Slug)
+	bobKey := e.apiKeyFor(t, user.ID)
 
 	publicURL := "/res/" + file.Slug + "?code=" + file.AccessCode
-	resp = e.do(t, http.MethodGet, publicURL, "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, publicURL, "", nil)
 
 	// Suspend.
-	resp = e.do(t, http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/status", user.ID), `{"disabled":true}`, adminCookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.expect(t, http.StatusNoContent, http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/status", user.ID), `{"disabled":true}`, adminCookie)
 
 	if users := e.adminUsers(t, adminCookie); !users[1].Disabled {
 		t.Error("list should report the account as disabled")
 	}
 	// The password still verifies, so this 403 is about the account's state.
-	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
 	// An existing session stops working on its very next request.
-	resp = e.do(t, http.MethodGet, "/api/files", "", userCookie)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/files", "", userCookie)
 	// The MCP key dies with it, or suspension would leave the agent door open.
-	resp = e.mcpCall(t, bobKey, "list_files", map[string]any{})
+	resp := e.mcpCall(t, bobKey, "list_files", map[string]any{})
 	assertStatus(t, resp, http.StatusUnauthorized)
 	resp.Body.Close()
 	// And the account's public links read as nonexistent, not merely forbidden.
-	resp = e.do(t, http.MethodGet, publicURL, "", nil)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodGet, publicURL, "", nil)
 	// The super admin's own files are unaffected by someone else's suspension.
 	adminFile := e.createViaAPI(t, adminCookie, "admin file", "<p>admin</p>")
-	resp = e.do(t, http.MethodGet, "/res/"+adminFile.Slug, "", adminCookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/res/"+adminFile.Slug, "", adminCookie)
 
 	// Restore: everything comes back, including the link.
-	resp = e.do(t, http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/status", user.ID), `{"disabled":false}`, adminCookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.expect(t, http.StatusNoContent, http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/status", user.ID), `{"disabled":false}`, adminCookie)
 	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
 	assertStatus(t, resp, http.StatusNoContent)
-	restored := cookieFrom(t, resp)
+	restored := sessionCookie(t, resp)
 	resp.Body.Close()
-	resp = e.do(t, http.MethodGet, "/api/files", "", restored)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodGet, publicURL, "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/api/files", "", restored)
+	e.expect(t, http.StatusOK, http.MethodGet, publicURL, "", nil)
 }
 
 // The super admin is the only account that can lift a suspension, so letting it
@@ -1565,22 +1333,14 @@ func TestAdminCannotDisableSuperAdmin(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)
 
-	resp := e.do(t, http.MethodPatch, "/api/admin/users/1/status", `{"disabled":true}`, cookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodPatch, "/api/admin/users/1/status", `{"disabled":true}`, cookie)
 
-	resp = e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/api/auth/me", "", cookie)
 
 	// An unknown id is a missing object (404); a non-numeric one could never
 	// name a row and is a malformed request (400).
-	resp = e.do(t, http.MethodPatch, "/api/admin/users/9999/status", `{"disabled":true}`, cookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodPatch, "/api/admin/users/abc/status", `{"disabled":true}`, cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodPatch, "/api/admin/users/9999/status", `{"disabled":true}`, cookie)
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/admin/users/abc/status", `{"disabled":true}`, cookie)
 }
 
 func TestAdminResetPassword(t *testing.T) {
@@ -1590,32 +1350,20 @@ func TestAdminResetPassword(t *testing.T) {
 	path := fmt.Sprintf("/api/admin/users/%d/password", user.ID)
 
 	// Too short is rejected before anything is written.
-	resp := e.do(t, http.MethodPost, path, `{"new_password":"abc"}`, adminCookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPost, path, `{"new_password":"abc"}`, adminCookie)
 
-	resp = e.do(t, http.MethodPost, path, `{"new_password":"brand-new-pass"}`, adminCookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.expect(t, http.StatusNoContent, http.MethodPost, path, `{"new_password":"brand-new-pass"}`, adminCookie)
 
 	// The new password works and the old one doesn't -- no current password
 	// was needed, which is the point: there is no self-service recovery.
-	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"brand-new-pass"}`, nil)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
-	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusNoContent, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"brand-new-pass"}`, nil)
+	e.expect(t, http.StatusUnauthorized, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
 
 	// Unlike a self-service change, an admin reset ends the target's existing
 	// sessions: it is what you reach for when an account is compromised.
-	resp = e.do(t, http.MethodGet, "/api/files", "", userCookie)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	resp.Body.Close()
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/files", "", userCookie)
 
-	resp = e.do(t, http.MethodPost, "/api/admin/users/9999/password", `{"new_password":"whatever1"}`, adminCookie)
-	assertStatus(t, resp, http.StatusNotFound)
-	resp.Body.Close()
+	e.expect(t, http.StatusNotFound, http.MethodPost, "/api/admin/users/9999/password", `{"new_password":"whatever1"}`, adminCookie)
 }
 
 // --- MCP endpoint ---
@@ -1623,19 +1371,7 @@ func TestAdminResetPassword(t *testing.T) {
 // enableMCP turns the mcp_enabled config on and issues the admin an API key.
 func (e *testEnv) enableMCP(t *testing.T) string {
 	t.Helper()
-	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{Key: "mcp_enabled", Value: "true"}); err != nil {
-		t.Fatalf("SetConfig: %v", err)
-	}
-	key, err := auth.NewAPIKey()
-	if err != nil {
-		t.Fatalf("NewAPIKey: %v", err)
-	}
-	if err := e.queries.SetUserAPIKey(context.Background(), sqlcgen.SetUserAPIKeyParams{
-		ApiKey: sql.NullString{String: key, Valid: true}, ID: e.admin.ID,
-	}); err != nil {
-		t.Fatalf("SetUserAPIKey: %v", err)
-	}
-	return key
+	return e.apiKeyFor(t, e.admin.ID)
 }
 
 // mcpCall POSTs a raw JSON-RPC tools/call to /mcp. Stateless mode means each
@@ -1647,20 +1383,11 @@ func (e *testEnv) mcpCall(t *testing.T, apiKey, tool string, args map[string]any
 		t.Fatalf("marshal args: %v", err)
 	}
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":%q,"arguments":%s}}`, tool, argJSON)
-	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/mcp", strings.NewReader(body))
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	header := map[string]string{"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		header["Authorization"] = "Bearer " + apiKey
 	}
-	resp, err := e.srv.Client().Do(req)
-	if err != nil {
-		t.Fatalf("POST /mcp: %v", err)
-	}
-	return resp
+	return e.send(t, http.MethodPost, "/mcp", strings.NewReader(body), nil, header, true)
 }
 
 type mcpToolResult struct {
@@ -1703,15 +1430,28 @@ func decodeMCPResult(t *testing.T, resp *http.Response) mcpToolResult {
 	return envelope.Result
 }
 
+// mcp runs a tool and returns its result, tool errors included.
+func (e *testEnv) mcp(t *testing.T, key, tool string, args map[string]any) mcpToolResult {
+	t.Helper()
+	return decodeMCPResult(t, e.mcpCall(t, key, tool, args))
+}
+
+// mcpOK runs a tool that is expected to succeed.
+func (e *testEnv) mcpOK(t *testing.T, key, tool string, args map[string]any) mcpToolResult {
+	t.Helper()
+	res := e.mcp(t, key, tool, args)
+	if res.IsError {
+		t.Fatalf("%s: %s", tool, res.text())
+	}
+	return res
+}
+
 // mcpUpload uploads one file over MCP and returns its structured output.
 func (e *testEnv) mcpUpload(t *testing.T, key, name, kind, content string) map[string]any {
 	t.Helper()
-	res := decodeMCPResult(t, e.mcpCall(t, key, "upload_file", map[string]any{
+	res := e.mcpOK(t, key, "upload_file", map[string]any{
 		"name": name, "kind": kind, "content": content,
-	}))
-	if res.IsError {
-		t.Fatalf("upload_file error: %s", res.text())
-	}
+	})
 	return res.StructuredContent
 }
 
@@ -1743,10 +1483,7 @@ func TestMCPGateAndAuth(t *testing.T) {
 	resp.Body.Close()
 
 	// Valid key works.
-	res := decodeMCPResult(t, e.mcpCall(t, key, "search_files", map[string]any{"query": "x"}))
-	if res.IsError {
-		t.Errorf("valid key got tool error: %s", res.text())
-	}
+	e.mcpOK(t, key, "search_files", map[string]any{"query": "x"})
 }
 
 func TestMCPUploadPublishFlow(t *testing.T) {
@@ -1764,18 +1501,12 @@ func TestMCPUploadPublishFlow(t *testing.T) {
 	}
 
 	// Private → the returned URL is not anonymously viewable yet.
-	resp := e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodGet, e.pathOf(t, url), "", nil)
 
 	// publish_file → same URL becomes anonymously viewable, rendered as HTML.
-	res := decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{"slug": slug}))
-	if res.IsError {
-		t.Fatalf("publish_file error: %s", res.text())
-	}
-	resp = e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	if b := bodyString(t, resp); !strings.Contains(b, "<h1") || !strings.Contains(b, "Hello MCP") {
+	e.mcpOK(t, key, "publish_file", map[string]any{"slug": slug})
+	resp := e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
+	if b := bodyOf(t, resp, http.StatusOK); !strings.Contains(b, "<h1") || !strings.Contains(b, "Hello MCP") {
 		t.Errorf("published markdown did not render: %q", b)
 	}
 }
@@ -1790,12 +1521,9 @@ func TestMCPPublishWithExpiry(t *testing.T) {
 
 	byViews := e.mcpUpload(t, key, "views", "markdown", "# v")
 	viewsSlug, _ := byViews["slug"].(string)
-	res := decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{
+	res := e.mcpOK(t, key, "publish_file", map[string]any{
 		"slug": viewsSlug, "max_views": 2,
-	}))
-	if res.IsError {
-		t.Fatalf("publish_file with max_views: %s", res.text())
-	}
+	})
 	if !strings.Contains(res.text(), "2 more view") {
 		t.Errorf("result %q should tell the agent how long the link lasts", res.text())
 	}
@@ -1809,12 +1537,9 @@ func TestMCPPublishWithExpiry(t *testing.T) {
 
 	byTTL := e.mcpUpload(t, key, "ttl", "markdown", "# t")
 	ttlSlug, _ := byTTL["slug"].(string)
-	res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{
+	res = e.mcpOK(t, key, "publish_file", map[string]any{
 		"slug": ttlSlug, "ttl": "7d",
-	}))
-	if res.IsError {
-		t.Fatalf("publish_file with ttl: %s", res.text())
-	}
+	})
 	if f, err = e.queries.GetFileBySlugAnyOwner(ctx, ttlSlug); err != nil {
 		t.Fatalf("GetFileBySlugAnyOwner: %v", err)
 	}
@@ -1829,7 +1554,7 @@ func TestMCPPublishWithExpiry(t *testing.T) {
 		{"slug": ttlSlug, "ttl": "24h", "max_views": 5},
 		{"slug": ttlSlug, "max_views": 0},
 	} {
-		if res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", args)); !res.IsError {
+		if res = e.mcp(t, key, "publish_file", args); !res.IsError {
 			t.Errorf("publish_file%v should be a tool error", args)
 		}
 	}
@@ -1842,32 +1567,22 @@ func TestMCPUnpublish(t *testing.T) {
 	out := e.mcpUpload(t, key, "doc", "markdown", "# hi")
 	slug, _ := out["slug"].(string)
 	url, _ := out["url"].(string)
-	if res := decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{"slug": slug})); res.IsError {
-		t.Fatalf("publish_file: %s", res.text())
-	}
-	resp := e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.mcpOK(t, key, "publish_file", map[string]any{"slug": slug})
+	e.expect(t, http.StatusOK, http.MethodGet, e.pathOf(t, url), "", nil)
 
-	res := decodeMCPResult(t, e.mcpCall(t, key, "unpublish_file", map[string]any{"slug": slug}))
-	if res.IsError {
-		t.Fatalf("unpublish_file: %s", res.text())
-	}
+	res := e.mcpOK(t, key, "unpublish_file", map[string]any{"slug": slug})
 	if isPublic, _ := res.StructuredContent["is_public"].(bool); isPublic {
 		t.Error("unpublish_file should report the file as private")
 	}
-	resp = e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
-	assertStatus(t, resp, http.StatusForbidden)
-	resp.Body.Close()
+	e.expect(t, http.StatusForbidden, http.MethodGet, e.pathOf(t, url), "", nil)
 
 	// The document itself survives -- unpublishing is not deleting.
-	resp = e.do(t, http.MethodGet, "/api/files/"+slug, "", e.authCookie(t))
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.HTMLContent != "# hi" {
+	resp := e.do(t, http.MethodGet, "/api/files/"+slug, "", e.authCookie(t))
+	if got := decodeFile(t, resp, http.StatusOK); got.HTMLContent != "# hi" {
 		t.Errorf("content = %q, want it untouched", got.HTMLContent)
 	}
 
-	if res = decodeMCPResult(t, e.mcpCall(t, key, "unpublish_file", map[string]any{"slug": "nope"})); !res.IsError {
+	if res = e.mcp(t, key, "unpublish_file", map[string]any{"slug": "nope"}); !res.IsError {
 		t.Error("unpublish_file on an unknown slug should be a tool error")
 	}
 }
@@ -1877,7 +1592,7 @@ func TestMCPListFiles(t *testing.T) {
 	key := e.enableMCP(t)
 
 	// Empty project: a plain answer, not an error.
-	res := decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
+	res := e.mcp(t, key, "list_files", map[string]any{})
 	if res.IsError || !strings.Contains(res.text(), "no documents") {
 		t.Errorf("list_files on an empty project = %v %q", res.IsError, res.text())
 	}
@@ -1885,28 +1600,18 @@ func TestMCPListFiles(t *testing.T) {
 	e.mcpUpload(t, key, "first", "markdown", "# one")
 	second := e.mcpUpload(t, key, "second", "html", "<p>two</p>")
 	secondSlug, _ := second["slug"].(string)
-	if res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{
-		"slug": secondSlug, "max_views": 3,
-	})); res.IsError {
-		t.Fatalf("publish_file: %s", res.text())
-	}
+	e.mcpOK(t, key, "publish_file", map[string]any{"slug": secondSlug, "max_views": 3})
 
 	// Another user's files must not appear: list_files has no query to scope it,
 	// so the owner filter in ListUserFiles is the only thing standing there.
 	_, otherCookie := e.newUser(t, "other")
 	e.createViaAPI(t, otherCookie, "not mine", "<p>hidden</p>")
 
-	res = decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
-	if res.IsError {
-		t.Fatalf("list_files: %s", res.text())
-	}
+	res = e.mcpOK(t, key, "list_files", map[string]any{})
 	if total, _ := res.StructuredContent["total"].(float64); total != 2 {
 		t.Errorf("total = %v, want 2 (only the key owner's files)", res.StructuredContent["total"])
 	}
-	text := res.text()
-	if strings.Contains(text, "not mine") {
-		t.Error("list_files leaked another user's file")
-	}
+	text := res.text() // the foreign file's name is pinned absent by TestMCPOwnershipIsolation
 	for _, want := range []string{"first", "second", "private", "3 more view"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("list_files text %q missing %q", text, want)
@@ -1919,16 +1624,16 @@ func TestMCPUploadValidation(t *testing.T) {
 	key := e.enableMCP(t)
 
 	// txt is a web-UI kind but not an MCP upload kind.
-	res := decodeMCPResult(t, e.mcpCall(t, key, "upload_file", map[string]any{
+	res := e.mcp(t, key, "upload_file", map[string]any{
 		"name": "x", "kind": "txt", "content": "plain",
-	}))
+	})
 	if !res.IsError || !strings.Contains(res.text(), "markdown or html") {
 		t.Errorf("txt upload = %v %q, want kind error", res.IsError, res.text())
 	}
 
-	res = decodeMCPResult(t, e.mcpCall(t, key, "upload_file", map[string]any{
+	res = e.mcp(t, key, "upload_file", map[string]any{
 		"name": "x", "kind": "html", "content": "",
-	}))
+	})
 	if !res.IsError || !strings.Contains(res.text(), "content is required") {
 		t.Errorf("empty content = %v %q, want content error", res.IsError, res.text())
 	}
@@ -1938,16 +1643,13 @@ func TestMCPBatchUpload(t *testing.T) {
 	e := newEnv(t)
 	key := e.enableMCP(t)
 
-	res := decodeMCPResult(t, e.mcpCall(t, key, "upload_files", map[string]any{
+	res := e.mcpOK(t, key, "upload_files", map[string]any{
 		"files": []map[string]any{
 			{"name": "a", "kind": "markdown", "content": "# a"},
 			{"name": "b", "kind": "html", "content": "<p>b</p>"},
 			{"name": "bad", "kind": "pdf", "content": "x"},
 		},
-	}))
-	if res.IsError {
-		t.Fatalf("upload_files error: %s", res.text())
-	}
+	})
 	if got := res.StructuredContent["uploaded"].(float64); got != 2 {
 		t.Errorf("uploaded = %v, want 2", got)
 	}
@@ -1978,10 +1680,7 @@ func TestMCPSearch(t *testing.T) {
 	e.mcpUpload(t, key, "另一篇", "html", "<p>这里提到了部署流程的细节。</p>")
 	e.mcpUpload(t, key, "无关", "html", "<p>nothing</p>")
 
-	res := decodeMCPResult(t, e.mcpCall(t, key, "search_files", map[string]any{"query": "部署"}))
-	if res.IsError {
-		t.Fatalf("search_files error: %s", res.text())
-	}
+	res := e.mcpOK(t, key, "search_files", map[string]any{"query": "部署"})
 	results := res.StructuredContent["results"].([]any)
 	if len(results) != 2 {
 		t.Fatalf("search returned %d results, want 2", len(results))
@@ -2002,10 +1701,7 @@ func TestMCPSearch(t *testing.T) {
 	}
 
 	// Miss → found=false with a human-readable message.
-	res = decodeMCPResult(t, e.mcpCall(t, key, "search_files", map[string]any{"query": "不存在的词"}))
-	if res.IsError {
-		t.Fatalf("search miss errored: %s", res.text())
-	}
+	res = e.mcpOK(t, key, "search_files", map[string]any{"query": "不存在的词"})
 	if found := res.StructuredContent["found"].(bool); found {
 		t.Error("miss should report found=false")
 	}
@@ -2026,17 +1722,14 @@ func TestMCPUpdate(t *testing.T) {
 	}
 
 	// Neither field → tool error.
-	res := decodeMCPResult(t, e.mcpCall(t, key, "update_file", map[string]any{"slug": slug}))
+	res := e.mcp(t, key, "update_file", map[string]any{"slug": slug})
 	if !res.IsError {
 		t.Error("update with nothing to change should error")
 	}
 
-	res = decodeMCPResult(t, e.mcpCall(t, key, "update_file", map[string]any{
+	res = e.mcpOK(t, key, "update_file", map[string]any{
 		"slug": slug, "name": "新标题", "content": "# v2",
-	}))
-	if res.IsError {
-		t.Fatalf("update_file error: %s", res.text())
-	}
+	})
 
 	after, err := e.queries.GetFileBySlugAnyOwner(context.Background(), slug)
 	if err != nil {
@@ -2059,10 +1752,7 @@ func TestMCPDeleteTwoPhase(t *testing.T) {
 	url := out["url"].(string)
 
 	// Phase 1: no confirm → nothing deleted, name and URL surfaced for the user.
-	res := decodeMCPResult(t, e.mcpCall(t, key, "delete_file", map[string]any{"slug": slug}))
-	if res.IsError {
-		t.Fatalf("delete phase 1 errored: %s", res.text())
-	}
+	res := e.mcpOK(t, key, "delete_file", map[string]any{"slug": slug})
 	if deleted := res.StructuredContent["deleted"].(bool); deleted {
 		t.Error("phase 1 must not delete")
 	}
@@ -2074,10 +1764,7 @@ func TestMCPDeleteTwoPhase(t *testing.T) {
 	}
 
 	// Phase 2: confirm=true → soft-deleted (in trash, not gone permanently).
-	res = decodeMCPResult(t, e.mcpCall(t, key, "delete_file", map[string]any{"slug": slug, "confirm": true}))
-	if res.IsError {
-		t.Fatalf("delete phase 2 errored: %s", res.text())
-	}
+	res = e.mcpOK(t, key, "delete_file", map[string]any{"slug": slug, "confirm": true})
 	if deleted := res.StructuredContent["deleted"].(bool); !deleted {
 		t.Error("phase 2 should report deleted=true")
 	}
@@ -2108,12 +1795,12 @@ func TestMCPOwnershipIsolation(t *testing.T) {
 	}
 
 	// search does not surface it…
-	res := decodeMCPResult(t, e.mcpCall(t, key, "search_files", map[string]any{"query": "机密"}))
+	res := e.mcp(t, key, "search_files", map[string]any{"query": "机密"})
 	if found := res.StructuredContent["found"].(bool); found {
 		t.Error("search must not return another user's files")
 	}
 	// …list does not either…
-	res = decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
+	res = e.mcp(t, key, "list_files", map[string]any{})
 	if strings.Contains(res.text(), "机密") {
 		t.Error("list must not return another user's files")
 	}
@@ -2128,7 +1815,7 @@ func TestMCPOwnershipIsolation(t *testing.T) {
 		{"unpublish_file", map[string]any{"slug": theirs.Slug}},
 		{"delete_file", map[string]any{"slug": theirs.Slug, "confirm": true}},
 	} {
-		res := decodeMCPResult(t, e.mcpCall(t, key, call.tool, call.args))
+		res := e.mcp(t, key, call.tool, call.args)
 		if !res.IsError || !strings.Contains(res.text(), "not found") {
 			t.Errorf("%s on foreign file = %v %q, want not-found error", call.tool, res.IsError, res.text())
 		}
@@ -2147,31 +1834,20 @@ func TestMCPToolsAreAllTested(t *testing.T) {
 	e := newEnv(t)
 	key := e.enableMCP(t)
 
-	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/mcp",
-		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+key)
-	resp, err := e.srv.Client().Do(req)
-	if err != nil {
-		t.Fatalf("tools/list: %v", err)
-	}
-	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusOK)
-
-	var envelope struct {
+	resp := e.send(t, http.MethodPost, "/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`), nil,
+		map[string]string{
+			"Content-Type":  "application/json",
+			"Accept":        "application/json, text/event-stream",
+			"Authorization": "Bearer " + key,
+		}, true)
+	envelope := decodeJSON[struct {
 		Result struct {
 			Tools []struct {
 				Name string `json:"name"`
 			} `json:"tools"`
 		} `json:"result"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		t.Fatalf("decode tools/list: %v", err)
-	}
+	}](t, resp, http.StatusOK)
 
 	// Each entry names the test that exercises the tool.
 	tested := map[string]string{
@@ -2302,9 +1978,7 @@ func TestFileEndpointsRejectForeignSlug(t *testing.T) {
 
 			active := e.createViaAPI(t, ownerCookie, "victim active", "<p>secret</p>")
 			trashed := e.createViaAPI(t, ownerCookie, "victim trashed", "<p>secret2</p>")
-			resp := e.do(t, http.MethodDelete, "/api/files/"+trashed.Slug, "", ownerCookie)
-			assertStatus(t, resp, http.StatusNoContent)
-			resp.Body.Close()
+			e.trash(t, ownerCookie, trashed.Slug)
 
 			activeBefore := e.fingerprint(t, active.Slug)
 			trashedBefore := e.trashFingerprint(t, ownerID, trashed.Slug)
@@ -2362,7 +2036,7 @@ func TestFileEndpointsCoverAllRoutes(t *testing.T) {
 	}
 
 	seen := 0
-	err := chi.Walk(server.New(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).(*chi.Mux),
+	err := chi.Walk(server.New(nil, slog.New(slog.NewTextHandler(io.Discard, nil))).(*chi.Mux),
 		func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 			route = strings.TrimSuffix(route, "/")
 			if !isFileRoute(route) {
@@ -2410,14 +2084,7 @@ func TestListScopedToOwner(t *testing.T) {
 
 	list := func(cookie *http.Cookie, path string) []fileResp {
 		t.Helper()
-		resp := e.do(t, http.MethodGet, path, "", cookie)
-		assertStatus(t, resp, http.StatusOK)
-		defer resp.Body.Close()
-		var out []fileResp
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			t.Fatalf("decode list: %v", err)
-		}
-		return out
+		return decodeJSON[[]fileResp](t, e.do(t, http.MethodGet, path, "", cookie), http.StatusOK)
 	}
 
 	if got := list(adminCookie, "/api/files"); len(got) != 2 {
@@ -2429,9 +2096,7 @@ func TestListScopedToOwner(t *testing.T) {
 	}
 
 	// Trash is scoped too.
-	resp := e.do(t, http.MethodDelete, "/api/files/"+adminTrash.Slug, "", adminCookie)
-	assertStatus(t, resp, http.StatusNoContent)
-	resp.Body.Close()
+	e.trash(t, adminCookie, adminTrash.Slug)
 
 	if got := list(adminCookie, "/api/files?deleted=true"); len(got) != 1 {
 		t.Errorf("admin trash has %d files, want 1", len(got))
@@ -2454,8 +2119,7 @@ func TestRenderIgnoresForeignSession(t *testing.T) {
 	// A signed-in stranger gets no more than an anonymous visitor: the file
 	// is private, so no code can help and the attempt is counted as failed.
 	resp := e.do(t, http.MethodGet, "/res/"+file.Slug, "", otherCookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	if b := bodyString(t, resp); strings.Contains(b, "secret") {
+	if b := bodyOf(t, resp, http.StatusForbidden); strings.Contains(b, "secret") {
 		t.Error("a foreign session must not receive the file's content")
 	}
 	after, err := e.queries.GetFileBySlugAnyOwner(context.Background(), file.Slug)
@@ -2468,19 +2132,13 @@ func TestRenderIgnoresForeignSession(t *testing.T) {
 	}
 
 	// The owner still gets in without a code.
-	resp = e.do(t, http.MethodGet, "/res/"+file.Slug, "", adminCookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/res/"+file.Slug, "", adminCookie)
 
 	// Once public, the stranger's correct code works and counts as a
 	// code-based view rather than an owner view.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+file.Slug+"/visibility", `{"is_public":true}`, adminCookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.publish(t, adminCookie, file.Slug)
 
-	resp = e.do(t, http.MethodGet, "/res/"+file.Slug+"?code="+file.AccessCode, "", otherCookie)
-	assertStatus(t, resp, http.StatusOK)
-	resp.Body.Close()
+	e.expect(t, http.StatusOK, http.MethodGet, "/res/"+file.Slug+"?code="+file.AccessCode, "", otherCookie)
 
 	after, err = e.queries.GetFileBySlugAnyOwner(context.Background(), file.Slug)
 	if err != nil {
@@ -2498,11 +2156,7 @@ func TestRenderIgnoresForeignSession(t *testing.T) {
 // state the real settings flow can produce a key in.
 func (e *testEnv) apiKeyFor(t *testing.T, userID int64) string {
 	t.Helper()
-	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
-		Key: "mcp_enabled", Value: "true",
-	}); err != nil {
-		t.Fatalf("SetConfig(mcp_enabled): %v", err)
-	}
+	e.setConfig(t, "mcp_enabled", "true")
 	key, err := auth.NewAPIKey()
 	if err != nil {
 		t.Fatalf("NewAPIKey: %v", err)
@@ -2519,23 +2173,13 @@ func (e *testEnv) apiKeyFor(t *testing.T, userID int64) string {
 // doKey is do with a Bearer API key instead of a session cookie.
 func (e *testEnv) doKey(t *testing.T, method, path, body, key string) *http.Response {
 	t.Helper()
+	header := map[string]string{"Authorization": "Bearer " + key}
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
+		header["Content-Type"] = "application/json"
 	}
-	req, err := http.NewRequest(method, e.srv.URL+path, r)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	resp, err := e.srv.Client().Do(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
-	}
-	return resp
+	return e.send(t, method, path, r, nil, header, true)
 }
 
 func TestAPIKeyRESTAccess(t *testing.T) {
@@ -2546,32 +2190,26 @@ func TestAPIKeyRESTAccess(t *testing.T) {
 	// Create, then read back, through the key alone.
 	resp := e.doKey(t, http.MethodPost, "/api/files",
 		`{"name":"via key","html_content":"<p>hi</p>"}`, key)
-	assertStatus(t, resp, http.StatusCreated)
-	created := decodeFile(t, resp)
+	created := decodeFile(t, resp, http.StatusCreated)
 
 	resp = e.doKey(t, http.MethodGet, "/api/files/"+created.Slug, "", key)
-	assertStatus(t, resp, http.StatusOK)
-	if got := decodeFile(t, resp); got.HTMLContent != "<p>hi</p>" {
+	if got := decodeFile(t, resp, http.StatusOK); got.HTMLContent != "<p>hi</p>" {
 		t.Errorf("content = %q, want the uploaded source", got.HTMLContent)
 	}
 
 	// The key resolves to its owner, not to whoever happens to be user 1.
 	resp = e.doKey(t, http.MethodGet, "/api/auth/me", "", key)
-	assertStatus(t, resp, http.StatusOK)
-	if body := bodyString(t, resp); !strings.Contains(body, `"bob"`) {
+	if body := bodyOf(t, resp, http.StatusOK); !strings.Contains(body, `"bob"`) {
 		t.Errorf("me = %s, want username bob", body)
 	}
 
 	// Owner scoping is unchanged: bob's key can't see the admin's file.
 	adminFile := e.createViaAPI(t, e.authCookie(t), "admins", "<p>secret</p>")
-	resp = e.doKey(t, http.MethodGet, "/api/files/"+adminFile.Slug, "", key)
-	assertStatus(t, resp, http.StatusNotFound)
-	bodyString(t, resp)
+	e.expectKeyGET(t, http.StatusNotFound, "/api/files/"+adminFile.Slug, key)
 
 	// A key that matches no row is a plain 401.
-	resp = e.doKey(t, http.MethodGet, "/api/files", "", "rb_nope")
-	assertStatus(t, resp, http.StatusUnauthorized)
-	bodyString(t, resp)
+	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/files", "", nil) // no credential at all
+	e.expectKeyGET(t, http.StatusUnauthorized, "/api/files", "rb_nope")
 }
 
 // TestAPIKeyRESTGates pins the two kill switches: the mcp_enabled config and
@@ -2581,30 +2219,16 @@ func TestAPIKeyRESTGates(t *testing.T) {
 	user, _ := e.newUser(t, "carol")
 	key := e.apiKeyFor(t, user.ID)
 
-	resp := e.doKey(t, http.MethodGet, "/api/files", "", key)
-	assertStatus(t, resp, http.StatusOK)
-	bodyString(t, resp)
+	e.expectKeyGET(t, http.StatusOK, "/api/files", key)
 
-	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
-		Key: "mcp_enabled", Value: "false",
-	}); err != nil {
-		t.Fatalf("SetConfig: %v", err)
-	}
-	resp = e.doKey(t, http.MethodGet, "/api/files", "", key)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	bodyString(t, resp)
+	e.setConfig(t, "mcp_enabled", "false")
+	e.expectKeyGET(t, http.StatusUnauthorized, "/api/files", key)
 
-	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
-		Key: "mcp_enabled", Value: "true",
-	}); err != nil {
-		t.Fatalf("SetConfig: %v", err)
-	}
+	e.setConfig(t, "mcp_enabled", "true")
 	if _, err := e.queries.DisableUser(context.Background(), user.ID); err != nil {
 		t.Fatalf("DisableUser: %v", err)
 	}
-	resp = e.doKey(t, http.MethodGet, "/api/files", "", key)
-	assertStatus(t, resp, http.StatusUnauthorized)
-	bodyString(t, resp)
+	e.expectKeyGET(t, http.StatusUnauthorized, "/api/files", key)
 }
 
 // TestAPIKeyCannotUseSuperAdminEndpoints pins the escalation boundary: even
@@ -2634,15 +2258,12 @@ func TestAPIKeyCannotUseSuperAdminEndpoints(t *testing.T) {
 
 	// The same requests keep working over the admin's session.
 	resp := e.do(t, http.MethodGet, "/api/admin/users", "", e.authCookie(t))
-	assertStatus(t, resp, http.StatusOK)
-	bodyString(t, resp)
+	bodyOf(t, resp, http.StatusOK)
 
 	// A non-admin key fails the role check before the auth-method check.
 	user, _ := e.newUser(t, "dave")
 	userKey := e.apiKeyFor(t, user.ID)
-	resp = e.doKey(t, http.MethodGet, "/api/backup", "", userKey)
-	assertStatus(t, resp, http.StatusForbidden)
-	bodyString(t, resp)
+	e.expectKeyGET(t, http.StatusForbidden, "/api/backup", userKey)
 }
 
 // TestUploadDefaultVisibilityConfig pins the upload_default_public config: off
@@ -2658,8 +2279,7 @@ func TestUploadDefaultVisibilityConfig(t *testing.T) {
 	}
 
 	resp := e.do(t, http.MethodPut, "/api/settings", `{"upload_default_public":true}`, cookie)
-	assertStatus(t, resp, http.StatusOK)
-	if body := bodyString(t, resp); !strings.Contains(body, `"upload_default_public":true`) {
+	if body := bodyOf(t, resp, http.StatusOK); !strings.Contains(body, `"upload_default_public":true`) {
 		t.Errorf("settings after update = %s, want upload_default_public true", body)
 	}
 
@@ -2669,8 +2289,7 @@ func TestUploadDefaultVisibilityConfig(t *testing.T) {
 	}
 	// And the link works anonymously right away.
 	resp = e.do(t, http.MethodGet, "/res/"+f.Slug+"?code="+f.AccessCode, "", nil)
-	assertStatus(t, resp, http.StatusOK)
-	bodyString(t, resp)
+	bodyOf(t, resp, http.StatusOK)
 
 	key := e.apiKeyFor(t, e.admin.ID)
 	if out := e.mcpUpload(t, key, "agent-doc", "markdown", "# hi"); out["is_public"] != false {

@@ -2,13 +2,17 @@ package server_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/handlers"
 )
 
@@ -147,8 +151,7 @@ func TestPasswordByteLimitIsReported(t *testing.T) {
 			"username": "zhang", "nickname": "zhangsan", "password": overLimit,
 		})
 		resp := e.do(t, http.MethodPost, "/api/setup", string(body), nil)
-		assertStatus(t, resp, http.StatusBadRequest)
-		if msg := bodyString(t, resp); !strings.Contains(msg, "72 bytes") {
+		if msg := bodyOf(t, resp, http.StatusBadRequest); !strings.Contains(msg, "72 bytes") {
 			t.Errorf("message = %q, want it to name the byte limit", strings.TrimSpace(msg))
 		}
 	})
@@ -158,9 +161,7 @@ func TestPasswordByteLimitIsReported(t *testing.T) {
 		body, _ := json.Marshal(map[string]string{
 			"username": "zhang", "nickname": "zhangsan", "password": atLimit,
 		})
-		resp := e.do(t, http.MethodPost, "/api/setup", string(body), nil)
-		assertStatus(t, resp, http.StatusCreated)
-		resp.Body.Close()
+		e.expect(t, http.StatusCreated, http.MethodPost, "/api/setup", string(body), nil)
 	})
 
 	t.Run("a long CJK nickname is measured in runes", func(t *testing.T) {
@@ -168,9 +169,7 @@ func TestPasswordByteLimitIsReported(t *testing.T) {
 		// 22 characters, 66 bytes: within the documented 64-character limit,
 		// but over it when the limit is applied to bytes.
 		body, _ := json.Marshal(map[string]any{"nickname": strings.Repeat("名", 22)})
-		resp := e.do(t, http.MethodPatch, "/api/user", string(body), e.authCookie(t))
-		assertStatus(t, resp, http.StatusNoContent)
-		resp.Body.Close()
+		e.expect(t, http.StatusNoContent, http.MethodPatch, "/api/user", string(body), e.authCookie(t))
 	})
 }
 
@@ -261,19 +260,6 @@ func TestRenderSandboxesUserContent(t *testing.T) {
 			}
 		})
 	}
-
-	// The app's own pages must not be framable, but a shared document may be:
-	// embedding your own published page somewhere is a reasonable thing to do.
-	app := e.do(t, http.MethodGet, "/api/health", "", nil)
-	defer app.Body.Close()
-	if got := app.Header.Get("X-Frame-Options"); got != "DENY" {
-		t.Errorf("app X-Frame-Options = %q, want DENY", got)
-	}
-	res := e.do(t, http.MethodGet, "/res/doc?code=code", "", nil)
-	defer res.Body.Close()
-	if got := res.Header.Get("X-Frame-Options"); got != "" {
-		t.Errorf("/res X-Frame-Options = %q, want it unset", got)
-	}
 }
 
 // TestAdminCannotResetOwnPassword pins the second half of the takeover chain
@@ -291,8 +277,7 @@ func TestAdminCannotResetOwnPassword(t *testing.T) {
 
 	path := fmt.Sprintf("/api/admin/users/%d/password", e.admin.ID)
 	resp := e.do(t, http.MethodPost, path, `{"new_password":"attacker-owns-you"}`, cookie)
-	assertStatus(t, resp, http.StatusForbidden)
-	if msg := bodyString(t, resp); !strings.Contains(msg, "profile settings") {
+	if msg := bodyOf(t, resp, http.StatusForbidden); !strings.Contains(msg, "profile settings") {
 		t.Errorf("message = %q, want it to point at the self-service path", strings.TrimSpace(msg))
 	}
 	if after := e.currentHash(t, e.admin.ID); after != before {
@@ -336,8 +321,7 @@ func TestOversizedDocumentReportsItsLimit(t *testing.T) {
 			"name": "toobig", "html_content": strings.Repeat("a", (5<<20)+1),
 		})
 		resp := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
-		assertStatus(t, resp, http.StatusRequestEntityTooLarge)
-		if msg := bodyString(t, resp); !strings.Contains(msg, "5MB") {
+		if msg := bodyOf(t, resp, http.StatusRequestEntityTooLarge); !strings.Contains(msg, "5MB") {
 			t.Errorf("message = %q, want it to name the 5MB limit", strings.TrimSpace(msg))
 		}
 	})
@@ -346,9 +330,7 @@ func TestOversizedDocumentReportsItsLimit(t *testing.T) {
 		body, _ := json.Marshal(map[string]string{
 			"name": "absurd", "html_content": strings.Repeat("a", 12<<20),
 		})
-		resp := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
-		assertStatus(t, resp, http.StatusRequestEntityTooLarge)
-		resp.Body.Close()
+		e.expect(t, http.StatusRequestEntityTooLarge, http.MethodPost, "/api/files", string(body), cookie)
 	})
 }
 
@@ -362,15 +344,11 @@ func TestNameLengthIsCapped(t *testing.T) {
 	long := strings.Repeat("x", 256)
 
 	body, _ := json.Marshal(map[string]string{"name": long, "html_content": "<p>hi</p>"})
-	resp := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
-	assertStatus(t, resp, http.StatusBadRequest)
-	resp.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPost, "/api/files", string(body), cookie)
 
 	file := e.createViaAPI(t, cookie, "ok", "<p>hi</p>")
 	renameBody, _ := json.Marshal(map[string]string{"name": long})
-	rename := e.do(t, http.MethodPatch, "/api/files/"+file.Slug+"/name", string(renameBody), cookie)
-	assertStatus(t, rename, http.StatusBadRequest)
-	rename.Body.Close()
+	e.expect(t, http.StatusBadRequest, http.MethodPatch, "/api/files/"+file.Slug+"/name", string(renameBody), cookie)
 }
 
 type usageResp struct {
@@ -380,14 +358,7 @@ type usageResp struct {
 
 func (e *testEnv) usage(t *testing.T, cookie *http.Cookie) usageResp {
 	t.Helper()
-	resp := e.do(t, http.MethodGet, "/api/user/usage", "", cookie)
-	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusOK)
-	var u usageResp
-	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		t.Fatalf("decode usage: %v", err)
-	}
-	return u
+	return decodeJSON[usageResp](t, e.do(t, http.MethodGet, "/api/user/usage", "", cookie), http.StatusOK)
 }
 
 // TestStorageQuotaIsEnforced covers the per-account limit end to end: the
@@ -403,10 +374,8 @@ func TestStorageQuotaIsEnforced(t *testing.T) {
 
 	// Squeeze the admin's own quota down to something a test can fill.
 	quota := fmt.Sprintf(`{"quota_bytes":%d}`, 4096)
-	setQuota := e.do(t, http.MethodPatch,
+	e.expect(t, http.StatusNoContent, http.MethodPatch,
 		fmt.Sprintf("/api/admin/users/%d/quota", e.admin.ID), quota, cookie)
-	assertStatus(t, setQuota, http.StatusNoContent)
-	setQuota.Body.Close()
 
 	content := strings.Repeat("a", 2000)
 	first := e.createViaAPI(t, cookie, "one", content)
@@ -418,8 +387,7 @@ func TestStorageQuotaIsEnforced(t *testing.T) {
 	e.createViaAPI(t, cookie, "two", content)
 	body, _ := json.Marshal(map[string]string{"name": "three", "html_content": content})
 	over := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
-	assertStatus(t, over, http.StatusRequestEntityTooLarge)
-	if msg := bodyString(t, over); !strings.Contains(msg, "quota") {
+	if msg := bodyOf(t, over, http.StatusRequestEntityTooLarge); !strings.Contains(msg, "quota") {
 		t.Errorf("message = %q, want it to say the quota is full", strings.TrimSpace(msg))
 	}
 
@@ -439,16 +407,12 @@ func TestStorageQuotaIsEnforced(t *testing.T) {
 		// A trashed row still occupies the database, and emptying the trash is
 		// a user action -- if soft delete freed quota it would be an unlimited
 		// bypass.
-		del := e.do(t, http.MethodDelete, "/api/files/"+first.Slug, "", cookie)
-		assertStatus(t, del, http.StatusNoContent)
-		del.Body.Close()
+		e.trash(t, cookie, first.Slug)
 		if u := e.usage(t, cookie); u.UsedBytes != 4000 {
 			t.Errorf("used = %d after trashing a file, want it unchanged at 4000", u.UsedBytes)
 		}
 
-		empty := e.do(t, http.MethodDelete, "/api/trash", "", cookie)
-		assertStatus(t, empty, http.StatusOK)
-		empty.Body.Close()
+		e.expect(t, http.StatusOK, http.MethodDelete, "/api/trash", "", cookie)
 		if u := e.usage(t, cookie); u.UsedBytes != 2000 {
 			t.Errorf("used = %d after emptying the trash, want 2000", u.UsedBytes)
 		}
@@ -468,14 +432,8 @@ func TestAdminCreateAccount(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)
 
-	resp := e.do(t, http.MethodPost, "/api/admin/users",
-		`{"username":"colleague","nickname":"A Colleague"}`, cookie)
-	assertStatus(t, resp, http.StatusCreated)
-	var created createdUserResp
-	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
-		t.Fatalf("decode created user: %v", err)
-	}
-	resp.Body.Close()
+	created := decodeJSON[createdUserResp](t, e.do(t, http.MethodPost, "/api/admin/users",
+		`{"username":"colleague","nickname":"A Colleague"}`, cookie), http.StatusCreated)
 
 	if created.Password == "" {
 		t.Fatal("no password returned; the caller has no way to hand the account over")
@@ -506,14 +464,6 @@ func TestAdminCreateAccount(t *testing.T) {
 		defer resp.Body.Close()
 		assertStatus(t, resp, http.StatusConflict)
 	})
-
-	t.Run("only the super admin may create accounts", func(t *testing.T) {
-		_, otherCookie := e.newUser(t, "regular")
-		resp := e.do(t, http.MethodPost, "/api/admin/users",
-			`{"username":"sneaky","nickname":"Sneaky"}`, otherCookie)
-		defer resp.Body.Close()
-		assertStatus(t, resp, http.StatusForbidden)
-	})
 }
 
 // TestAdminDeleteAccount covers removing an account and everything it owns.
@@ -531,15 +481,9 @@ func TestAdminDeleteAccount(t *testing.T) {
 	del := e.do(t, http.MethodDelete, "/api/files/"+trashed.Slug, "", victimCookie)
 	del.Body.Close()
 
-	resp := e.do(t, http.MethodDelete, fmt.Sprintf("/api/admin/users/%d", victim.ID), "", cookie)
-	assertStatus(t, resp, http.StatusOK)
-	var out struct {
+	out := decodeJSON[struct {
 		DeletedFiles int64 `json:"deleted_files"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode delete response: %v", err)
-	}
-	resp.Body.Close()
+	}](t, e.do(t, http.MethodDelete, fmt.Sprintf("/api/admin/users/%d", victim.ID), "", cookie), http.StatusOK)
 	if out.DeletedFiles != 2 {
 		t.Errorf("deleted_files = %d, want 2 (the trashed one counts)", out.DeletedFiles)
 	}
@@ -576,18 +520,6 @@ func TestAdminDeleteAccount(t *testing.T) {
 		assertStatus(t, resp, http.StatusForbidden)
 	})
 
-	t.Run("a non-admin cannot delete anyone", func(t *testing.T) {
-		other, otherCookie := e.newUser(t, "regular")
-		third, _ := e.newUser(t, "third")
-		resp := e.do(t, http.MethodDelete,
-			fmt.Sprintf("/api/admin/users/%d", third.ID), "", otherCookie)
-		defer resp.Body.Close()
-		assertStatus(t, resp, http.StatusForbidden)
-		if _, err := e.queries.GetUserByID(context.Background(), other.ID); err != nil {
-			t.Errorf("caller's own row disappeared: %v", err)
-		}
-	})
-
 	t.Run("an unknown id is a 404 and commits nothing", func(t *testing.T) {
 		before, err := e.queries.CountUsers(context.Background())
 		if err != nil {
@@ -615,16 +547,11 @@ func TestListingsCarrySizeWithoutContent(t *testing.T) {
 	content := strings.Repeat("x", 1234)
 	file := e.createViaAPI(t, cookie, "sized", content)
 
-	resp := e.do(t, http.MethodGet, "/api/files", "", cookie)
-	defer resp.Body.Close()
-	var listed []struct {
+	listed := decodeJSON[[]struct {
 		Slug        string `json:"slug"`
 		Size        int64  `json:"size"`
 		HTMLContent string `json:"html_content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
-		t.Fatalf("decode list: %v", err)
-	}
+	}](t, e.do(t, http.MethodGet, "/api/files", "", cookie), http.StatusOK)
 	if len(listed) != 1 {
 		t.Fatalf("listed %d files, want 1", len(listed))
 	}
@@ -655,8 +582,7 @@ func TestListingsCarrySizeWithoutContent(t *testing.T) {
 
 	// Single-file reads still carry the content -- that is what the editor loads.
 	one := e.do(t, http.MethodGet, "/api/files/"+file.Slug, "", cookie)
-	defer one.Body.Close()
-	if got := decodeFile(t, one).HTMLContent; got != "short" {
+	if got := decodeFile(t, one, http.StatusOK).HTMLContent; got != "short" {
 		t.Errorf("GET one file returned %q, want the content", got)
 	}
 }
@@ -683,15 +609,7 @@ func TestSearchReturnsContentSnippets(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.query, func(t *testing.T) {
-			resp := e.do(t, http.MethodGet, "/api/search?q="+urlQuery(c.query)+"&content=true", "", cookie)
-			defer resp.Body.Close()
-			var results []struct {
-				MatchedContent bool   `json:"matched_content"`
-				Snippet        string `json:"snippet"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-				t.Fatalf("decode search: %v", err)
-			}
+			results := e.search(t, cookie, "q="+url.QueryEscape(c.query)+"&content=true")
 			if len(results) != 1 {
 				t.Fatalf("got %d results, want 1", len(results))
 			}
@@ -705,10 +623,6 @@ func TestSearchReturnsContentSnippets(t *testing.T) {
 	}
 }
 
-func urlQuery(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, "%", "%25"), " ", "%20")
-}
-
 // TestQuotaAppliesPerAccount pins that the limit is the target account's, not a
 // global one, and that lowering it below current usage blocks new writes
 // without touching stored files.
@@ -719,15 +633,11 @@ func TestQuotaAppliesPerAccount(t *testing.T) {
 
 	existing := e.createViaAPI(t, otherCookie, "existing", strings.Repeat("x", 3000))
 
-	lower := e.do(t, http.MethodPatch,
+	e.expect(t, http.StatusNoContent, http.MethodPatch,
 		fmt.Sprintf("/api/admin/users/%d/quota", other.ID), `{"quota_bytes":100}`, adminCookie)
-	assertStatus(t, lower, http.StatusNoContent)
-	lower.Body.Close()
 
 	body, _ := json.Marshal(map[string]string{"name": "new", "html_content": "x"})
-	blocked := e.do(t, http.MethodPost, "/api/files", string(body), otherCookie)
-	assertStatus(t, blocked, http.StatusRequestEntityTooLarge)
-	blocked.Body.Close()
+	e.expect(t, http.StatusRequestEntityTooLarge, http.MethodPost, "/api/files", string(body), otherCookie)
 
 	// The file they already had is untouched and still served.
 	read := e.do(t, http.MethodGet, "/api/files/"+existing.Slug, "", otherCookie)
@@ -736,13 +646,6 @@ func TestQuotaAppliesPerAccount(t *testing.T) {
 
 	// The admin's own uploads are unaffected: quotas are per account.
 	e.createViaAPI(t, adminCookie, "mine", "<p>fine</p>")
-
-	t.Run("a non-admin cannot raise their own quota", func(t *testing.T) {
-		resp := e.do(t, http.MethodPatch,
-			fmt.Sprintf("/api/admin/users/%d/quota", other.ID), `{"quota_bytes":999999}`, otherCookie)
-		defer resp.Body.Close()
-		assertStatus(t, resp, http.StatusForbidden)
-	})
 }
 
 // TestMCPRespectsAccountLimits pins that an API key is not a way around the
@@ -759,10 +662,8 @@ func TestMCPRespectsAccountLimits(t *testing.T) {
 	key := e.enableMCP(t)
 
 	// A quota small enough to fill in one upload.
-	setQuota := e.do(t, http.MethodPatch,
+	e.expect(t, http.StatusNoContent, http.MethodPatch,
 		fmt.Sprintf("/api/admin/users/%d/quota", e.admin.ID), `{"quota_bytes":4096}`, cookie)
-	assertStatus(t, setQuota, http.StatusNoContent)
-	setQuota.Body.Close()
 
 	fill := e.mcpUpload(t, key, "first", "markdown", strings.Repeat("a", 3000))
 	if fill["slug"] == nil {
@@ -866,5 +767,57 @@ func TestAppPagesAreNotFramable(t *testing.T) {
 		if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
 			t.Errorf("%s: X-Frame-Options = %q, want DENY", path, got)
 		}
+	}
+}
+
+// TestSuperAdminEndpointsRejectOrdinaryUsers pins the role check on every
+// endpoint that is the super admin's alone. An ordinary account gets 403 (the
+// path exists, only the privilege is in question), not 404 -- and the 403 must
+// be the privilege check firing before the work, so each target is checked for
+// side effects afterwards. (Key-authenticated requests are refused even for
+// the super admin: TestAPIKeyCannotUseSuperAdminEndpoints.)
+func TestSuperAdminEndpointsRejectOrdinaryUsers(t *testing.T) {
+	e := newEnv(t)
+	victim, _ := e.newUser(t, "victim")
+	caller, cookie := e.newUser(t, "regular")
+	kept := e.createViaAPI(t, e.authCookie(t), "keep me", "<p>safe</p>")
+	snapshot := e.downloadBackup(t, e.authCookie(t))
+	id := fmt.Sprint(victim.ID)
+
+	for _, c := range []struct{ name, method, path, body string }{
+		{"download backup", http.MethodGet, "/api/backup", ""},
+		{"restore backup", http.MethodPost, "/api/backup/restore", string(snapshot)},
+		{"write settings", http.MethodPut, "/api/settings", `{"allow_registration":true}`},
+		{"list accounts", http.MethodGet, "/api/admin/users", ""},
+		{"create account", http.MethodPost, "/api/admin/users", `{"username":"sneaky","nickname":"Sneaky"}`},
+		{"delete account", http.MethodDelete, "/api/admin/users/" + id, ""},
+		{"delete the super admin", http.MethodDelete, fmt.Sprintf("/api/admin/users/%d", handlers.SuperAdminID), ""},
+		{"suspend account", http.MethodPatch, "/api/admin/users/" + id + "/status", `{"disabled":true}`},
+		{"set own quota", http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/quota", caller.ID), `{"quota_bytes":999999}`},
+		{"reset password", http.MethodPost, "/api/admin/users/" + id + "/password", `{"new_password":"hijacked"}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e.expect(t, http.StatusForbidden, c.method, c.path, c.body, cookie)
+		})
+	}
+
+	ctx := context.Background()
+	if got, err := e.queries.GetUserByID(ctx, victim.ID); err != nil {
+		t.Errorf("victim row disappeared: %v", err)
+	} else if got.DisabledAt.Valid || !auth.VerifyPassword(got.PasswordHash, "secret2") {
+		t.Errorf("a rejected admin request changed the victim: %+v", got)
+	}
+	if got, err := e.queries.GetUserByID(ctx, caller.ID); err != nil || got.QuotaBytes != caller.QuotaBytes {
+		t.Errorf("caller's row or quota changed: %+v, %v", got, err)
+	}
+	if _, err := e.queries.GetUserByUsername(ctx, "sneaky"); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("a rejected create made the account anyway: %v", err)
+	}
+	if _, err := e.queries.GetUserByID(ctx, handlers.SuperAdminID); err != nil {
+		t.Errorf("super admin row disappeared: %v", err)
+	}
+	e.expect(t, http.StatusOK, http.MethodGet, "/api/files/"+kept.Slug, "", e.authCookie(t))
+	if cfg, err := e.queries.GetConfig(ctx, "allow_registration"); err == nil && cfg == "true" {
+		t.Error("a rejected settings write took effect")
 	}
 }

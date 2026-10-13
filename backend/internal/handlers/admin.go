@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,8 +24,7 @@ type AdminHandler struct {
 	queries *sqlcgen.Queries
 	// conn is here only for Delete, which has to remove an account's files,
 	// its sessions and the row itself as one unit. There are no foreign keys
-	// to cascade for us (SQLite would need them declared and PRAGMA
-	// foreign_keys on every connection), so the transaction is what stops a
+	// to cascade for us (the schema declares none), so the transaction is what stops a
 	// failure halfway through from leaving files owned by an id that no longer
 	// exists -- rows nothing in the app can list, delete or serve.
 	conn   *sql.DB
@@ -62,8 +60,7 @@ func (h *AdminHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.queries.ListUsersWithFileCounts(r.Context())
 	if err != nil {
-		h.logger.Error("list users", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "list users", err)
 		return
 	}
 
@@ -75,15 +72,12 @@ func (h *AdminHandler) List(w http.ResponseWriter, r *http.Request) {
 			Nickname:     u.Nickname,
 			IsSuperAdmin: u.ID == SuperAdminID,
 			Disabled:     u.DisabledAt.Valid,
+			DisabledAt:   fmtNullTime(u.DisabledAt),
 			CreatedAt:    u.CreatedAt.Format(timeLayout),
 			FileCount:    u.FileCount,
 			TrashedCount: u.TrashedCount,
 			UsedBytes:    u.UsedBytes,
 			QuotaBytes:   u.QuotaBytes,
-		}
-		if u.DisabledAt.Valid {
-			s := u.DisabledAt.Time.Format(timeLayout)
-			item.DisabledAt = &s
 		}
 		resp = append(resp, item)
 	}
@@ -138,13 +132,8 @@ func (h *AdminHandler) SetStatus(w http.ResponseWriter, r *http.Request) {
 	} else {
 		_, err = h.queries.EnableUser(r.Context(), id)
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	if err != nil {
-		h.logger.Error("set user status", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		queryError(w, h.logger, "set user status", err, "user_id", id)
 		return
 	}
 
@@ -209,8 +198,7 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 
 	hash, err := auth.HashPassword(req.NewPassword)
 	if err != nil {
-		h.logger.Error("hash password", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "hash password", err)
 		return
 	}
 	rows, err := h.queries.UpdateUserPassword(r.Context(), sqlcgen.UpdateUserPasswordParams{
@@ -218,12 +206,11 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		ID:           id,
 	})
 	if err != nil {
-		h.logger.Error("reset user password", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "reset user password", err, "user_id", id)
 		return
 	}
 	if rows == 0 {
-		http.Error(w, "not found", http.StatusNotFound)
+		notFound(w)
 		return
 	}
 	if err := h.queries.DeleteUserSessions(r.Context(), id); err != nil {
@@ -271,27 +258,17 @@ func (h *AdminHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	password, err := auth.NewGeneratedPassword()
 	if err != nil {
-		h.logger.Error("generate password", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "generate password", err)
 		return
 	}
 
-	user, errMsg, err := createUser(r, h.queries, registerRequest{
+	user, err := createUser(r.Context(), h.queries, registerRequest{
 		Username: req.Username,
 		Nickname: req.Nickname,
 		Password: password,
 	}, false)
-	if errMsg != "" {
-		status := http.StatusBadRequest
-		if errMsg == "username already taken" {
-			status = http.StatusConflict
-		}
-		http.Error(w, errMsg, status)
-		return
-	}
 	if err != nil {
-		h.logger.Error("create user by super admin", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeCreateUserError(w, h.logger, "create user by super admin", err)
 		return
 	}
 	h.logger.Info("user created by super admin", "user_id", user.ID, "username", user.Username)
@@ -322,8 +299,9 @@ type deleteUserResponse struct {
 // accounts, so deleting it is a one-way door out of the app) and the caller's
 // own, which is the same door reached from the other side.
 func (h *AdminHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	caller, ok := requireSuperAdmin(w, r)
-	if !ok {
+	// requireSuperAdmin pins the caller to SuperAdminID, so refusing that id
+	// below also covers "you cannot delete your own account".
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 	id, ok := targetUserID(w, r)
@@ -334,15 +312,10 @@ func (h *AdminHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the super admin cannot be deleted", http.StatusForbidden)
 		return
 	}
-	if id == caller.ID {
-		http.Error(w, "you cannot delete your own account", http.StatusForbidden)
-		return
-	}
 
 	tx, err := h.conn.BeginTx(r.Context(), nil)
 	if err != nil {
-		h.logger.Error("begin delete user", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "begin delete user", err, "user_id", id)
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
@@ -350,30 +323,26 @@ func (h *AdminHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	files, err := q.DeleteUserFiles(r.Context(), id)
 	if err != nil {
-		h.logger.Error("delete user files", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "delete user files", err, "user_id", id)
 		return
 	}
 	if err := q.DeleteUserSessions(r.Context(), id); err != nil {
-		h.logger.Error("delete user sessions", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "delete user sessions", err, "user_id", id)
 		return
 	}
 	rows, err := q.DeleteUser(r.Context(), id)
 	if err != nil {
-		h.logger.Error("delete user", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "delete user", err, "user_id", id)
 		return
 	}
 	// Checked before the commit, so a request naming a user that does not
 	// exist rolls back rather than committing a no-op that reports 404.
 	if rows == 0 {
-		http.Error(w, "not found", http.StatusNotFound)
+		notFound(w)
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		h.logger.Error("commit delete user", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		serverError(w, h.logger, "commit delete user", err, "user_id", id)
 		return
 	}
 	h.logger.Info("user deleted by super admin", "user_id", id, "files", files)
@@ -417,13 +386,8 @@ func (h *AdminHandler) SetQuota(w http.ResponseWriter, r *http.Request) {
 		QuotaBytes: req.QuotaBytes,
 		ID:         id,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	if err != nil {
-		h.logger.Error("set user quota", "user_id", id, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		queryError(w, h.logger, "set user quota", err, "user_id", id)
 		return
 	}
 	h.logger.Info("user quota changed", "user_id", id, "quota_bytes", req.QuotaBytes)
