@@ -8,7 +8,7 @@ Upgrades are `docker compose pull && docker compose up -d`. Database migrations
 are forward-only and apply themselves on start, so **take a backup before
 upgrading** (Settings → Backup) if you might want to go back.
 
-## Unreleased
+## v0.4.0
 
 ### Changed
 
@@ -54,6 +54,17 @@ upgrading** (Settings → Backup) if you might want to go back.
   opened inside the site uses one view, and its stylesheets and scripts use none.
 - **Rolling back** to an earlier version after creating a site needs a restored
   backup, as with any migration; an older binary cannot render sites at all.
+
+## v0.3.0
+
+### Added
+
+- **An API key can call the REST API directly**, not just MCP: send it as
+  `Authorization: Bearer rb_...`. Same rules as MCP — it lives and dies with the
+  MCP toggle and the account's status — and it stays a file-scope credential, so
+  backup and account management still require a browser session.
+- **A default visibility for new uploads.** `upload_default_public` in Settings
+  decides whether a newly created file starts public; unset means private.
 
 ## v0.2.0
 
