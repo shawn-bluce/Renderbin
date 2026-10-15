@@ -43,6 +43,9 @@ func New(conn *sql.DB, logger *slog.Logger) http.Handler {
 		r.MethodNotAllowed(apiMethodNotAllowed)
 
 		r.Get("/health", handlers.Health)
+		// Public: the /res pages' QR widget asks for it from a sandboxed
+		// origin, which sends no cookie.
+		r.Get("/qr", handlers.QRCode)
 
 		r.Get("/setup/status", setupH.Status)
 		r.Post("/setup", setupH.Setup)

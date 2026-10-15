@@ -28,6 +28,10 @@ const (
 	// at it. MCP uploads ignore it: those tools promise "starts private" in
 	// their descriptions, and publish_file is the agent's explicit consent step.
 	ConfigUploadDefaultPublic = "upload_default_public"
+	// ConfigQRWidget puts the "open on your phone" QR button on every page
+	// served at /res (see qr.go). On by default, which migration 0007 seeds,
+	// since a missing key reads as false.
+	ConfigQRWidget = "qr_widget"
 )
 
 // configBool reads a boolean config; missing keys and read errors are false.

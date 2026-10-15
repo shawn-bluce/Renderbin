@@ -657,8 +657,9 @@ func TestRenderAccessControl(t *testing.T) {
 
 	// Public file, correct code -> 200 + content, and code_success_count
 	// bumps (anonymous access), not success_count (session access).
+	// (Followed by the QR widget, see TestRenderQRWidget.)
 	resp := e.do(t, http.MethodGet, "/res/pub?code=rightcode", "", nil)
-	if b := bodyOf(t, resp, http.StatusOK); b != "<h1>hello</h1>" {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.HasPrefix(b, "<h1>hello</h1>") {
 		t.Errorf("render body = %q", b)
 	}
 	f, err := e.queries.GetFileBySlugAnyOwner(context.Background(), "pub")
@@ -679,7 +680,7 @@ func TestRenderAccessControl(t *testing.T) {
 	// success_count, not code_success_count.
 	cookie := e.authCookie(t)
 	resp = e.do(t, http.MethodGet, "/res/priv", "", cookie)
-	if b := bodyOf(t, resp, http.StatusOK); b != "<h1>secret</h1>" {
+	if b := bodyOf(t, resp, http.StatusOK); !strings.HasPrefix(b, "<h1>secret</h1>") {
 		t.Errorf("admin render body = %q", b)
 	}
 	f, err = e.queries.GetFileBySlugAnyOwner(context.Background(), "priv")

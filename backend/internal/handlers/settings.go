@@ -25,6 +25,7 @@ type settingsResponse struct {
 	AllowRegistration   bool `json:"allow_registration"`
 	MCPEnabled          bool `json:"mcp_enabled"`
 	UploadDefaultPublic bool `json:"upload_default_public"`
+	QRWidget            bool `json:"qr_widget"`
 }
 
 func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +33,7 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 		AllowRegistration:   configBool(r.Context(), h.queries, ConfigAllowRegistration),
 		MCPEnabled:          configBool(r.Context(), h.queries, ConfigMCPEnabled),
 		UploadDefaultPublic: configBool(r.Context(), h.queries, ConfigUploadDefaultPublic),
+		QRWidget:            configBool(r.Context(), h.queries, ConfigQRWidget),
 	})
 }
 
@@ -39,6 +41,7 @@ type updateSettingsRequest struct {
 	AllowRegistration   *bool `json:"allow_registration"`
 	MCPEnabled          *bool `json:"mcp_enabled"`
 	UploadDefaultPublic *bool `json:"upload_default_public"`
+	QRWidget            *bool `json:"qr_widget"`
 }
 
 // Update writes global configs; super admin only. Fields are optional so the
@@ -58,6 +61,7 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ConfigAllowRegistration:   req.AllowRegistration,
 		ConfigMCPEnabled:          req.MCPEnabled,
 		ConfigUploadDefaultPublic: req.UploadDefaultPublic,
+		ConfigQRWidget:            req.QRWidget,
 	} {
 		if value != nil {
 			updates[key] = *value

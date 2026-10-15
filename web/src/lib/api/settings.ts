@@ -4,6 +4,7 @@ export interface Settings {
 	allow_registration: boolean;
 	mcp_enabled: boolean;
 	upload_default_public: boolean;
+	qr_widget: boolean;
 }
 
 export function getSettings(f?: typeof fetch): Promise<Settings> {

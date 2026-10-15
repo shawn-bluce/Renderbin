@@ -10,6 +10,15 @@ upgrading** (Settings → Backup) if you might want to go back.
 
 ## Unreleased
 
+### Added
+
+- **Open a page on your phone.** Every opened document and site page shows a
+  small QR button in its bottom-right corner; hovering it shows a QR code of
+  the page's link. It is hidden on touch screens, in print, and when the page
+  is embedded in a frame. On by default; the super admin can turn it off under
+  Settings → Sharing (formerly "Uploads"). Turning it off reaches a site page a
+  browser has already cached only once that site is next replaced.
+
 ### Changed
 
 - **Faster with many or large files.** The file listing, trash, search and the

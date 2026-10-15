@@ -1132,7 +1132,14 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 	}
 	if owner || (file.IsPublic && accessCodeMatches(file.AccessCode, r.URL.Query().Get("code"))) {
 		h.recordView(r.Context(), file, owner)
-		writeUserHTML(w, http.StatusOK, renderContent(file.Kind, file.Name, file.HtmlContent))
+		// Only the owner gets this far with a private file, and the phone
+		// the QR code hands the link to is not signed in.
+		note := qrNoteNone
+		if !file.IsPublic {
+			note = qrNotePrivate
+		}
+		page := renderContent(file.Kind, file.Name, file.HtmlContent)
+		writeUserHTML(w, http.StatusOK, h.withQRWidget(r.Context(), page, note))
 		return
 	}
 

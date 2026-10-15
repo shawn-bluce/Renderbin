@@ -141,7 +141,7 @@
 		{ id: 'accounts', icon: 'lucide:users', label: t('accounts.title'), show: isAdmin },
 		{ id: 'backup', icon: 'lucide:database-backup', label: t('backup.title'), show: isAdmin },
 		{ id: 'registration', icon: 'lucide:user-plus', label: t('settings.registration'), show: true },
-		{ id: 'uploads', icon: 'lucide:upload', label: t('settings.uploads'), show: true },
+		{ id: 'sharing', icon: 'lucide:share-2', label: t('settings.sharing'), show: true },
 		{ id: 'ai', icon: 'lucide:sparkles', label: t('settings.ai'), show: true }
 	]}
 	{@const itemClass = mobile ? 'nav-chip' : 'nav-item'}
@@ -258,14 +258,15 @@
 				)}
 			</section>
 
-			<!-- Section: uploads -->
-			<section id="uploads" class="card scroll-mt-20 p-5">
-				<SectionTitle icon="lucide:upload" label={t('settings.uploads')} />
+			<!-- Section: sharing -->
+			<section id="sharing" class="card scroll-mt-20 p-5">
+				<SectionTitle icon="lucide:share-2" label={t('settings.sharing')} />
 				{@render setting(
 					t('config.uploadDefaultPublic'),
 					t('config.uploadDefaultPublicHint'),
 					'upload_default_public'
 				)}
+				{@render setting(t('config.qrWidget'), t('config.qrWidgetHint'), 'qr_widget')}
 			</section>
 		</div>
 

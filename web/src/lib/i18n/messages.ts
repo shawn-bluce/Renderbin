@@ -248,6 +248,9 @@ const en = {
 	'config.uploadDefaultPublic': 'New files start public',
 	'config.uploadDefaultPublicHint':
 		'Files created on the dashboard or over the API start public, viewable by anyone with the link and access code. When off, every new file starts private. MCP uploads always start private.',
+	'config.qrWidget': 'QR code on shared pages',
+	'config.qrWidgetHint':
+		'Every opened document and site page shows a small QR button in its bottom-right corner; hovering it shows a code of the page link, to open it on a phone. Hidden on touch screens and when the page is embedded in a frame.',
 
 	// Settings page
 	'settings.title': 'Settings',
@@ -261,7 +264,7 @@ const en = {
 	'settings.newPassword': 'New password',
 	'settings.passwordUpdated': 'Password updated.',
 	'settings.registration': 'Registration',
-	'settings.uploads': 'Uploads',
+	'settings.sharing': 'Sharing',
 	'backup.title': 'Backup & restore',
 	'backup.download': 'Download a backup',
 	'backup.downloadHint':
@@ -609,6 +612,9 @@ const zh = {
 	'config.uploadDefaultPublic': '新文件默认公开',
 	'config.uploadDefaultPublicHint':
 		'在仪表盘或通过 API 创建的文件默认公开，任何拿到链接和访问码的人都能立即查看；关闭时新文件默认私有。MCP 上传始终以私有创建。',
+	'config.qrWidget': '页面二维码',
+	'config.qrWidgetHint':
+		'打开的文档和站点页面右下角显示一个小二维码按钮，鼠标悬停时弹出当前页面链接的二维码，方便用手机扫码查看。在触屏设备上和页面被 iframe 嵌入时不显示。',
 
 	// Settings page
 	'settings.title': '设置',
@@ -622,7 +628,7 @@ const zh = {
 	'settings.newPassword': '新密码',
 	'settings.passwordUpdated': '密码已更新。',
 	'settings.registration': '注册',
-	'settings.uploads': '上传',
+	'settings.sharing': '分享',
 	'backup.title': '备份与恢复',
 	'backup.download': '下载备份',
 	'backup.downloadHint': '一个 SQLite 文件，包含全部内容：所有账号及其所有文件。',

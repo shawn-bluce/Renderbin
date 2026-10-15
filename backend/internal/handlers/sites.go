@@ -236,6 +236,7 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 			h.recordView(r.Context(), file, preview)
 		}
 		setSiteHeaders(w, "")
+		varyOnDest(w, entry)
 		w.Header().Del("Content-Type")
 		w.Header().Set("Last-Modified", file.UpdatedAt.UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusNotModified)
@@ -270,11 +271,20 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	contentType := site.ContentType(entry, data)
 	if doc {
 		h.recordView(r.Context(), file, preview)
+		// Only pages get the QR widget: HTML pulled in by fetch() is a
+		// fragment the site's own script splices somewhere.
+		note := qrNoteNone
+		if preview {
+			note = qrNotePreview
+		}
+		data = h.withQRWidget(r.Context(), data, note)
 	}
 
-	setSiteHeaders(w, site.ContentType(entry, data))
+	setSiteHeaders(w, contentType)
+	varyOnDest(w, entry)
 	http.ServeContent(w, r, "", stored.UpdatedAt, bytes.NewReader(data))
 }
 
@@ -291,6 +301,19 @@ func setSiteHeaders(w http.ResponseWriter, contentType string) {
 	// access code takes effect on the next request rather than whenever a
 	// cache gets round to it. Unchanged entries still get a 304.
 	hdr.Set("Cache-Control", "no-cache")
+}
+
+// varyOnDest tells caches that an HTML entry's bytes depend on how it was
+// requested: a page view carries the QR widget, a fetch() of the same URL does
+// not, and neither may be answered with the other's cached copy.
+//
+// The widget is not part of the validator, so turning it on or off reaches a
+// page a browser already holds only once the site's archive next changes:
+// until then a revalidation is still a 304.
+func varyOnDest(w http.ResponseWriter, entry string) {
+	if site.IsHTML(entry) {
+		w.Header().Add("Vary", "Sec-Fetch-Dest")
+	}
 }
 
 // notModifiedSince is the If-Modified-Since half of http.ServeContent's
