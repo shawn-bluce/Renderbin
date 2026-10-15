@@ -125,7 +125,7 @@ jobs:
             # URL the README tells people to curl. The version is stamped into
             # the binary (buildinfo.Version) and reported by /api/health.
             tar -czf "dist/renderbin_linux_${arch}.tar.gz" \
-              -C dist renderbin -C .. LICENSE README.md
+              -C dist renderbin -C .. LICENSE README.md README.zh-CN.md
             rm dist/renderbin
           done
           (cd dist && sha256sum *.tar.gz > checksums.txt)
