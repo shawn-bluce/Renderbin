@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -185,16 +184,16 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	}
 	tok, sub, hasSlash := strings.Cut(rest, "/")
 
-	file, err := h.queries.GetFileBySlugAnyOwner(r.Context(), slug)
-	if err == nil && file.Kind != KindSite {
-		err = sql.ErrNoRows
-	}
+	// Metadata only: the archive is fetched below, once a response actually
+	// needs its bytes.
+	row, err := h.queries.GetSiteBySlugAnyOwner(r.Context(), slug)
 	if err != nil {
 		// A miss is deliberately without setUserContentHeaders: nothing
 		// user-authored is served, and the app's own X-Frame-Options: DENY stays on.
 		queryError(w, h.logger, "get site", err)
 		return
 	}
+	file := listRowToFile(sqlcgen.ListUserFilesRow(row))
 
 	entry := sub
 	if entry == "" || strings.HasSuffix(entry, "/") {
@@ -227,7 +226,29 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	arc, err := site.Open(file.Archive)
+	// The archive cannot have changed since the browser cached this entry
+	// (updated_at moves on every replacement), so neither the bytes nor
+	// whether the entry exists can differ from what it already holds: answer
+	// without loading the zip. A page view still counts, as it did when
+	// ServeContent made the same decision after the load.
+	if notModifiedSince(r, file.UpdatedAt) {
+		if doc {
+			h.recordView(r.Context(), file, preview)
+		}
+		setSiteHeaders(w, "")
+		w.Header().Del("Content-Type")
+		w.Header().Set("Last-Modified", file.UpdatedAt.UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	stored, err := h.queries.GetSiteArchive(r.Context(), file.ID)
+	if err != nil {
+		// Deleted or suspended between the two queries.
+		queryError(w, h.logger, "get site archive", err)
+		return
+	}
+	arc, err := site.Open(stored.Archive)
 	if err != nil {
 		serverError(w, h.logger, "open site archive", err, "slug", file.Slug)
 		return
@@ -253,7 +274,13 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 		h.recordView(r.Context(), file, preview)
 	}
 
-	setUserContentHeaders(w, site.ContentType(entry, data))
+	setSiteHeaders(w, site.ContentType(entry, data))
+	http.ServeContent(w, r, "", stored.UpdatedAt, bytes.NewReader(data))
+}
+
+// setSiteHeaders sets what every served site entry carries, a 304 included.
+func setSiteHeaders(w http.ResponseWriter, contentType string) {
+	setUserContentHeaders(w, contentType)
 	hdr := w.Header()
 	// Module scripts, fetch() and web fonts are CORS requests, and from the
 	// sandbox's opaque origin they are cross-origin to this server: without
@@ -262,10 +289,27 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	hdr.Set("Access-Control-Allow-Origin", "*")
 	// Revalidate every time, so making the site private or changing its
 	// access code takes effect on the next request rather than whenever a
-	// cache gets round to it. ServeContent still answers 304 when nothing
-	// changed.
+	// cache gets round to it. Unchanged entries still get a 304.
 	hdr.Set("Cache-Control", "no-cache")
-	http.ServeContent(w, r, "", file.UpdatedAt, bytes.NewReader(data))
+}
+
+// notModifiedSince is the If-Modified-Since half of http.ServeContent's
+// precondition check, run before the archive is loaded. Anything it does not
+// decide -- an If-None-Match, a malformed date -- returns false and goes the
+// long way, where ServeContent applies the full rules.
+func notModifiedSince(r *http.Request, modtime time.Time) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	if r.Header.Get("If-None-Match") != "" {
+		return false
+	}
+	ims, err := http.ParseTime(r.Header.Get("If-Modified-Since"))
+	if err != nil {
+		return false
+	}
+	// Last-Modified has whole-second resolution; compare at the same.
+	return !modtime.Truncate(time.Second).After(ims)
 }
 
 func queryPart(r *http.Request) string {

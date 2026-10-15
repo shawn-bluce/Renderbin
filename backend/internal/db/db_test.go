@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -210,7 +212,7 @@ func TestMigrationRewritesLegacyTimestamps(t *testing.T) {
 		t.Fatalf("insert file without expiry: %v", err)
 	}
 
-	if err := migrate(conn); err != nil {
+	if _, err := migrate(conn); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -474,5 +476,197 @@ func TestContentSizeCountsSiteArchive(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("restored site content_size = %d, want 3", n)
+	}
+}
+
+// TestMigrationMovesContentLast covers migration 0006, which rebuilds files
+// with html_content and archive as its last two columns. A table rebuild is
+// the one kind of migration that can lose data silently, so this checks that
+// every column of every row survives, and that the id counter does too.
+func TestMigrationMovesContentLast(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	legacy := openRaw(t, path)
+	applyMigrationsBefore(t, legacy, "0006")
+
+	for _, stmt := range []string{
+		`INSERT INTO users (username, nickname, password_hash) VALUES ('a', 'A', 'h')`,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, tags, is_public,
+		                    expires_at, success_count, kind)
+		 VALUES ('doc', 'Doc', '汉字 body', 'code1', 1, 'x,y', 1,
+		         '2030-01-02 03:04:05+00:00', 7, 'markdown')`,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind, archive,
+		                    deleted_at, max_views, expired_reason)
+		 VALUES ('site', 'Site', '', 'code2', 1, 'site', x'504b0506',
+		         '2026-01-01 00:00:00+00:00', 3, 'views')`,
+		// Large enough that the rebuild's leftover free pages dominate the
+		// file, which is what the compaction check below needs to see.
+		`UPDATE files SET html_content = html_content || hex(zeroblob(200000)) WHERE slug = 'doc'`,
+		// Issued and then hard-deleted: the counter must stay at 3, not fall
+		// back to the highest surviving id.
+		`INSERT INTO files (slug, name, html_content, access_code, user_id)
+		 VALUES ('gone', 'Gone', 'x', 'code3', 1)`,
+		`DELETE FROM files WHERE slug = 'gone'`,
+	} {
+		if _, err := legacy.Exec(stmt); err != nil {
+			t.Fatalf("stage pre-0006 data: %v\n%s", err, stmt)
+		}
+	}
+
+	// Named columns, so the comparison does not depend on the order the
+	// migration is changing.
+	const cols = `id, slug, name, html_content, is_public, access_code, created_at,
+		updated_at, deleted_at, success_count, failure_count, tags, expires_at,
+		max_views, view_count, kind, code_success_count, user_id, expired_at,
+		expired_reason, content_size, archive`
+	snapshot := func(conn *sql.DB) []string {
+		t.Helper()
+		rows, err := conn.Query(`SELECT ` + cols + ` FROM files ORDER BY id`)
+		if err != nil {
+			t.Fatalf("read files: %v", err)
+		}
+		defer rows.Close()
+		names, _ := rows.Columns()
+		var out []string
+		for rows.Next() {
+			vals := make([]any, len(names))
+			ptrs := make([]any, len(names))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out = append(out, fmt.Sprintf("%v", vals))
+		}
+		return out
+	}
+	before := snapshot(legacy)
+	legacy.Close()
+
+	conn, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (upgrade): %v", err)
+	}
+	defer conn.Close()
+
+	if after := snapshot(conn); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Errorf("rows changed by the rebuild:\nbefore %v\nafter  %v", before, after)
+	}
+
+	var last2 string
+	if err := conn.QueryRow(
+		`SELECT group_concat(name, ',') FROM (
+		   SELECT name FROM pragma_table_info('files') ORDER BY cid DESC LIMIT 2)`,
+	).Scan(&last2); err != nil {
+		t.Fatalf("read column order: %v", err)
+	}
+	if last2 != "archive,html_content" {
+		t.Errorf("last two columns = %s, want html_content then archive", last2)
+	}
+
+	if seq := rawText(t, conn, `SELECT seq FROM sqlite_sequence WHERE name = 'files'`); seq != "3" {
+		t.Errorf("files sequence = %s after the rebuild, want 3 (the highest id ever issued)", seq)
+	}
+	if n := rawText(t, conn, `SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'files_new'`); n != "0" {
+		t.Errorf("files_new still has %s sequence row(s)", n)
+	}
+
+	// The rebuild wrote a second copy before dropping the first; Open must
+	// have given that space back rather than leave the file twice its size.
+	if free := rawText(t, conn, `SELECT freelist_count FROM pragma_freelist_count`); free != "0" {
+		t.Errorf("%s free pages after the upgrade, want 0 (compacted)", free)
+	}
+
+	// What the DROP took with it must be back.
+	for _, name := range []string{
+		"idx_files_owner_list",
+		"files_content_size_after_insert",
+		"files_content_size_after_update",
+	} {
+		if n := rawText(t, conn,
+			`SELECT COUNT(*) FROM sqlite_master WHERE name = ? AND tbl_name = 'files'`, name,
+		); n != "1" {
+			t.Errorf("%s missing after the rebuild", name)
+		}
+	}
+}
+
+// TestReadsDoNotQueueBehindEachOther pins that the handle is a pool. With a
+// single connection, a query still holding its connection -- a backup's
+// VACUUM INTO, a large row being read -- made every other request wait for it.
+func TestReadsDoNotQueueBehindEachOther(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	// An open cursor keeps its connection until it is closed.
+	held, err := conn.Query(`SELECT name FROM sqlite_master`)
+	if err != nil {
+		t.Fatalf("hold a reader: %v", err)
+	}
+	defer held.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&n); err != nil {
+		t.Fatalf("second query while another holds a connection: %v", err)
+	}
+}
+
+// TestConcurrentTransactionsWaitForTheWriteLock pins _txlock=immediate. A
+// deferred transaction that reads and then writes upgrades its lock half-way,
+// and when another connection has written in between, SQLite fails it
+// immediately with SQLITE_BUSY instead of waiting -- busy_timeout does not
+// apply to that case. update_site's read-merge-write transaction is exactly
+// that shape.
+func TestConcurrentTransactionsWaitForTheWriteLock(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`INSERT INTO configs (key, value) VALUES ('n', '0')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const workers, rounds = 8, 25
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*rounds)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				errs <- func() error {
+					tx, err := conn.Begin()
+					if err != nil {
+						return err
+					}
+					defer tx.Rollback()
+					var v int
+					if err := tx.QueryRow(`SELECT CAST(value AS INTEGER) FROM configs WHERE key = 'n'`).Scan(&v); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(`UPDATE configs SET value = ? WHERE key = 'n'`, fmt.Sprint(v+1)); err != nil {
+						return err
+					}
+					return tx.Commit()
+				}()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("read-then-write transaction failed under contention: %v", err)
+		}
+	}
+
+	if got := rawText(t, conn, `SELECT value FROM configs WHERE key = 'n'`); got != fmt.Sprint(workers*rounds) {
+		t.Errorf("counter = %s, want %d: a transaction lost an update", got, workers*rounds)
 	}
 }

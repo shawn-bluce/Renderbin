@@ -485,6 +485,77 @@ func TestSiteViewCounting(t *testing.T) {
 	}
 }
 
+// TestSiteRevalidationSkipsArchive pins that a conditional request is answered
+// from the row's metadata, without loading the zip. Every asset of a site
+// revalidates on every visit (Cache-Control: no-cache), so loading a multi-MB
+// archive to answer each 304 was the bulk of a repeat visit's cost. The
+// stored archive is replaced with garbage behind the handler's back: a
+// request that loads it fails, so a 304 proves it was never read.
+func TestSiteRevalidationSkipsArchive(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+	s := e.uploadSite(t, cookie, "cached", demoSite())
+	e.publish(t, cookie, s.Slug)
+	base := "/res/" + s.Slug + "/" + s.AccessCode + "/"
+
+	first := e.raw(t, http.MethodGet, base+"css/site.css", nil, nil, nil)
+	first.Body.Close()
+	assertStatus(t, first, http.StatusOK)
+	lm := first.Header.Get("Last-Modified")
+
+	// Writing archive alone leaves updated_at as it was.
+	if _, err := e.conn.Exec(`UPDATE files SET archive = x'00' WHERE slug = ?`, s.Slug); err != nil {
+		t.Fatal(err)
+	}
+
+	ims := map[string]string{"If-Modified-Since": lm, "Sec-Fetch-Dest": "style"}
+	resp := e.raw(t, http.MethodGet, base+"css/site.css", nil, nil, ims)
+	resp.Body.Close()
+	assertStatus(t, resp, http.StatusNotModified)
+	h := resp.Header
+	if !strings.Contains(h.Get("Content-Security-Policy"), "sandbox") {
+		t.Errorf("304 without the sandbox CSP: %q", h.Get("Content-Security-Policy"))
+	}
+	if h.Get("Access-Control-Allow-Origin") != "*" || h.Get("Cache-Control") != "no-cache" {
+		t.Errorf("304 headers: ACAO %q, Cache-Control %q", h.Get("Access-Control-Allow-Origin"), h.Get("Cache-Control"))
+	}
+	if h.Get("Last-Modified") != lm {
+		t.Errorf("304 Last-Modified = %q, want %q", h.Get("Last-Modified"), lm)
+	}
+
+	// A revalidated page view still counts, as it did before.
+	before := e.fileRow(t, s.Slug).CodeSuccessCount
+	ims["Sec-Fetch-Dest"] = "document"
+	resp = e.raw(t, http.MethodGet, base, nil, nil, ims)
+	resp.Body.Close()
+	assertStatus(t, resp, http.StatusNotModified)
+	if got := e.fileRow(t, s.Slug).CodeSuccessCount - before; got != 1 {
+		t.Errorf("code_success_count moved by %d on a revalidated page view, want 1", got)
+	}
+
+	// Without the condition the archive is read -- and is garbage.
+	resp = e.raw(t, http.MethodGet, base+"css/site.css", nil, nil, nil)
+	resp.Body.Close()
+	assertStatus(t, resp, http.StatusInternalServerError)
+
+	// A site replaced since the browser's copy is served in full, with the
+	// new bytes and the new date.
+	later := time.Now().Add(time.Hour).UTC()
+	fresh := makeSiteZip(t, map[string]string{"index.html": "<p>new</p>", "css/site.css": "body{color:red}"})
+	if _, err := e.conn.Exec(`UPDATE files SET archive = ?, updated_at = ? WHERE slug = ?`, fresh, later, s.Slug); err != nil {
+		t.Fatal(err)
+	}
+	ims["Sec-Fetch-Dest"] = "style"
+	resp = e.raw(t, http.MethodGet, base+"css/site.css", nil, nil, ims)
+	assertStatus(t, resp, http.StatusOK)
+	if body := bodyString(t, resp); body != "body{color:red}" {
+		t.Errorf("replaced site served %q", body)
+	}
+	if got := resp.Header.Get("Last-Modified"); got != later.Format(http.TimeFormat) {
+		t.Errorf("Last-Modified = %q, want %q", got, later.Format(http.TimeFormat))
+	}
+}
+
 func TestSiteStorageAndEdits(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)

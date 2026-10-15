@@ -20,7 +20,7 @@ SET expires_at = NULL,
     expired_reason = '',
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type ClearFileExpiryParams struct {
@@ -35,7 +35,6 @@ func (q *Queries) ClearFileExpiry(ctx context.Context, arg ClearFileExpiryParams
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -53,6 +52,7 @@ func (q *Queries) ClearFileExpiry(ctx context.Context, arg ClearFileExpiryParams
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -71,7 +71,7 @@ VALUES (
     ?6,
     ?7
 )
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type CreateFileParams struct {
@@ -115,7 +115,6 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -133,6 +132,7 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -151,7 +151,7 @@ VALUES (
     ?5,
     ?6
 )
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type CreateSiteParams struct {
@@ -180,7 +180,6 @@ func (q *Queries) CreateSite(ctx context.Context, arg CreateSiteParams) (File, e
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -198,6 +197,7 @@ func (q *Queries) CreateSite(ctx context.Context, arg CreateSiteParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -253,7 +253,7 @@ func (q *Queries) ExpireFile(ctx context.Context, arg ExpireFileParams) error {
 
 const getFileBySlugAnyOwner = `-- name: GetFileBySlugAnyOwner :one
 
-SELECT files.id, files.slug, files.name, files.html_content, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.archive FROM files
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.html_content, files.archive FROM files
 JOIN users ON users.id = files.user_id
 WHERE files.slug = ? AND files.deleted_at IS NULL AND users.disabled_at IS NULL
 `
@@ -278,7 +278,6 @@ func (q *Queries) GetFileBySlugAnyOwner(ctx context.Context, slug string) (File,
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -296,13 +295,106 @@ func (q *Queries) GetFileBySlugAnyOwner(ctx context.Context, slug string) (File,
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
 }
 
+const getSiteArchive = `-- name: GetSiteArchive :one
+SELECT files.archive, files.updated_at FROM files
+JOIN users ON users.id = files.user_id
+WHERE files.id = ? AND files.kind = 'site'
+  AND files.deleted_at IS NULL AND users.disabled_at IS NULL
+`
+
+type GetSiteArchiveRow struct {
+	Archive   []byte    `json:"archive"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// updated_at comes back with the archive because it is the Last-Modified of
+// these exact bytes, should the site have been replaced between the halves.
+func (q *Queries) GetSiteArchive(ctx context.Context, id int64) (GetSiteArchiveRow, error) {
+	row := q.db.QueryRowContext(ctx, getSiteArchive, id)
+	var i GetSiteArchiveRow
+	err := row.Scan(&i.Archive, &i.UpdatedAt)
+	return i, err
+}
+
+const getSiteBySlugAnyOwner = `-- name: GetSiteBySlugAnyOwner :one
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code,
+       files.created_at, files.updated_at, files.deleted_at, files.success_count,
+       files.failure_count, files.tags, files.expires_at, files.max_views,
+       files.view_count, files.kind, files.code_success_count, files.user_id,
+       files.expired_at, files.expired_reason, files.content_size
+FROM files
+JOIN users ON users.id = files.user_id
+WHERE files.slug = ? AND files.kind = 'site'
+  AND files.deleted_at IS NULL AND users.disabled_at IS NULL
+`
+
+type GetSiteBySlugAnyOwnerRow struct {
+	ID               int64         `json:"id"`
+	Slug             string        `json:"slug"`
+	Name             string        `json:"name"`
+	IsPublic         bool          `json:"is_public"`
+	AccessCode       string        `json:"access_code"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
+	DeletedAt        sql.NullTime  `json:"deleted_at"`
+	SuccessCount     int64         `json:"success_count"`
+	FailureCount     int64         `json:"failure_count"`
+	Tags             string        `json:"tags"`
+	ExpiresAt        sql.NullTime  `json:"expires_at"`
+	MaxViews         sql.NullInt64 `json:"max_views"`
+	ViewCount        int64         `json:"view_count"`
+	Kind             string        `json:"kind"`
+	CodeSuccessCount int64         `json:"code_success_count"`
+	UserID           int64         `json:"user_id"`
+	ExpiredAt        sql.NullTime  `json:"expired_at"`
+	ExpiredReason    string        `json:"expired_reason"`
+	ContentSize      int64         `json:"content_size"`
+}
+
+// The site render path in two halves, so a request does not load the whole
+// archive before it knows it needs a byte of it. Every stylesheet, script and
+// image of a site is its own request, and with Cache-Control: no-cache each
+// one revalidates on every visit; answering those 304s used to read the full
+// zip each time. GetSiteBySlugAnyOwner carries everything access control and
+// the conditional check need (same columns as ListUserFiles, so the handler
+// converts it the same way); GetSiteArchive runs only when bytes are served.
+// Both keep the users join: suspension has to hold on either half.
+func (q *Queries) GetSiteBySlugAnyOwner(ctx context.Context, slug string) (GetSiteBySlugAnyOwnerRow, error) {
+	row := q.db.QueryRowContext(ctx, getSiteBySlugAnyOwner, slug)
+	var i GetSiteBySlugAnyOwnerRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.IsPublic,
+		&i.AccessCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.SuccessCount,
+		&i.FailureCount,
+		&i.Tags,
+		&i.ExpiresAt,
+		&i.MaxViews,
+		&i.ViewCount,
+		&i.Kind,
+		&i.CodeSuccessCount,
+		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
+	)
+	return i, err
+}
+
 const getUserFileBySlug = `-- name: GetUserFileBySlug :one
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive FROM files
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
 `
 
@@ -318,7 +410,6 @@ func (q *Queries) GetUserFileBySlug(ctx context.Context, arg GetUserFileBySlugPa
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -336,6 +427,7 @@ func (q *Queries) GetUserFileBySlug(ctx context.Context, arg GetUserFileBySlugPa
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -606,7 +698,7 @@ const refreshFileAccessCode = `-- name: RefreshFileAccessCode :one
 UPDATE files
 SET access_code = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type RefreshFileAccessCodeParams struct {
@@ -622,7 +714,6 @@ func (q *Queries) RefreshFileAccessCode(ctx context.Context, arg RefreshFileAcce
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -640,6 +731,7 @@ func (q *Queries) RefreshFileAccessCode(ctx context.Context, arg RefreshFileAcce
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -649,7 +741,7 @@ const renameFile = `-- name: RenameFile :one
 UPDATE files
 SET name = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type RenameFileParams struct {
@@ -665,7 +757,6 @@ func (q *Queries) RenameFile(ctx context.Context, arg RenameFileParams) (File, e
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -683,6 +774,7 @@ func (q *Queries) RenameFile(ctx context.Context, arg RenameFileParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -695,7 +787,7 @@ SET archive = ?1,
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
   AND kind = 'site'
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type ReplaceSiteArchiveParams struct {
@@ -711,7 +803,6 @@ func (q *Queries) ReplaceSiteArchive(ctx context.Context, arg ReplaceSiteArchive
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -729,6 +820,7 @@ func (q *Queries) ReplaceSiteArchive(ctx context.Context, arg ReplaceSiteArchive
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -738,7 +830,7 @@ const restoreFile = `-- name: RestoreFile :one
 UPDATE files
 SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type RestoreFileParams struct {
@@ -753,7 +845,6 @@ func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File,
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -771,6 +862,7 @@ func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File,
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -976,7 +1068,7 @@ SET is_public = 1,
     expired_reason = '',
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?3 AND user_id = ?4 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type SetFileExpiryParams struct {
@@ -1001,7 +1093,6 @@ func (q *Queries) SetFileExpiry(ctx context.Context, arg SetFileExpiryParams) (F
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -1019,6 +1110,7 @@ func (q *Queries) SetFileExpiry(ctx context.Context, arg SetFileExpiryParams) (F
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -1028,7 +1120,7 @@ const setFileTags = `-- name: SetFileTags :one
 UPDATE files
 SET tags = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type SetFileTagsParams struct {
@@ -1044,7 +1136,6 @@ func (q *Queries) SetFileTags(ctx context.Context, arg SetFileTagsParams) (File,
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -1062,6 +1153,7 @@ func (q *Queries) SetFileTags(ctx context.Context, arg SetFileTagsParams) (File,
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -1071,7 +1163,7 @@ const setFileVisibility = `-- name: SetFileVisibility :one
 UPDATE files
 SET is_public = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type SetFileVisibilityParams struct {
@@ -1087,7 +1179,6 @@ func (q *Queries) SetFileVisibility(ctx context.Context, arg SetFileVisibilityPa
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -1105,6 +1196,7 @@ func (q *Queries) SetFileVisibility(ctx context.Context, arg SetFileVisibilityPa
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -1157,7 +1249,7 @@ SET name = ?1,
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?5 AND user_id = ?6 AND deleted_at IS NULL
   AND kind <> 'site'
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type UpdateFileParams struct {
@@ -1191,7 +1283,6 @@ func (q *Queries) UpdateFile(ctx context.Context, arg UpdateFileParams) (File, e
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -1209,6 +1300,7 @@ func (q *Queries) UpdateFile(ctx context.Context, arg UpdateFileParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err
@@ -1222,7 +1314,7 @@ SET name = ?1,
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?4 AND user_id = ?5 AND deleted_at IS NULL
   AND kind = 'site'
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
 `
 
 type UpdateSiteMetaParams struct {
@@ -1248,7 +1340,6 @@ func (q *Queries) UpdateSiteMeta(ctx context.Context, arg UpdateSiteMetaParams) 
 		&i.ID,
 		&i.Slug,
 		&i.Name,
-		&i.HtmlContent,
 		&i.IsPublic,
 		&i.AccessCode,
 		&i.CreatedAt,
@@ -1266,6 +1357,7 @@ func (q *Queries) UpdateSiteMeta(ctx context.Context, arg UpdateSiteMetaParams) 
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.HtmlContent,
 		&i.Archive,
 	)
 	return i, err

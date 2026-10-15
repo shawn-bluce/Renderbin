@@ -8,6 +8,23 @@ Upgrades are `docker compose pull && docker compose up -d`. Database migrations
 are forward-only and apply themselves on start, so **take a backup before
 upgrading** (Settings → Backup) if you might want to go back.
 
+## Unreleased
+
+### Changed
+
+- **Faster with many or large files.** The file listing, trash, search and the
+  upload quota check no longer read every document from disk to answer: the
+  database stored file contents in the middle of each row, and reading any
+  column after it meant reading the content too (500 files of 1MB: the listing
+  went from 95ms to 0.6ms). Migration `0006` fixes the layout by rebuilding the
+  `files` table **once, on the first start after upgrading**, then compacts the
+  file so it does not stay twice its size -- about 5s for a 500MB database.
+  While it runs it needs free disk space of about twice the database's size.
+- Requests no longer queue behind each other on a single database connection:
+  downloading a backup, or a slow request, no longer stalls everyone else.
+- Revisiting a multi-page site is cheaper: unchanged stylesheets, scripts and
+  images are confirmed (304) without loading the site's archive.
+
 ## v0.4.0
 
 ### Changed

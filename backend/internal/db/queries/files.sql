@@ -276,6 +276,33 @@ SELECT files.* FROM files
 JOIN users ON users.id = files.user_id
 WHERE files.slug = ? AND files.deleted_at IS NULL AND users.disabled_at IS NULL;
 
+-- The site render path in two halves, so a request does not load the whole
+-- archive before it knows it needs a byte of it. Every stylesheet, script and
+-- image of a site is its own request, and with Cache-Control: no-cache each
+-- one revalidates on every visit; answering those 304s used to read the full
+-- zip each time. GetSiteBySlugAnyOwner carries everything access control and
+-- the conditional check need (same columns as ListUserFiles, so the handler
+-- converts it the same way); GetSiteArchive runs only when bytes are served.
+-- Both keep the users join: suspension has to hold on either half.
+-- name: GetSiteBySlugAnyOwner :one
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code,
+       files.created_at, files.updated_at, files.deleted_at, files.success_count,
+       files.failure_count, files.tags, files.expires_at, files.max_views,
+       files.view_count, files.kind, files.code_success_count, files.user_id,
+       files.expired_at, files.expired_reason, files.content_size
+FROM files
+JOIN users ON users.id = files.user_id
+WHERE files.slug = ? AND files.kind = 'site'
+  AND files.deleted_at IS NULL AND users.disabled_at IS NULL;
+
+-- updated_at comes back with the archive because it is the Last-Modified of
+-- these exact bytes, should the site have been replaced between the halves.
+-- name: GetSiteArchive :one
+SELECT files.archive, files.updated_at FROM files
+JOIN users ON users.id = files.user_id
+WHERE files.id = ? AND files.kind = 'site'
+  AND files.deleted_at IS NULL AND users.disabled_at IS NULL;
+
 -- name: IncrementFileSuccessCount :exec
 UPDATE files
 SET success_count = success_count + 1

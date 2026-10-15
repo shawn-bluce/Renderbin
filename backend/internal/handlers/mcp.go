@@ -723,10 +723,11 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, siteOutput{}, err
 	}
 
-	// Read, merge and write back in one transaction. The server runs a single
-	// database connection, so nothing else interleaves -- and every query in
-	// here must go through q, or it would wait forever for the connection
-	// this transaction holds.
+	// Read, merge and write back in one transaction. It is BEGIN IMMEDIATE
+	// (see db.Open), so it holds the write lock from the read onwards and no
+	// other write interleaves. Every query in here must go through q: one on
+	// m.queries runs on another connection, outside the transaction -- and a
+	// write there would wait on the lock this transaction holds.
 	tx, err := m.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, siteOutput{}, m.toolError("begin update site", err)

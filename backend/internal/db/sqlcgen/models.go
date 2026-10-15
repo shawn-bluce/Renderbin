@@ -18,7 +18,6 @@ type File struct {
 	ID               int64         `json:"id"`
 	Slug             string        `json:"slug"`
 	Name             string        `json:"name"`
-	HtmlContent      string        `json:"html_content"`
 	IsPublic         bool          `json:"is_public"`
 	AccessCode       string        `json:"access_code"`
 	CreatedAt        time.Time     `json:"created_at"`
@@ -36,6 +35,7 @@ type File struct {
 	ExpiredAt        sql.NullTime  `json:"expired_at"`
 	ExpiredReason    string        `json:"expired_reason"`
 	ContentSize      int64         `json:"content_size"`
+	HtmlContent      string        `json:"html_content"`
 	Archive          []byte        `json:"archive"`
 }
 
