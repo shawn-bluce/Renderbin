@@ -12,29 +12,36 @@ import (
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
-	"github.com/shawn-bluce/renderbin/backend/internal/db"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
 // Subcommands. Running the binary with no arguments starts the server, which is
 // what the container's ENTRYPOINT does and must keep doing.
 //
-// The only subcommand is the escape hatch for the one lockout the app cannot fix
+// reset-password is the escape hatch for the one lockout the app cannot fix
 // itself: the super admin (id=1) can reset anyone else's password from the
 // settings page, but nothing can reset *theirs*, and there is no email-based
 // recovery by design. Without this, that means editing the SQLite file by hand.
+// The data subcommands (backup, restore, fsck, migrate) are in datacmds.go.
 
 const usage = `renderbin — self-hosted sharing for HTML, Markdown and text files
 
 Usage:
   server                      Start the HTTP server (default)
   server reset-password ...   Set an account's password directly
+  server backup --out=FILE    Write a complete backup (.tar)
+  server restore --in=FILE    Replace all data with a backup
+  server fsck                 Check that every file's content is intact
+  server migrate --check      Show what starting this version would do
   server --help               Show this help
   server --version            Print the version
 
-Environment (server):
+Run a subcommand with -h for its details.
+
+Environment (server and subcommands):
   LISTEN_ADDR   Address to bind            (default ":8080")
   DB_PATH       SQLite database file       (default "data/app.db")
+  BLOB_DIR      File content directory     (default "blobs" beside DB_PATH)
 `
 
 const resetPasswordUsage = `server reset-password --user=NAME [--password=SECRET]
@@ -66,21 +73,29 @@ func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int,
 		fmt.Fprintln(stdout, buildinfo.Version)
 		return 0, true
 	case "reset-password":
-		err := resetPassword(args[1:], stdin, stdout, stderr)
-		// `reset-password -h` already printed its usage; asking for help is not
-		// a failure.
-		if errors.Is(err, flag.ErrHelp) {
-			return 0, true
-		}
-		if err != nil {
-			fmt.Fprintln(stderr, "error:", err)
-			return 1, true
-		}
-		return 0, true
+		return exitCode(resetPassword(args[1:], stdin, stdout, stderr), stderr), true
+	case "backup":
+		return exitCode(backupCmd(args[1:], stdout, stderr), stderr), true
+	case "restore":
+		return exitCode(restoreCmd(args[1:], stdout, stderr), stderr), true
+	case "fsck":
+		return exitCode(fsckCmd(args[1:], stdout, stderr), stderr), true
+	case "migrate":
+		return exitCode(migrateCmd(args[1:], stdout, stderr), stderr), true
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
 		return 2, true
 	}
+}
+
+// exitCode turns a subcommand's result into its exit status. `cmd -h` has
+// already printed its usage; asking for help is not a failure.
+func exitCode(err error, stderr io.Writer) int {
+	if err == nil || errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	fmt.Fprintln(stderr, "error:", err)
+	return 1
 }
 
 func resetPassword(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -111,10 +126,10 @@ func resetPassword(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 		return errors.New(msg)
 	}
 
-	dbPath := envOr("DB_PATH", defaultDBPath)
-	conn, err := db.Open(dbPath)
+	dbPath, _ := dataPaths()
+	conn, _, err := openData()
 	if err != nil {
-		return fmt.Errorf("open database %s: %w", dbPath, err)
+		return err
 	}
 	defer conn.Close()
 

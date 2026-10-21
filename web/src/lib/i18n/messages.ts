@@ -268,11 +268,11 @@ const en = {
 	'backup.title': 'Backup & restore',
 	'backup.download': 'Download a backup',
 	'backup.downloadHint':
-		'A single SQLite file containing everything: all accounts and all of their files.',
+		'A single .tar file containing everything: all accounts and all of their files. For a large instance, the server backup command does the same from the command line.',
 	'backup.downloadButton': 'Download',
 	'backup.restore': 'Restore from a backup',
 	'backup.restoreHint':
-		'Uploads a backup file and replaces the current database with it. A backup taken by an older version is upgraded as it is restored.',
+		'Uploads a backup (.tar, or a .db from an older version) and replaces all current data with it. A backup taken by an older version is upgraded as it is restored.',
 	'backup.chooseFile': 'Choose a file…',
 	'backup.restoreWarning':
 		'This replaces every account and every file with the contents of that backup. Anything created since it was taken is lost, and you will be signed out.',
@@ -350,7 +350,7 @@ const en = {
 	'accounts.deleteConfirm': 'Delete permanently',
 	'accounts.deleteBody': 'Delete {name} and all {n} of their files?',
 	'accounts.deleteWarning':
-		'The files are erased outright, not moved to a trash, and every link to them stops working. There is no undo. To block access reversibly, disable the account instead.',
+		'The files are erased outright, not moved to a trash: every link to them stops working at once, and their content is removed from disk within 24 hours. There is no undo. To block access reversibly, disable the account instead.',
 	'accounts.deleteDone': 'Deleted {name} and {n} files.',
 	'accounts.quotaEdit': 'Change the storage limit',
 	'accounts.quotaLabel': 'Storage limit',
@@ -631,11 +631,12 @@ const zh = {
 	'settings.sharing': '分享',
 	'backup.title': '备份与恢复',
 	'backup.download': '下载备份',
-	'backup.downloadHint': '一个 SQLite 文件，包含全部内容：所有账号及其所有文件。',
+	'backup.downloadHint':
+		'一个 .tar 文件，包含全部内容：所有账号及其所有文件。数据量大时，也可以用服务端的 backup 命令在命令行完成同样的备份。',
 	'backup.downloadButton': '下载',
 	'backup.restore': '从备份恢复',
 	'backup.restoreHint':
-		'上传一个备份文件，用它替换当前数据库。由旧版本导出的备份会在恢复过程中自动升级。',
+		'上传一个备份（.tar，或旧版本导出的 .db），用它替换当前全部数据。由旧版本导出的备份会在恢复过程中自动升级。',
 	'backup.chooseFile': '选择文件…',
 	'backup.restoreWarning':
 		'该操作会用备份中的内容替换所有账号与所有文件。备份之后新增的数据都会丢失，你也会被登出。',
@@ -710,7 +711,7 @@ const zh = {
 	'accounts.deleteConfirm': '永久删除',
 	'accounts.deleteBody': '删除 {name} 及其名下全部 {n} 个文件？',
 	'accounts.deleteWarning':
-		'这些文件会被直接抹除，不进回收站，所有指向它们的链接都会失效，且无法撤销。若只是想临时阻止访问，请改用禁用账号。',
+		'这些文件会被直接抹除，不进回收站：所有指向它们的链接立即失效，文件内容会在 24 小时内从磁盘上清除，且无法撤销。若只是想临时阻止访问，请改用禁用账号。',
 	'accounts.deleteDone': '已删除 {name} 及其 {n} 个文件。',
 	'accounts.quotaEdit': '修改存储上限',
 	'accounts.quotaLabel': '存储上限',

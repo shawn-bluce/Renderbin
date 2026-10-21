@@ -3,11 +3,14 @@ package db
 import (
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 )
 
 //go:embed migrations/*.sql
@@ -15,6 +18,11 @@ var migrationsFS embed.FS
 
 // Open opens the SQLite database at path, enables WAL mode, and applies
 // any pending migrations from internal/db/migrations in filename order.
+//
+// store is where file content lives (see internal/blobstore). The database
+// only names blobs, so it is meaningless without the store that goes with it,
+// and one migration (0009_extract_content) writes into it: an older database
+// still holding its content inline has that content moved out on open.
 //
 // The two time DSN parameters are load-bearing, not tuning. The driver's
 // default write format is Go's time.Time.String() -- local wall clock with the
@@ -43,7 +51,10 @@ var migrationsFS embed.FS
 // mid-way, and if another connection wrote in between SQLite fails it at once
 // with SQLITE_BUSY rather than waiting. BEGIN IMMEDIATE takes the write lock
 // up front and waits for it like any other write.
-func Open(path string) (*sql.DB, error) {
+func Open(path string, store *blobstore.Store) (*sql.DB, error) {
+	if store == nil {
+		return nil, errors.New("open database: no blob store")
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_txlock=immediate&_time_format=sqlite&_timezone=UTC", path)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -61,7 +72,7 @@ func Open(path string) (*sql.DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("enable WAL: %w", err)
 	}
-	applied, err := migrate(conn)
+	applied, err := migrate(conn, store)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -86,6 +97,9 @@ func Open(path string) (*sql.DB, error) {
 //
 // It only runs on a start that applied migrations, so an ordinary restart
 // never pays for it -- emptying the trash is not meant to trigger a rewrite.
+//
+// VACUUM's cost follows the live data, not the file: after 0010 dropped the
+// content columns of a 10GB database, it copies only the metadata left.
 func compactIfMostlyFree(conn *sql.DB) error {
 	var free, total int64
 	if err := conn.QueryRow(`SELECT freelist_count FROM pragma_freelist_count`).Scan(&free); err != nil {
@@ -101,8 +115,35 @@ func compactIfMostlyFree(conn *sql.DB) error {
 	return err
 }
 
+// goMigrations are the steps SQL cannot express, run in name order among the
+// SQL files and recorded in schema_migrations the same way. Unlike a SQL file,
+// a Go step is not wrapped in one transaction: it manages its own, and must be
+// safe to re-run after it was interrupted, since it is only recorded once it
+// has finished.
+var goMigrations = map[string]func(*sql.DB, *blobstore.Store) error{
+	"0009_extract_content": extractContent,
+}
+
+// migrationNames lists every migration, SQL files and Go steps, in the order
+// they apply.
+func migrationNames() ([]string, error) {
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries)+len(goMigrations))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	for name := range goMigrations {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 // migrate applies pending migrations and reports how many it applied.
-func migrate(conn *sql.DB) (int, error) {
+func migrate(conn *sql.DB, store *blobstore.Store) (int, error) {
 	if _, err := conn.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
 		filename TEXT PRIMARY KEY,
 		applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -110,15 +151,10 @@ func migrate(conn *sql.DB) (int, error) {
 		return 0, err
 	}
 
-	entries, err := migrationsFS.ReadDir("migrations")
+	names, err := migrationNames()
 	if err != nil {
 		return 0, err
 	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		names = append(names, e.Name())
-	}
-	sort.Strings(names)
 
 	applied := 0
 	for _, name := range names {
@@ -127,6 +163,17 @@ func migrate(conn *sql.DB) (int, error) {
 			return 0, err
 		}
 		if done > 0 {
+			continue
+		}
+
+		if step, ok := goMigrations[name]; ok {
+			if err := step(conn, store); err != nil {
+				return 0, fmt.Errorf("apply %s: %w", name, err)
+			}
+			if _, err := conn.Exec(`INSERT INTO schema_migrations (filename) VALUES (?)`, name); err != nil {
+				return 0, err
+			}
+			applied++
 			continue
 		}
 

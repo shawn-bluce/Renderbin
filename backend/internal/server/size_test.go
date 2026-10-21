@@ -57,7 +57,7 @@ func TestSizeIsConsistentAcrossEndpoints(t *testing.T) {
 
 	// A site's size is its stored (compressed) archive, on create and replace.
 	site := e.uploadSite(t, cookie, "s", map[string]string{"index.html": "<h1>" + strings.Repeat("a", 2000) + "</h1>"})
-	if want := archiveSize(e.fileRow(t, site.Slug)); site.Size != want {
+	if want := e.archiveSize(t, e.fileRow(t, site.Slug)); site.Size != want {
 		t.Errorf("site create size = %d, want %d", site.Size, want)
 	}
 }

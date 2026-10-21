@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"database/sql"
@@ -20,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/db"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/server"
@@ -68,6 +70,7 @@ type testEnv struct {
 	srv     *httptest.Server
 	queries *sqlcgen.Queries
 	conn    *sql.DB
+	blobs   *blobstore.Store
 	admin   sqlcgen.User
 	logs    *syncBuffer // everything the server logged
 }
@@ -76,17 +79,22 @@ type testEnv struct {
 // state the first-run /api/setup flow expects.
 func newBareEnv(t *testing.T) *testEnv {
 	t.Helper()
-	conn, err := db.Open(filepath.Join(t.TempDir(), "app.db"))
+	dir := t.TempDir()
+	blobs, err := blobstore.Open(filepath.Join(dir, "blobs"))
+	if err != nil {
+		t.Fatalf("blobstore.Open: %v", err)
+	}
+	conn, err := db.Open(filepath.Join(dir, "app.db"), blobs)
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
 
 	logs := &syncBuffer{}
-	srv := httptest.NewServer(server.New(conn, slog.New(slog.NewTextHandler(logs, nil))))
+	srv := httptest.NewServer(server.New(conn, blobs, slog.New(slog.NewTextHandler(logs, nil))))
 	t.Cleanup(srv.Close)
 
-	return &testEnv{srv: srv, queries: sqlcgen.New(conn), conn: conn, logs: logs}
+	return &testEnv{srv: srv, queries: sqlcgen.New(conn), conn: conn, blobs: blobs, logs: logs}
 }
 
 // newEnv additionally seeds the super admin (id=1, testUser/testPass), the
@@ -591,18 +599,44 @@ func TestVisibilityTagsRefresh(t *testing.T) {
 	}
 }
 
+// storeBlob writes content to the blob store and records it, as the handlers
+// do before they write a files row.
+func (e *testEnv) storeBlob(t *testing.T, content []byte) string {
+	t.Helper()
+	b, err := e.blobs.Put(content)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := e.queries.InsertBlob(context.Background(), sqlcgen.InsertBlobParams{
+		ID: b.ID, Size: b.Size, Sha256: b.SHA256,
+	}); err != nil {
+		t.Fatalf("InsertBlob: %v", err)
+	}
+	return b.ID
+}
+
+// content is what a file row's blob holds: a document's source, a site's zip.
+func (e *testEnv) content(t *testing.T, f sqlcgen.File) []byte {
+	t.Helper()
+	data, err := e.blobs.Read(f.BlobID)
+	if err != nil {
+		t.Fatalf("read content of %s: %v", f.Slug, err)
+	}
+	return data
+}
+
 // insertFile writes a file row directly, with the slug, access code and
 // visibility the API's Create (random slug, private) can't express.
 func (e *testEnv) insertFile(t *testing.T, slug, kind, source, code string, public bool) {
 	t.Helper()
 	if _, err := e.queries.CreateFile(context.Background(), sqlcgen.CreateFileParams{
-		Slug:        slug,
-		Name:        slug,
-		HtmlContent: source,
-		Kind:        kind,
-		IsPublic:    public,
-		AccessCode:  code,
-		UserID:      e.admin.ID,
+		Slug:       slug,
+		Name:       slug,
+		BlobID:     e.storeBlob(t, []byte(source)),
+		Kind:       kind,
+		IsPublic:   public,
+		AccessCode: code,
+		UserID:     e.admin.ID,
 	}); err != nil {
 		t.Fatalf("CreateFile(%s %s): %v", slug, kind, err)
 	}
@@ -841,17 +875,36 @@ func TestBackupDownload(t *testing.T) {
 	// Unauthenticated -> 401 (requireAuth middleware).
 	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/backup", "", nil)
 
-	// Authenticated -> 200, attachment, and a valid SQLite file.
+	// Authenticated -> 200, a .tar attachment: the database, then the content.
 	resp := e.do(t, http.MethodGet, "/api/backup", "", cookie)
 	assertStatus(t, resp, http.StatusOK)
-	if cd := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment;") {
+	if cd := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment;") || !strings.Contains(cd, ".tar") {
 		t.Errorf("Content-Disposition = %q", cd)
 	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-tar" {
+		t.Errorf("Content-Type = %q", ct)
+	}
 	// (A signed-in non-admin gets 403: see TestSuperAdminEndpointsRejectOrdinaryUsers.)
-	body := bodyString(t, resp)
-	// Every SQLite database file begins with this 16-byte magic header.
-	if !strings.HasPrefix(body, "SQLite format 3\x00") {
-		t.Errorf("backup body does not look like a SQLite database (first bytes: %q)", body[:min(16, len(body))])
+	tr := tar.NewReader(strings.NewReader(bodyString(t, resp)))
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("backup is not a tar: %v", err)
+		}
+		names = append(names, hdr.Name)
+		if hdr.Name == "renderbin.db" {
+			head := make([]byte, 16)
+			if _, err := io.ReadFull(tr, head); err != nil || string(head) != "SQLite format 3\x00" {
+				t.Errorf("renderbin.db does not look like a SQLite database (first bytes: %q)", head)
+			}
+		}
+	}
+	if len(names) != 2 || names[0] != "renderbin.db" || !strings.HasPrefix(names[1], "blobs/") {
+		t.Errorf("backup entries = %v, want renderbin.db and the document's blob", names)
 	}
 }
 
@@ -925,6 +978,8 @@ func TestRestoreRejections(t *testing.T) {
 	}{
 		{"not a database", []byte("just some notes, not a database at all"), http.StatusBadRequest},
 		{"empty upload", nil, http.StatusBadRequest},
+		// A download cut short: the database arrived, the content did not.
+		{"truncated backup", snapshot[:len(snapshot)/2], http.StatusBadRequest},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			resp := e.restore(t, c.body, cookie)
@@ -1736,8 +1791,8 @@ func TestMCPUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFileBySlugAnyOwner after update: %v", err)
 	}
-	if after.Name != "新标题" || after.HtmlContent != "# v2" {
-		t.Errorf("update result = %q %q", after.Name, after.HtmlContent)
+	if content := string(e.content(t, after)); after.Name != "新标题" || content != "# v2" {
+		t.Errorf("update result = %q %q", after.Name, content)
 	}
 	if after.Slug != before.Slug || after.AccessCode != before.AccessCode || after.Kind != before.Kind {
 		t.Error("update must not change slug, access code, or kind")
@@ -1788,7 +1843,7 @@ func TestMCPOwnershipIsolation(t *testing.T) {
 	// A second user owns a file; the admin's key must not see or touch it.
 	other, _ := e.newUser(t, "other")
 	theirs, err := e.queries.CreateFile(context.Background(), sqlcgen.CreateFileParams{
-		Slug: "their-doc", Name: "机密文档", HtmlContent: "<p>secret</p>", Kind: "html",
+		Slug: "their-doc", Name: "机密文档", BlobID: e.storeBlob(t, []byte("<p>secret</p>")), Kind: "html",
 		AccessCode: "code1234", UserID: other.ID,
 	})
 	if err != nil {
@@ -1922,8 +1977,8 @@ func (e *testEnv) fingerprint(t *testing.T, slug string) string {
 	if err != nil {
 		t.Fatalf("fingerprint %q: %v", slug, err)
 	}
-	return fmt.Sprintf("name=%q content=%q archive=%x public=%v code=%q tags=%q expires=%v maxviews=%v",
-		f.Name, f.HtmlContent, f.Archive, f.IsPublic, f.AccessCode, f.Tags, f.ExpiresAt.Valid, f.MaxViews.Valid)
+	return fmt.Sprintf("name=%q blob=%s content=%q public=%v code=%q tags=%q expires=%v maxviews=%v",
+		f.Name, f.BlobID, e.content(t, f), f.IsPublic, f.AccessCode, f.Tags, f.ExpiresAt.Valid, f.MaxViews.Valid)
 }
 
 // trashFingerprint is fingerprint for a soft-deleted file, which
@@ -1938,17 +1993,10 @@ func (e *testEnv) trashFingerprint(t *testing.T, ownerID int64, slug string) str
 		if f.Slug != slug {
 			continue
 		}
-		// The trash listing deliberately doesn't carry html_content (no query
-		// reachable from a listing does), so read it directly -- the point of
-		// this fingerprint is that the content is untouched.
-		var content string
-		if err := e.conn.QueryRow(
-			`SELECT html_content FROM files WHERE slug = ? AND user_id = ?`,
-			slug, ownerID).Scan(&content); err != nil {
-			t.Fatalf("read trashed content: %v", err)
-		}
-		return fmt.Sprintf("name=%q content=%q public=%v code=%q tags=%q",
-			f.Name, content, f.IsPublic, f.AccessCode, f.Tags)
+		// The point of this fingerprint is that the content is untouched: the
+		// same blob, holding the same bytes.
+		return fmt.Sprintf("name=%q blob=%s content=%q public=%v code=%q tags=%q",
+			f.Name, f.BlobID, e.content(t, f), f.IsPublic, f.AccessCode, f.Tags)
 	}
 	t.Fatalf("file %q is no longer in user %d's trash", slug, ownerID)
 	return ""
@@ -2037,7 +2085,7 @@ func TestFileEndpointsCoverAllRoutes(t *testing.T) {
 	}
 
 	seen := 0
-	err := chi.Walk(server.New(nil, slog.New(slog.NewTextHandler(io.Discard, nil))).(*chi.Mux),
+	err := chi.Walk(server.New(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).(*chi.Mux),
 		func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 			route = strings.TrimSuffix(route, "/")
 			if !isFileRoute(route) {

@@ -13,12 +13,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/handlers"
 	"github.com/shawn-bluce/renderbin/backend/internal/web"
 )
 
-func New(conn *sql.DB, logger *slog.Logger) http.Handler {
+// New builds the whole HTTP surface over a database and the blob store that
+// holds its files' content.
+func New(conn *sql.DB, blobs *blobstore.Store, logger *slog.Logger) http.Handler {
 	queries := sqlcgen.New(conn)
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
@@ -28,8 +31,8 @@ func New(conn *sql.DB, logger *slog.Logger) http.Handler {
 	authH := handlers.NewAuthHandler(queries, logger)
 	setupH := handlers.NewSetupHandler(queries, authH, logger)
 	settingsH := handlers.NewSettingsHandler(queries, logger)
-	files := handlers.NewFilesHandler(queries, logger)
-	backupH := handlers.NewBackupHandler(conn, logger)
+	files := handlers.NewFilesHandler(queries, blobs, logger)
+	backupH := handlers.NewBackupHandler(conn, blobs, logger)
 	adminH := handlers.NewAdminHandler(queries, conn, logger)
 
 	r.Route("/api", func(r chi.Router) {
@@ -113,7 +116,7 @@ func New(conn *sql.DB, logger *slog.Logger) http.Handler {
 
 	// MCP endpoint: its own Bearer-token (API key) auth + mcp_enabled gate,
 	// deliberately outside /api and the session-cookie requireAuth.
-	r.Handle("/mcp", handlers.NewMCPHandler(queries, conn, logger))
+	r.Handle("/mcp", handlers.NewMCPHandler(queries, blobs, conn, logger))
 
 	r.NotFound(spaHandler(web.FS()))
 

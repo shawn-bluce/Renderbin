@@ -132,35 +132,6 @@ func TestSlugPatternAndPathToken(t *testing.T) {
 	}
 }
 
-// sqlWindow reproduces, in Go, exactly what SearchUserFilesWithContent's
-// instr()/substr() pair extracts, so the cases below exercise
-// snippetFromWindow against the shape it really receives instead of a
-// convenient one. SQLite counts characters (not bytes) in both functions and
-// instr() is 1-based, which is what makes the CJK case below meaningful.
-// TestSearchReturnsContentSnippets in internal/server covers the SQL half for
-// real, against a live database.
-func sqlWindow(content, query string) (window string, matchPos, contentChars int64) {
-	full := []rune(content)
-	lowered := []rune(strings.ToLower(content))
-	needle := []rune(strings.ToLower(query))
-
-	pos := -1
-	for i := 0; i+len(needle) <= len(lowered); i++ {
-		if string(lowered[i:i+len(needle)]) == string(needle) {
-			pos = i
-			break
-		}
-	}
-	if pos < 0 {
-		return "", 0, int64(len(full))
-	}
-
-	matchPos = int64(pos + 1)
-	start := max(int64(1), matchPos-100)
-	end := min(int(start-1)+len(needle)+200, len(full))
-	return string(full[start-1 : end]), matchPos, int64(len(full))
-}
-
 func TestSnippetFromWindow(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -193,7 +164,7 @@ func TestSnippetFromWindow(t *testing.T) {
 			want:    "…" + strings.Repeat("汉", 100) + "目标" + strings.Repeat("字", 100) + "…",
 		},
 		{
-			// The window SQL hands over is longer than we want here, because
+			// The window contentWindow hands over is longer than we want here, because
 			// its fixed length was budgeted for 100 runes of lead-in that do
 			// not exist. The trailing context still has to come out at 100.
 			name:    "a match at the start has no leading ellipsis",
@@ -211,12 +182,37 @@ func TestSnippetFromWindow(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			window, matchPos, contentChars := sqlWindow(c.content, c.query)
+			window, matchPos, contentChars := contentWindow(c.content, asciiLower(c.query), c.query)
 			got := snippetFromWindow(window, c.query, matchPos, contentChars)
 			if got != c.want {
 				t.Errorf("snippetFromWindow() = %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// contentWindow replaced a SQL instr()/substr() pair, and keeps its rules so
+// search results did not change: case folding for ASCII only (SQLite's
+// lower()), positions counted in characters.
+func TestContentWindowMatchesTheOldSQL(t *testing.T) {
+	for _, c := range []struct {
+		content, query string
+		pos            int64
+	}{
+		{"Hello World", "world", 7},
+		{"hello world", "WORLD", 7},
+		{"汉字 Needle", "needle", 4}, // characters, not bytes
+		{"Ärger", "ä", 0},          // non-ASCII is not folded
+		{"Ärger", "Ä", 1},
+		{"abc", "abcd", 0},
+	} {
+		_, pos, chars := contentWindow(c.content, asciiLower(c.query), c.query)
+		if pos != c.pos {
+			t.Errorf("contentWindow(%q, %q) matched at %d, want %d", c.content, c.query, pos, c.pos)
+		}
+		if want := int64(len([]rune(c.content))); chars != want {
+			t.Errorf("contentWindow(%q) counted %d characters, want %d", c.content, chars, want)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/site"
 )
@@ -184,16 +187,15 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	}
 	tok, sub, hasSlash := strings.Cut(rest, "/")
 
-	// Metadata only: the archive is fetched below, once a response actually
+	// The row only: the archive is opened below, once a response actually
 	// needs its bytes.
-	row, err := h.queries.GetSiteBySlugAnyOwner(r.Context(), slug)
+	file, err := h.queries.GetSiteBySlugAnyOwner(r.Context(), slug)
 	if err != nil {
 		// A miss is deliberately without setUserContentHeaders: nothing
 		// user-authored is served, and the app's own X-Frame-Options: DENY stays on.
 		queryError(w, h.logger, "get site", err)
 		return
 	}
-	file := listRowToFile(sqlcgen.ListUserFilesRow(row))
 
 	entry := sub
 	if entry == "" || strings.HasSuffix(entry, "/") {
@@ -229,7 +231,7 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 	// The archive cannot have changed since the browser cached this entry
 	// (updated_at moves on every replacement), so neither the bytes nor
 	// whether the entry exists can differ from what it already holds: answer
-	// without loading the zip. A page view still counts, as it did when
+	// without opening the zip. A page view still counts, as it did when
 	// ServeContent made the same decision after the load.
 	if notModifiedSince(r, file.UpdatedAt) {
 		if doc {
@@ -243,13 +245,17 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stored, err := h.queries.GetSiteArchive(r.Context(), file.ID)
+	// Read through the blob on disk: the central directory and this one
+	// entry, not the whole zip. The blob is the one this row named, and an
+	// archive that has since been replaced is still on disk for the
+	// collector's grace period, so the row and the bytes agree.
+	blob, err := h.blobs.Open(file.BlobID)
 	if err != nil {
-		// Deleted or suspended between the two queries.
-		queryError(w, h.logger, "get site archive", err)
+		serverError(w, h.logger, "open site archive", err, "slug", file.Slug)
 		return
 	}
-	arc, err := site.Open(stored.Archive)
+	defer blob.Close()
+	arc, err := openSiteBlob(blob)
 	if err != nil {
 		serverError(w, h.logger, "open site archive", err, "slug", file.Slug)
 		return
@@ -285,7 +291,30 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 
 	setSiteHeaders(w, contentType)
 	varyOnDest(w, entry)
-	http.ServeContent(w, r, "", stored.UpdatedAt, bytes.NewReader(data))
+	http.ServeContent(w, r, "", file.UpdatedAt, bytes.NewReader(data))
+}
+
+// openSiteBlob reads a site's zip through its open blob file.
+func openSiteBlob(blob *os.File) (*site.Archive, error) {
+	info, err := blob.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return site.Open(blob, info.Size())
+}
+
+// siteEntries lists what a site holds, from its zip's central directory.
+func (h *FilesHandler) siteEntries(file sqlcgen.File) ([]site.EntryInfo, error) {
+	blob, err := h.blobs.Open(file.BlobID)
+	if err != nil {
+		return nil, err
+	}
+	defer blob.Close()
+	arc, err := openSiteBlob(blob)
+	if err != nil {
+		return nil, err
+	}
+	return arc.List(), nil
 }
 
 // setSiteHeaders sets what every served site entry carries, a 304 included.
@@ -365,7 +394,7 @@ func siteName(requested string, entries []site.Entry) (string, error) {
 // storeNewSite packs normalized entries and creates the site row, after the
 // quota check. Shared by POST /api/sites and MCP upload_site. Errors wrapping
 // errOverQuota are for the caller; anything else is internal.
-func storeNewSite(ctx context.Context, queries *sqlcgen.Queries, user sqlcgen.User, name string, entries []site.Entry, isPublic bool) (sqlcgen.File, error) {
+func storeNewSite(ctx context.Context, queries *sqlcgen.Queries, store *blobstore.Store, user sqlcgen.User, name string, entries []site.Entry, isPublic bool) (sqlcgen.File, error) {
 	archive, err := site.Pack(entries)
 	if err != nil {
 		return sqlcgen.File{}, fmt.Errorf("pack site: %w", err)
@@ -377,11 +406,15 @@ func storeNewSite(ctx context.Context, queries *sqlcgen.Queries, user sqlcgen.Us
 	if err != nil {
 		return sqlcgen.File{}, fmt.Errorf("generate access code: %w", err)
 	}
+	blobID, err := storeContent(ctx, queries, store, archive)
+	if err != nil {
+		return sqlcgen.File{}, err
+	}
 	return withFreshSlug(func(slug string) (sqlcgen.File, error) {
 		return queries.CreateSite(ctx, sqlcgen.CreateSiteParams{
 			Slug:       slug,
 			Name:       name,
-			Archive:    archive,
+			BlobID:     blobID,
 			IsPublic:   isPublic,
 			AccessCode: accessCode,
 			UserID:     user.ID,
@@ -414,6 +447,13 @@ func readSiteUpload(w http.ResponseWriter, r *http.Request) ([]site.Entry, bool)
 	return entries, true
 }
 
+// siteStillThere tells "replaced meanwhile" (409) from "deleted meanwhile"
+// (404) after ReplaceSiteBlob's compare-and-swap matched no row.
+func (h *FilesHandler) siteStillThere(r *http.Request, user sqlcgen.User, slug string) bool {
+	_, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{Slug: slug, UserID: user.ID})
+	return err == nil
+}
+
 func writeSiteError(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
 	if site.IsTooLarge(err) {
@@ -442,7 +482,7 @@ func (h *FilesHandler) CreateSite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Same default-visibility policy as a document upload over HTTP.
-	file, err := storeNewSite(r.Context(), h.queries, user, name, entries,
+	file, err := storeNewSite(r.Context(), h.queries, h.blobs, user, name, entries,
 		configBool(r.Context(), h.queries, ConfigUploadDefaultPublic))
 	if err != nil {
 		if errors.Is(err, errOverQuota) {
@@ -489,12 +529,22 @@ func (h *FilesHandler) ReplaceSite(w http.ResponseWriter, r *http.Request) {
 	if !h.checkQuota(w, r, user, int64(len(archive)), old.ContentSize) {
 		return
 	}
+	blobID, err := storeContent(r.Context(), h.queries, h.blobs, archive)
+	if err != nil {
+		serverError(w, h.logger, "replace site", err)
+		return
+	}
 
-	file, err := h.queries.ReplaceSiteArchive(r.Context(), sqlcgen.ReplaceSiteArchiveParams{
-		Archive: archive,
-		Slug:    slug,
-		UserID:  user.ID,
+	file, err := h.queries.ReplaceSiteBlob(r.Context(), sqlcgen.ReplaceSiteBlobParams{
+		BlobID:    blobID,
+		Slug:      slug,
+		UserID:    user.ID,
+		OldBlobID: old.BlobID,
 	})
+	if errors.Is(err, sql.ErrNoRows) && h.siteStillThere(r, user, slug) {
+		http.Error(w, "the site was changed while this upload was processed; reload it and try again", http.StatusConflict)
+		return
+	}
 	if err != nil {
 		queryError(w, h.logger, "replace site", err)
 		return

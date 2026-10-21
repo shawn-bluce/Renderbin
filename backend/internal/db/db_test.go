@@ -1,33 +1,41 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 )
 
 // TestOpenRunsAllMigrations also covers re-opening: a second Open of the same
 // file must not re-apply anything.
 func TestOpenRunsAllMigrations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.db")
-	conn, err := Open(path)
+	store := testStore(t)
+	conn, err := Open(path, store)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer conn.Close()
 
-	// schema_migrations should record exactly one row per embedded migration file.
-	entries, err := migrationsFS.ReadDir("migrations")
+	// schema_migrations should record exactly one row per migration: every
+	// embedded file plus every Go step.
+	names, err := migrationNames()
 	if err != nil {
-		t.Fatalf("read migrations dir: %v", err)
+		t.Fatalf("list migrations: %v", err)
 	}
-	want := len(entries)
+	want := len(names)
 	if want == 0 {
-		t.Fatal("no migration files embedded")
+		t.Fatal("no migrations")
 	}
 
 	var got int
@@ -39,8 +47,11 @@ func TestOpenRunsAllMigrations(t *testing.T) {
 	}
 
 	// Every column the schema declares must exist and be queryable.
+	if _, err := conn.Exec(`INSERT INTO blobs (id, size, sha256) VALUES ('b', 8, 'x')`); err != nil {
+		t.Fatalf("insert blob: %v", err)
+	}
 	if _, err := conn.Exec(
-		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('s', 'n', '<p>h</p>', 'code', 1)`,
+		`INSERT INTO files (slug, name, blob_id, content_size, access_code, user_id) VALUES ('s', 'n', 'b', 8, 'code', 1)`,
 	); err != nil {
 		t.Fatalf("insert file: %v", err)
 	}
@@ -63,7 +74,7 @@ func TestOpenRunsAllMigrations(t *testing.T) {
 
 	// Re-opening the same file must not re-apply migrations or error.
 	conn.Close()
-	again, err := Open(path)
+	again, err := Open(path, store)
 	if err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
@@ -97,11 +108,7 @@ func rawText(t *testing.T, conn *sql.DB, query string, args ...any) string {
 // which shares no format with the CURRENT_TIMESTAMP columns next to it and made
 // every SQL comparison between the two a lexicographic accident.
 func TestTimestampsStoredAsComparableUTC(t *testing.T) {
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer conn.Close()
+	conn := openTest(t)
 
 	// A fixed instant in a non-UTC zone: if the write path ignored the zone,
 	// the stored text would be the local wall clock instead.
@@ -212,7 +219,7 @@ func TestMigrationRewritesLegacyTimestamps(t *testing.T) {
 		t.Fatalf("insert file without expiry: %v", err)
 	}
 
-	if _, err := migrate(conn); err != nil {
+	if _, err := migrate(conn, testStore(t)); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -311,7 +318,7 @@ func TestMigrationBackfillsContentSize(t *testing.T) {
 	legacy.Close()
 
 	// Reopening is the upgrade: db.Open runs whatever has not been recorded.
-	conn, err := Open(path)
+	conn, err := Open(path, testStore(t))
 	if err != nil {
 		t.Fatalf("Open (upgrade): %v", err)
 	}
@@ -339,156 +346,132 @@ func TestMigrationBackfillsContentSize(t *testing.T) {
 	}
 }
 
-// TestContentSizeIsSelfCorrecting pins the triggers that keep files.content_size
-// honest regardless of which binary wrote the row.
-//
-// The realistic way to get a wrong value is a downgrade: an older image runs
-// happily against an upgraded database (sqlc expands SELECT * into explicit
-// column names at generation time, so columns added later are simply ignored),
-// but its INSERT does not name content_size and takes the DEFAULT 0. Rolling
-// forward again would not repair those rows, because migration 0003 is already
-// recorded and its backfill never runs twice -- leaving files that report zero
-// bytes and count nothing against their owner's quota.
-func TestContentSizeIsSelfCorrecting(t *testing.T) {
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer conn.Close()
-
-	// Exactly what an older binary's INSERT looks like: no content_size.
-	const content = "汉字内容" // 12 bytes, 4 characters
-	if _, err := conn.Exec(
-		`INSERT INTO files (slug, name, html_content, access_code, user_id)
-		 VALUES ('legacy', 'n', ?, 'code', 1)`, content,
-	); err != nil {
-		t.Fatalf("insert without content_size: %v", err)
-	}
-
-	var size int64
-	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'legacy'`).Scan(&size); err != nil {
-		t.Fatalf("read content_size: %v", err)
-	}
-	if size != int64(len(content)) {
-		t.Errorf("content_size = %d after an insert that omitted it, want %d bytes", size, len(content))
-	}
-
-	// The same for an update that rewrites the content without the size.
-	const longer = "a much longer body than before"
-	if _, err := conn.Exec(
-		`UPDATE files SET html_content = ? WHERE slug = 'legacy'`, longer,
-	); err != nil {
-		t.Fatalf("update without content_size: %v", err)
-	}
-	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'legacy'`).Scan(&size); err != nil {
-		t.Fatalf("read content_size: %v", err)
-	}
-	if size != int64(len(longer)) {
-		t.Errorf("content_size = %d after an update that omitted it, want %d", size, len(longer))
-	}
-
-	// A counter bump must not be treated as a content change -- /res/{slug}
-	// issues one on every request, and AFTER UPDATE OF html_content is what
-	// keeps those off the trigger. Prove it by planting a wrong size (writing
-	// content_size itself does not fire the trigger either): a bump must leave
-	// it alone, and only a content write puts it right again.
-	if _, err := conn.Exec(`UPDATE files SET content_size = 999 WHERE slug = 'legacy'`); err != nil {
-		t.Fatalf("plant a wrong size: %v", err)
-	}
-	if _, err := conn.Exec(
-		`UPDATE files SET success_count = success_count + 1 WHERE slug = 'legacy'`,
-	); err != nil {
-		t.Fatalf("bump counter: %v", err)
-	}
-	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'legacy'`).Scan(&size); err != nil {
-		t.Fatalf("read content_size: %v", err)
-	}
-	if size != 999 {
-		t.Errorf("content_size = %d after a counter bump, want the planted 999: the content trigger fired", size)
-	}
-	if _, err := conn.Exec(`UPDATE files SET html_content = ? WHERE slug = 'legacy'`, longer); err != nil {
-		t.Fatalf("rewrite content: %v", err)
-	}
-	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'legacy'`).Scan(&size); err != nil {
-		t.Fatalf("read content_size: %v", err)
-	}
-	if size != int64(len(longer)) {
-		t.Errorf("content_size = %d after a content write, want %d", size, len(longer))
+// insertBlobRow records a blob of the given size directly, for tests of the
+// files triggers that need no bytes on disk.
+func insertBlobRow(t *testing.T, conn *sql.DB, id string, size int) {
+	t.Helper()
+	if _, err := conn.Exec(`INSERT INTO blobs (id, size, sha256, orphaned_at) VALUES (?, ?, 'x', CURRENT_TIMESTAMP)`, id, size); err != nil {
+		t.Fatalf("insert blob %s: %v", id, err)
 	}
 }
 
-// TestContentSizeCountsSiteArchive pins migration 0004's rebuilt triggers: for
-// a site the size is html_content plus the stored zip, on insert and on update
-// of either column. Restore inserts rows with their size already set, so a
-// trigger that only knew html_content would zero every site's size.
-func TestContentSizeCountsSiteArchive(t *testing.T) {
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer conn.Close()
+// TestContentSizeMustMatchBlob pins 0010's check triggers, the replacement for
+// the old guarantee that content_size was computed from the content in the
+// same statement. A row whose size disagrees with its blob, or whose blob has
+// no record, is refused outright -- including the inserts a backup restore
+// does, so a tampered snapshot cannot plant a size the quota would trust.
+func TestContentSizeMustMatchBlob(t *testing.T) {
+	conn := openTest(t)
+	insertBlobRow(t, conn, "five", 5)
+	insertBlobRow(t, conn, "ten", 10)
 
-	sizeOf := func() int64 {
+	insert := func(slug, blob string, size int) error {
+		_, err := conn.Exec(`INSERT INTO files (slug, name, blob_id, content_size, access_code, user_id)
+			VALUES (?, 'n', ?, ?, 'code', 1)`, slug, blob, size)
+		return err
+	}
+	if err := insert("wrong-size", "five", 4); err == nil {
+		t.Error("a row claiming 4 bytes of a 5-byte blob was accepted")
+	}
+	if err := insert("no-blob", "missing", 0); err == nil {
+		t.Error("a row naming a blob with no record was accepted")
+	}
+	if err := insert("ok", "five", 5); err != nil {
+		t.Fatalf("a correct row was refused: %v", err)
+	}
+
+	if _, err := conn.Exec(`UPDATE files SET blob_id = 'ten' WHERE slug = 'ok'`); err == nil {
+		t.Error("swapping the blob without its size was accepted")
+	}
+	if _, err := conn.Exec(`UPDATE files SET content_size = 999 WHERE slug = 'ok'`); err == nil {
+		t.Error("planting a size by hand was accepted")
+	}
+	if _, err := conn.Exec(`UPDATE files SET blob_id = 'ten', content_size = 10 WHERE slug = 'ok'`); err != nil {
+		t.Errorf("a consistent swap was refused: %v", err)
+	}
+	// /res bumps a counter on every request; that must not trip the check.
+	if _, err := conn.Exec(`UPDATE files SET success_count = success_count + 1 WHERE slug = 'ok'`); err != nil {
+		t.Errorf("a counter bump was refused: %v", err)
+	}
+	// A blob belongs to one row.
+	if err := insert("shared", "ten", 10); err == nil {
+		t.Error("a second row sharing a blob was accepted")
+	}
+}
+
+// TestBlobReferenceTracking pins the triggers the collector relies on: a blob
+// is orphaned exactly when the last row lets go of it, and only then.
+func TestBlobReferenceTracking(t *testing.T) {
+	conn := openTest(t)
+	orphaned := func(id string) bool {
 		t.Helper()
-		var n int64
-		if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'site'`).Scan(&n); err != nil {
-			t.Fatalf("read content_size: %v", err)
+		var n int
+		if err := conn.QueryRow(`SELECT orphaned_at IS NOT NULL FROM blobs WHERE id = ?`, id).Scan(&n); err != nil {
+			t.Fatalf("read blob %s: %v", id, err)
 		}
-		return n
+		return n == 1
 	}
 
-	if _, err := conn.Exec(
-		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind, archive)
-		 VALUES ('site', 'n', '', 'code', 1, 'site', ?)`, []byte("12345"),
-	); err != nil {
-		t.Fatalf("insert site: %v", err)
+	insertBlobRow(t, conn, "v1", 2)
+	insertBlobRow(t, conn, "v2", 3)
+	if !orphaned("v1") {
+		t.Fatal("a new blob should start orphaned until a row adopts it")
 	}
-	if got := sizeOf(); got != 5 {
-		t.Errorf("content_size = %d for a 5-byte archive and no html, want 5", got)
+	if _, err := conn.Exec(`INSERT INTO files (slug, name, blob_id, content_size, access_code, user_id)
+		VALUES ('f', 'n', 'v1', 2, 'code', 1)`); err != nil {
+		t.Fatal(err)
 	}
-
-	if _, err := conn.Exec(`UPDATE files SET archive = ? WHERE slug = 'site'`, []byte("1234567890")); err != nil {
-		t.Fatalf("replace archive: %v", err)
-	}
-	if got := sizeOf(); got != 10 {
-		t.Errorf("content_size = %d after replacing the archive with 10 bytes, want 10", got)
+	if orphaned("v1") {
+		t.Error("an inserted row did not adopt its blob")
 	}
 
-	// Both columns count: html bytes (not characters) plus archive bytes.
-	if _, err := conn.Exec(`UPDATE files SET html_content = ? WHERE slug = 'site'`, "汉"); err != nil {
-		t.Fatalf("set html: %v", err)
+	// An edit swaps blobs: the new one is adopted, the old one let go.
+	if _, err := conn.Exec(`UPDATE files SET blob_id = 'v2', content_size = 3 WHERE slug = 'f'`); err != nil {
+		t.Fatal(err)
 	}
-	if got := sizeOf(); got != 13 {
-		t.Errorf("content_size = %d for 3 html bytes + 10 archive bytes, want 13", got)
+	if orphaned("v2") || !orphaned("v1") {
+		t.Errorf("after an edit: v1 orphaned=%v (want true), v2 orphaned=%v (want false)", orphaned("v1"), orphaned("v2"))
 	}
 
-	// A restore-style insert that already carries a size the triggers disagree
-	// with is corrected rather than trusted.
-	if _, err := conn.Exec(
-		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind, archive, content_size)
-		 VALUES ('restored', 'n', '', 'code2', 1, 'site', ?, 0)`, []byte("abc"),
-	); err != nil {
-		t.Fatalf("insert restored site: %v", err)
+	// The trash keeps its content: soft delete is an UPDATE of deleted_at.
+	if _, err := conn.Exec(`UPDATE files SET deleted_at = CURRENT_TIMESTAMP WHERE slug = 'f'`); err != nil {
+		t.Fatal(err)
 	}
-	var n int64
-	if err := conn.QueryRow(`SELECT content_size FROM files WHERE slug = 'restored'`).Scan(&n); err != nil {
-		t.Fatalf("read restored size: %v", err)
+	if orphaned("v2") {
+		t.Error("moving a file to the trash orphaned its content")
 	}
-	if n != 3 {
-		t.Errorf("restored site content_size = %d, want 3", n)
+
+	if _, err := conn.Exec(`DELETE FROM files WHERE slug = 'f'`); err != nil {
+		t.Fatal(err)
+	}
+	if !orphaned("v2") {
+		t.Error("deleting the row did not orphan its blob")
 	}
 }
 
-// TestMigrationMovesContentLast covers migration 0006, which rebuilds files
-// with html_content and archive as its last two columns. A table rebuild is
-// the one kind of migration that can lose data silently, so this checks that
-// every column of every row survives, and that the id counter does too.
-func TestMigrationMovesContentLast(t *testing.T) {
+// stageLegacyContent builds a database in the state the last release before
+// blob storage left it, holding the given rows, and returns its path.
+func stageLegacyContent(t *testing.T, stmts ...string) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.db")
 	legacy := openRaw(t, path)
-	applyMigrationsBefore(t, legacy, "0006")
+	applyMigrationsBefore(t, legacy, "0008")
+	for _, stmt := range stmts {
+		if _, err := legacy.Exec(stmt); err != nil {
+			t.Fatalf("stage legacy data: %v\n%s", err, stmt)
+		}
+	}
+	legacy.Close()
+	return path
+}
 
-	for _, stmt := range []string{
+// TestMigrationMovesContentToBlobs covers 0008-0010 end to end: the content of
+// every row leaves the database for the blob store, byte for byte, and
+// nothing else about any row changes. A table rebuild is the one kind of
+// migration that can lose data silently, so every column is compared.
+func TestMigrationMovesContentToBlobs(t *testing.T) {
+	big := strings.Repeat("0", 400000)
+	path := stageLegacyContent(t,
 		`INSERT INTO users (username, nickname, password_hash) VALUES ('a', 'A', 'h')`,
 		`INSERT INTO files (slug, name, html_content, access_code, user_id, tags, is_public,
 		                    expires_at, success_count, kind)
@@ -498,26 +481,22 @@ func TestMigrationMovesContentLast(t *testing.T) {
 		                    deleted_at, max_views, expired_reason)
 		 VALUES ('site', 'Site', '', 'code2', 1, 'site', x'504b0506',
 		         '2026-01-01 00:00:00+00:00', 3, 'views')`,
-		// Large enough that the rebuild's leftover free pages dominate the
-		// file, which is what the compaction check below needs to see.
-		`UPDATE files SET html_content = html_content || hex(zeroblob(200000)) WHERE slug = 'doc'`,
-		// Issued and then hard-deleted: the counter must stay at 3, not fall
+		// Large enough that the dropped content dominates the file, which is
+		// what the compaction check below needs to see.
+		`INSERT INTO files (slug, name, html_content, access_code, user_id)
+		 VALUES ('big', 'Big', '`+big+`', 'code4', 1)`,
+		// Issued and then hard-deleted: the counter must stay at 4, not fall
 		// back to the highest surviving id.
 		`INSERT INTO files (slug, name, html_content, access_code, user_id)
 		 VALUES ('gone', 'Gone', 'x', 'code3', 1)`,
 		`DELETE FROM files WHERE slug = 'gone'`,
-	} {
-		if _, err := legacy.Exec(stmt); err != nil {
-			t.Fatalf("stage pre-0006 data: %v\n%s", err, stmt)
-		}
-	}
+	)
+	want := map[string][]byte{"doc": []byte("汉字 body"), "site": {0x50, 0x4b, 0x05, 0x06}, "big": []byte(big)}
 
-	// Named columns, so the comparison does not depend on the order the
-	// migration is changing.
-	const cols = `id, slug, name, html_content, is_public, access_code, created_at,
+	const cols = `id, slug, name, is_public, access_code, created_at,
 		updated_at, deleted_at, success_count, failure_count, tags, expires_at,
 		max_views, view_count, kind, code_success_count, user_id, expired_at,
-		expired_reason, content_size, archive`
+		expired_reason, content_size`
 	snapshot := func(conn *sql.DB) []string {
 		t.Helper()
 		rows, err := conn.Query(`SELECT ` + cols + ` FROM files ORDER BY id`)
@@ -540,48 +519,68 @@ func TestMigrationMovesContentLast(t *testing.T) {
 		}
 		return out
 	}
-	before := snapshot(legacy)
-	legacy.Close()
+	before := snapshot(openRaw(t, path))
 
-	conn, err := Open(path)
+	store := testStore(t)
+	conn, err := Open(path, store)
 	if err != nil {
 		t.Fatalf("Open (upgrade): %v", err)
 	}
 	defer conn.Close()
 
 	if after := snapshot(conn); fmt.Sprint(after) != fmt.Sprint(before) {
-		t.Errorf("rows changed by the rebuild:\nbefore %v\nafter  %v", before, after)
+		t.Errorf("rows changed by the migration:\nbefore %v\nafter  %v", before, after)
 	}
 
-	var last2 string
-	if err := conn.QueryRow(
-		`SELECT group_concat(name, ',') FROM (
-		   SELECT name FROM pragma_table_info('files') ORDER BY cid DESC LIMIT 2)`,
-	).Scan(&last2); err != nil {
-		t.Fatalf("read column order: %v", err)
+	for slug, content := range want {
+		var blobID string
+		var size int64
+		var orphaned bool
+		if err := conn.QueryRow(`SELECT f.blob_id, b.size, b.orphaned_at IS NOT NULL FROM files f
+			JOIN blobs b ON b.id = f.blob_id WHERE f.slug = ?`, slug).Scan(&blobID, &size, &orphaned); err != nil {
+			t.Fatalf("%s: read its blob: %v", slug, err)
+		}
+		got, err := store.Read(blobID)
+		if err != nil {
+			t.Fatalf("%s: read blob from disk: %v", slug, err)
+		}
+		if !bytes.Equal(got, content) || size != int64(len(content)) {
+			t.Errorf("%s: blob holds %d bytes (recorded %d), want its %d bytes of content", slug, len(got), size, len(content))
+		}
+		if orphaned {
+			t.Errorf("%s: its blob is marked orphaned, so the collector would delete it", slug)
+		}
 	}
-	if last2 != "archive,html_content" {
-		t.Errorf("last two columns = %s, want html_content then archive", last2)
+	if n := rawText(t, conn, `SELECT COUNT(*) FROM blobs`); n != "3" {
+		t.Errorf("%s blob records, want exactly one per file", n)
 	}
 
-	if seq := rawText(t, conn, `SELECT seq FROM sqlite_sequence WHERE name = 'files'`); seq != "3" {
-		t.Errorf("files sequence = %s after the rebuild, want 3 (the highest id ever issued)", seq)
+	for _, gone := range []string{"html_content", "archive"} {
+		if n := rawText(t, conn, `SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = ?`, gone); n != "0" {
+			t.Errorf("files.%s still exists", gone)
+		}
+	}
+	if n := rawText(t, conn, `SELECT COUNT(*) FROM sqlite_master WHERE name = 'blob_extraction'`); n != "0" {
+		t.Error("blob_extraction was not dropped")
+	}
+	if seq := rawText(t, conn, `SELECT seq FROM sqlite_sequence WHERE name = 'files'`); seq != "4" {
+		t.Errorf("files sequence = %s after the rebuild, want 4 (the highest id ever issued)", seq)
 	}
 	if n := rawText(t, conn, `SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'files_new'`); n != "0" {
 		t.Errorf("files_new still has %s sequence row(s)", n)
 	}
-
-	// The rebuild wrote a second copy before dropping the first; Open must
-	// have given that space back rather than leave the file twice its size.
+	// The database held the content until the rebuild dropped it; Open must
+	// have given that space back.
 	if free := rawText(t, conn, `SELECT freelist_count FROM pragma_freelist_count`); free != "0" {
 		t.Errorf("%s free pages after the upgrade, want 0 (compacted)", free)
 	}
-
-	// What the DROP took with it must be back.
 	for _, name := range []string{
 		"idx_files_owner_list",
-		"files_content_size_after_insert",
-		"files_content_size_after_update",
+		"files_blob_check_insert",
+		"files_blob_check_update",
+		"files_blob_adopt",
+		"files_blob_swap",
+		"files_blob_release",
 	} {
 		if n := rawText(t, conn,
 			`SELECT COUNT(*) FROM sqlite_master WHERE name = ? AND tbl_name = 'files'`, name,
@@ -589,17 +588,161 @@ func TestMigrationMovesContentLast(t *testing.T) {
 			t.Errorf("%s missing after the rebuild", name)
 		}
 	}
+	for _, name := range []string{"files_content_size_after_insert", "files_content_size_after_update"} {
+		if n := rawText(t, conn, `SELECT COUNT(*) FROM sqlite_master WHERE name = ?`, name); n != "0" {
+			t.Errorf("%s survived; it measures columns that no longer exist", name)
+		}
+	}
+}
+
+// TestExtractionResumes interrupts the extraction after its first batch, with
+// a blob written but never recorded as a crash would leave it, and checks that
+// the next start finishes the job without redoing the first batch.
+func TestExtractionResumes(t *testing.T) {
+	path := stageLegacyContent(t,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('a', 'A', 'first', 'c1', 1)`,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('b', 'B', 'second', 'c2', 1)`,
+	)
+	store := testStore(t)
+
+	// The first start gets as far as one batch of one file.
+	defer func(old int64) { extractBatchBytes = old }(extractBatchBytes)
+	extractBatchBytes = 1
+	partial := openRaw(t, path)
+	applyMigrationsFrom(t, partial, "0008", "0009")
+	if res, err := extractBatch(partial, store); err != nil || res.files != 1 {
+		t.Fatalf("first batch = %+v, %v; want one file", res, err)
+	}
+	if _, err := store.Put([]byte("written but never recorded")); err != nil {
+		t.Fatal(err)
+	}
+	partial.Close()
+
+	conn, err := Open(path, store)
+	if err != nil {
+		t.Fatalf("Open (resume): %v", err)
+	}
+	defer conn.Close()
+
+	for slug, content := range map[string]string{"a": "first", "b": "second"} {
+		var id string
+		if err := conn.QueryRow(`SELECT blob_id FROM files WHERE slug = ?`, slug).Scan(&id); err != nil {
+			t.Fatalf("%s: %v", slug, err)
+		}
+		if got, err := store.Read(id); err != nil || string(got) != content {
+			t.Errorf("%s: blob = %q, %v; want %q", slug, got, err, content)
+		}
+	}
+	if n := rawText(t, conn, `SELECT COUNT(*) FROM blobs`); n != "2" {
+		t.Errorf("%s blob records after resuming, want 2: the first batch was redone", n)
+	}
+}
+
+// applyMigrationsFrom applies the SQL migrations from first (inclusive) up to
+// but excluding stop.
+func applyMigrationsFrom(t *testing.T, conn *sql.DB, first, stop string) {
+	t.Helper()
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name < first || name >= stop {
+			continue
+		}
+		body, _ := migrationsFS.ReadFile("migrations/" + name)
+		if _, err := conn.Exec(string(body)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+		if _, err := conn.Exec(`INSERT INTO schema_migrations (filename) VALUES (?)`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestExtractionRefusesWithoutSpace pins the upgrade's disk check: rather than
+// fill the disk halfway through, it refuses to start and changes nothing.
+func TestExtractionRefusesWithoutSpace(t *testing.T) {
+	path := stageLegacyContent(t,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('a', 'A', 'content', 'c1', 1)`,
+	)
+	defer func(old func(*blobstore.Store) (uint64, bool)) { diskFree = old }(diskFree)
+	diskFree = func(*blobstore.Store) (uint64, bool) { return 1024, true }
+
+	if _, err := Open(path, testStore(t)); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("Open with a full disk = %v, want ErrInsufficientSpace", err)
+	}
+	raw := openRaw(t, path)
+	if got := rawText(t, raw, `SELECT html_content FROM files WHERE slug = 'a'`); got != "content" {
+		t.Errorf("content = %q after the refused upgrade, want it untouched", got)
+	}
+	if n := rawText(t, raw, `SELECT COUNT(*) FROM schema_migrations WHERE filename >= '0009'`); n != "0" {
+		t.Errorf("%s migration(s) from 0009 on recorded after the refusal", n)
+	}
+}
+
+// A row whose content_size disagrees with its content is refused rather than
+// guessed at: the size is what the quota counts.
+func TestExtractionRefusesInconsistentRows(t *testing.T) {
+	path := stageLegacyContent(t,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('a', 'A', 'content', 'c1', 1)`,
+		// Writing content_size alone does not fire 0006's triggers.
+		`UPDATE files SET content_size = 999 WHERE slug = 'a'`,
+	)
+	_, err := Open(path, testStore(t))
+	if err == nil || !strings.Contains(err.Error(), "content_size says 999") {
+		t.Fatalf("Open = %v, want a refusal naming the size mismatch", err)
+	}
+}
+
+// TestInspectChangesNothing pins `server migrate --check`: it reports the
+// pending work against a legacy database without doing any of it.
+func TestInspectChangesNothing(t *testing.T) {
+	path := stageLegacyContent(t,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('a', 'A', '12345', 'c1', 1)`,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id) VALUES ('b', 'B', '汉字', 'c2', 1)`,
+	)
+	blobDir := filepath.Join(t.TempDir(), "not-yet", "blobs")
+
+	plan, err := Inspect(path, blobDir)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if fmt.Sprint(plan.Pending) != "[0008_blob_store.sql 0009_extract_content 0010_drop_inline_content.sql]" {
+		t.Errorf("Pending = %v", plan.Pending)
+	}
+	if plan.MoveFiles != 2 || plan.MoveBytes != 11 || plan.Need < 11 {
+		t.Errorf("plan = %+v, want 2 files, 11 bytes", plan)
+	}
+	raw := openRaw(t, path)
+	if n := rawText(t, raw, `SELECT COUNT(*) FROM schema_migrations WHERE filename >= '0008'`); n != "0" {
+		t.Errorf("Inspect applied %s migration(s)", n)
+	}
+	raw.Close()
+	if _, err := os.Stat(blobDir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Inspect created the blob directory: %v", err)
+	}
+
+	store, err := blobstore.Open(blobDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Open(path, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if plan, err = Inspect(path, blobDir); err != nil || len(plan.Pending) != 0 || plan.MoveFiles != 0 {
+		t.Errorf("Inspect after upgrading = %+v, %v; want nothing pending", plan, err)
+	}
 }
 
 // TestReadsDoNotQueueBehindEachOther pins that the handle is a pool. With a
 // single connection, a query still holding its connection -- a backup's
 // VACUUM INTO, a large row being read -- made every other request wait for it.
 func TestReadsDoNotQueueBehindEachOther(t *testing.T) {
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer conn.Close()
+	conn := openTest(t)
 
 	// An open cursor keeps its connection until it is closed.
 	held, err := conn.Query(`SELECT name FROM sqlite_master`)
@@ -623,11 +766,7 @@ func TestReadsDoNotQueueBehindEachOther(t *testing.T) {
 // apply to that case. update_site's read-merge-write transaction is exactly
 // that shape.
 func TestConcurrentTransactionsWaitForTheWriteLock(t *testing.T) {
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer conn.Close()
+	conn := openTest(t)
 	if _, err := conn.Exec(`INSERT INTO configs (key, value) VALUES ('n', '0')`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}

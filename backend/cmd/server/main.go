@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
-	"github.com/shawn-bluce/renderbin/backend/internal/db"
+	"github.com/shawn-bluce/renderbin/backend/internal/cron"
 	"github.com/shawn-bluce/renderbin/backend/internal/server"
 )
 
@@ -31,23 +30,25 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// The default too: an upgrade that moves content out of the database logs
+	// its progress from inside db.Open, and should log it like everything else.
+	slog.SetDefault(logger)
 
 	addr := envOr("LISTEN_ADDR", defaultListenAddr)
-	dbPath := envOr("DB_PATH", defaultDBPath)
 
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		logger.Error("create db dir", "error", err)
-		os.Exit(1)
-	}
-
-	conn, err := db.Open(dbPath)
+	conn, blobs, err := openData()
 	if err != nil {
-		logger.Error("open database", "error", err)
+		logger.Error("open data", "error", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	handler := server.New(conn, logger)
+	handler := server.New(conn, blobs, logger)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go cron.RunBlobGC(ctx, conn, blobs, logger)
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -68,9 +69,6 @@ func main() {
 			serverErr <- err
 		}
 	}()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	select {
 	case err := <-serverErr:

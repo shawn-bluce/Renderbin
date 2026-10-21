@@ -8,7 +8,6 @@ package sqlcgen
 import (
 	"context"
 	"database/sql"
-	"time"
 )
 
 const clearFileExpiry = `-- name: ClearFileExpiry :one
@@ -20,7 +19,7 @@ SET expires_at = NULL,
     expired_reason = '',
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type ClearFileExpiryParams struct {
@@ -52,36 +51,35 @@ func (q *Queries) ClearFileExpiry(ctx context.Context, arg ClearFileExpiryParams
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
 
 const createFile = `-- name: CreateFile :one
 
-INSERT INTO files (slug, name, html_content, content_size, kind, is_public, access_code, user_id)
+INSERT INTO files (slug, name, blob_id, content_size, kind, is_public, access_code, user_id)
 VALUES (
     ?1,
     ?2,
     ?3,
-    length(CAST(?3 AS BLOB)),
+    (SELECT size FROM blobs WHERE id = ?3),
     ?4,
     ?5,
     ?6,
     ?7
 )
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type CreateFileParams struct {
-	Slug        string `json:"slug"`
-	Name        string `json:"name"`
-	HtmlContent string `json:"html_content"`
-	Kind        string `json:"kind"`
-	IsPublic    bool   `json:"is_public"`
-	AccessCode  string `json:"access_code"`
-	UserID      int64  `json:"user_id"`
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	BlobID     string `json:"blob_id"`
+	Kind       string `json:"kind"`
+	IsPublic   bool   `json:"is_public"`
+	AccessCode string `json:"access_code"`
+	UserID     int64  `json:"user_id"`
 }
 
 // ===========================================================================
@@ -96,15 +94,17 @@ type CreateFileParams struct {
 //
 // New file queries belong in this section and MUST carry the predicate.
 // ===========================================================================
-// content_size is derived from html_content by the statement itself, here and
-// in UpdateFile, so the two can never drift: there is no way to write the
-// content through this schema without writing its size in the same statement.
-// length(CAST(x AS BLOB)) is bytes; bare length() on TEXT counts characters.
+// content_size is read from the blob's own record by the statement itself,
+// here and in every statement that changes blob_id, so there is no way to
+// point a row at content without writing that content's size in the same
+// statement -- and 0010's check triggers refuse a size that disagrees anyway.
+// The blob is written to disk and recorded in blobs (InsertBlob) first; see
+// internal/blobstore for why that order makes a crash harmless.
 func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, error) {
 	row := q.db.QueryRowContext(ctx, createFile,
 		arg.Slug,
 		arg.Name,
-		arg.HtmlContent,
+		arg.BlobID,
 		arg.Kind,
 		arg.IsPublic,
 		arg.AccessCode,
@@ -132,45 +132,42 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
 
 const createSite = `-- name: CreateSite :one
-INSERT INTO files (slug, name, html_content, archive, content_size, kind, is_public, access_code, user_id)
+INSERT INTO files (slug, name, blob_id, content_size, kind, is_public, access_code, user_id)
 VALUES (
     ?1,
     ?2,
-    '',
     ?3,
-    length(?3),
+    (SELECT size FROM blobs WHERE id = ?3),
     'site',
     ?4,
     ?5,
     ?6
 )
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type CreateSiteParams struct {
 	Slug       string `json:"slug"`
 	Name       string `json:"name"`
-	Archive    []byte `json:"archive"`
+	BlobID     string `json:"blob_id"`
 	IsPublic   bool   `json:"is_public"`
 	AccessCode string `json:"access_code"`
 	UserID     int64  `json:"user_id"`
 }
 
-// A directory site: html_content stays ” and the whole directory is one zip
-// in archive (see internal/site). content_size is again derived by the
-// statement, from the archive this time; length() of a BLOB is bytes.
+// A directory site: the blob is the whole directory as one zip (see
+// internal/site).
 func (q *Queries) CreateSite(ctx context.Context, arg CreateSiteParams) (File, error) {
 	row := q.db.QueryRowContext(ctx, createSite,
 		arg.Slug,
 		arg.Name,
-		arg.Archive,
+		arg.BlobID,
 		arg.IsPublic,
 		arg.AccessCode,
 		arg.UserID,
@@ -197,8 +194,7 @@ func (q *Queries) CreateSite(ctx context.Context, arg CreateSiteParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -253,7 +249,7 @@ func (q *Queries) ExpireFile(ctx context.Context, arg ExpireFileParams) error {
 
 const getFileBySlugAnyOwner = `-- name: GetFileBySlugAnyOwner :one
 
-SELECT files.id, files.slug, files.name, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.html_content, files.archive FROM files
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.blob_id FROM files
 JOIN users ON users.id = files.user_id
 WHERE files.slug = ? AND files.deleted_at IS NULL AND users.disabled_at IS NULL
 `
@@ -295,79 +291,26 @@ func (q *Queries) GetFileBySlugAnyOwner(ctx context.Context, slug string) (File,
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
 
-const getSiteArchive = `-- name: GetSiteArchive :one
-SELECT files.archive, files.updated_at FROM files
-JOIN users ON users.id = files.user_id
-WHERE files.id = ? AND files.kind = 'site'
-  AND files.deleted_at IS NULL AND users.disabled_at IS NULL
-`
-
-type GetSiteArchiveRow struct {
-	Archive   []byte    `json:"archive"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// updated_at comes back with the archive because it is the Last-Modified of
-// these exact bytes, should the site have been replaced between the halves.
-func (q *Queries) GetSiteArchive(ctx context.Context, id int64) (GetSiteArchiveRow, error) {
-	row := q.db.QueryRowContext(ctx, getSiteArchive, id)
-	var i GetSiteArchiveRow
-	err := row.Scan(&i.Archive, &i.UpdatedAt)
-	return i, err
-}
-
 const getSiteBySlugAnyOwner = `-- name: GetSiteBySlugAnyOwner :one
-SELECT files.id, files.slug, files.name, files.is_public, files.access_code,
-       files.created_at, files.updated_at, files.deleted_at, files.success_count,
-       files.failure_count, files.tags, files.expires_at, files.max_views,
-       files.view_count, files.kind, files.code_success_count, files.user_id,
-       files.expired_at, files.expired_reason, files.content_size
-FROM files
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.blob_id FROM files
 JOIN users ON users.id = files.user_id
 WHERE files.slug = ? AND files.kind = 'site'
   AND files.deleted_at IS NULL AND users.disabled_at IS NULL
 `
 
-type GetSiteBySlugAnyOwnerRow struct {
-	ID               int64         `json:"id"`
-	Slug             string        `json:"slug"`
-	Name             string        `json:"name"`
-	IsPublic         bool          `json:"is_public"`
-	AccessCode       string        `json:"access_code"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
-	DeletedAt        sql.NullTime  `json:"deleted_at"`
-	SuccessCount     int64         `json:"success_count"`
-	FailureCount     int64         `json:"failure_count"`
-	Tags             string        `json:"tags"`
-	ExpiresAt        sql.NullTime  `json:"expires_at"`
-	MaxViews         sql.NullInt64 `json:"max_views"`
-	ViewCount        int64         `json:"view_count"`
-	Kind             string        `json:"kind"`
-	CodeSuccessCount int64         `json:"code_success_count"`
-	UserID           int64         `json:"user_id"`
-	ExpiredAt        sql.NullTime  `json:"expired_at"`
-	ExpiredReason    string        `json:"expired_reason"`
-	ContentSize      int64         `json:"content_size"`
-}
-
-// The site render path in two halves, so a request does not load the whole
-// archive before it knows it needs a byte of it. Every stylesheet, script and
-// image of a site is its own request, and with Cache-Control: no-cache each
-// one revalidates on every visit; answering those 304s used to read the full
-// zip each time. GetSiteBySlugAnyOwner carries everything access control and
-// the conditional check need (same columns as ListUserFiles, so the handler
-// converts it the same way); GetSiteArchive runs only when bytes are served.
-// Both keep the users join: suspension has to hold on either half.
-func (q *Queries) GetSiteBySlugAnyOwner(ctx context.Context, slug string) (GetSiteBySlugAnyOwnerRow, error) {
+// The site render path. It used to come in two halves, so that answering a
+// 304 did not load the archive; the archive is a blob on disk now, opened
+// only when bytes are served, and this row is all access control, counting
+// and the conditional check need. Keeps the users join: suspension holds
+// here too.
+func (q *Queries) GetSiteBySlugAnyOwner(ctx context.Context, slug string) (File, error) {
 	row := q.db.QueryRowContext(ctx, getSiteBySlugAnyOwner, slug)
-	var i GetSiteBySlugAnyOwnerRow
+	var i File
 	err := row.Scan(
 		&i.ID,
 		&i.Slug,
@@ -389,12 +332,13 @@ func (q *Queries) GetSiteBySlugAnyOwner(ctx context.Context, slug string) (GetSi
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
+		&i.BlobID,
 	)
 	return i, err
 }
 
 const getUserFileBySlug = `-- name: GetUserFileBySlug :one
-SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
 `
 
@@ -427,15 +371,15 @@ func (q *Queries) GetUserFileBySlug(ctx context.Context, arg GetUserFileBySlugPa
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
 
 const getUserFileSize = `-- name: GetUserFileSize :one
-SELECT content_size, kind FROM files
-WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
+SELECT files.content_size, files.kind, files.blob_id, blobs.sha256 FROM files
+JOIN blobs ON blobs.id = files.blob_id
+WHERE files.slug = ?1 AND files.user_id = ?2 AND files.deleted_at IS NULL
 `
 
 type GetUserFileSizeParams struct {
@@ -446,15 +390,24 @@ type GetUserFileSizeParams struct {
 type GetUserFileSizeRow struct {
 	ContentSize int64  `json:"content_size"`
 	Kind        string `json:"kind"`
+	BlobID      string `json:"blob_id"`
+	Sha256      string `json:"sha256"`
 }
 
 // What an edit is replacing, so the quota check can subtract it instead of
 // charging the account twice for a file it already stores -- plus the kind,
-// since a site is edited through different statements than a document.
+// since a site is edited through different statements than a document, and
+// the blob, so an edit that leaves the content as it was keeps it rather than
+// writing an identical copy.
 func (q *Queries) GetUserFileSize(ctx context.Context, arg GetUserFileSizeParams) (GetUserFileSizeRow, error) {
 	row := q.db.QueryRowContext(ctx, getUserFileSize, arg.Slug, arg.UserID)
 	var i GetUserFileSizeRow
-	err := row.Scan(&i.ContentSize, &i.Kind)
+	err := row.Scan(
+		&i.ContentSize,
+		&i.Kind,
+		&i.BlobID,
+		&i.Sha256,
+	)
 	return i, err
 }
 
@@ -537,46 +490,20 @@ func (q *Queries) IncrementFileViewCount(ctx context.Context, slug string) error
 }
 
 const listUserDeletedFiles = `-- name: ListUserDeletedFiles :many
-SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
-       success_count, failure_count, tags, expires_at, max_views, view_count,
-       kind, code_success_count, user_id, expired_at, expired_reason, content_size
-FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
 WHERE deleted_at IS NOT NULL AND user_id = ?1
 ORDER BY deleted_at DESC
 `
 
-type ListUserDeletedFilesRow struct {
-	ID               int64         `json:"id"`
-	Slug             string        `json:"slug"`
-	Name             string        `json:"name"`
-	IsPublic         bool          `json:"is_public"`
-	AccessCode       string        `json:"access_code"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
-	DeletedAt        sql.NullTime  `json:"deleted_at"`
-	SuccessCount     int64         `json:"success_count"`
-	FailureCount     int64         `json:"failure_count"`
-	Tags             string        `json:"tags"`
-	ExpiresAt        sql.NullTime  `json:"expires_at"`
-	MaxViews         sql.NullInt64 `json:"max_views"`
-	ViewCount        int64         `json:"view_count"`
-	Kind             string        `json:"kind"`
-	CodeSuccessCount int64         `json:"code_success_count"`
-	UserID           int64         `json:"user_id"`
-	ExpiredAt        sql.NullTime  `json:"expired_at"`
-	ExpiredReason    string        `json:"expired_reason"`
-	ContentSize      int64         `json:"content_size"`
-}
-
-func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]ListUserDeletedFilesRow, error) {
+func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]File, error) {
 	rows, err := q.db.QueryContext(ctx, listUserDeletedFiles, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListUserDeletedFilesRow
+	var items []File
 	for rows.Next() {
-		var i ListUserDeletedFilesRow
+		var i File
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
@@ -598,6 +525,7 @@ func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]Lis
 			&i.ExpiredAt,
 			&i.ExpiredReason,
 			&i.ContentSize,
+			&i.BlobID,
 		); err != nil {
 			return nil, err
 		}
@@ -613,52 +541,23 @@ func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]Lis
 }
 
 const listUserFiles = `-- name: ListUserFiles :many
-SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
-       success_count, failure_count, tags, expires_at, max_views, view_count,
-       kind, code_success_count, user_id, expired_at, expired_reason, content_size
-FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
 WHERE deleted_at IS NULL AND user_id = ?1
 ORDER BY created_at DESC
 `
 
-type ListUserFilesRow struct {
-	ID               int64         `json:"id"`
-	Slug             string        `json:"slug"`
-	Name             string        `json:"name"`
-	IsPublic         bool          `json:"is_public"`
-	AccessCode       string        `json:"access_code"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
-	DeletedAt        sql.NullTime  `json:"deleted_at"`
-	SuccessCount     int64         `json:"success_count"`
-	FailureCount     int64         `json:"failure_count"`
-	Tags             string        `json:"tags"`
-	ExpiresAt        sql.NullTime  `json:"expires_at"`
-	MaxViews         sql.NullInt64 `json:"max_views"`
-	ViewCount        int64         `json:"view_count"`
-	Kind             string        `json:"kind"`
-	CodeSuccessCount int64         `json:"code_success_count"`
-	UserID           int64         `json:"user_id"`
-	ExpiredAt        sql.NullTime  `json:"expired_at"`
-	ExpiredReason    string        `json:"expired_reason"`
-	ContentSize      int64         `json:"content_size"`
-}
-
-// The two listings and the name search deliberately do NOT select
-// html_content. They used to be SELECT *, which read every document's full
-// source out of SQLite so the handler could blank the field before encoding --
-// 350MB of RSS to answer a 13KB request for an account holding 160MB. Anything
-// added here must stay off html_content; GetUserFileBySlug is the endpoint that
-// returns content, and it returns one row.
-func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]ListUserFilesRow, error) {
+// The listings are SELECT * again. They used to name every column but
+// html_content, because reading a row meant reading its document; the content
+// now lives in blobs on disk, and a files row is a few hundred bytes.
+func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]File, error) {
 	rows, err := q.db.QueryContext(ctx, listUserFiles, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListUserFilesRow
+	var items []File
 	for rows.Next() {
-		var i ListUserFilesRow
+		var i File
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
@@ -680,6 +579,7 @@ func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]ListUserFi
 			&i.ExpiredAt,
 			&i.ExpiredReason,
 			&i.ContentSize,
+			&i.BlobID,
 		); err != nil {
 			return nil, err
 		}
@@ -698,7 +598,7 @@ const refreshFileAccessCode = `-- name: RefreshFileAccessCode :one
 UPDATE files
 SET access_code = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type RefreshFileAccessCodeParams struct {
@@ -731,8 +631,7 @@ func (q *Queries) RefreshFileAccessCode(ctx context.Context, arg RefreshFileAcce
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -741,7 +640,7 @@ const renameFile = `-- name: RenameFile :one
 UPDATE files
 SET name = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type RenameFileParams struct {
@@ -774,30 +673,42 @@ func (q *Queries) RenameFile(ctx context.Context, arg RenameFileParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
 
-const replaceSiteArchive = `-- name: ReplaceSiteArchive :one
+const replaceSiteBlob = `-- name: ReplaceSiteBlob :one
 UPDATE files
-SET archive = ?1,
-    content_size = length(?1),
+SET blob_id = ?1,
+    content_size = (SELECT size FROM blobs WHERE id = ?1),
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-  AND kind = 'site'
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+  AND kind = 'site' AND blob_id = ?4
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
-type ReplaceSiteArchiveParams struct {
-	Archive []byte `json:"archive"`
-	Slug    string `json:"slug"`
-	UserID  int64  `json:"user_id"`
+type ReplaceSiteBlobParams struct {
+	BlobID    string `json:"blob_id"`
+	Slug      string `json:"slug"`
+	UserID    int64  `json:"user_id"`
+	OldBlobID string `json:"old_blob_id"`
 }
 
-func (q *Queries) ReplaceSiteArchive(ctx context.Context, arg ReplaceSiteArchiveParams) (File, error) {
-	row := q.db.QueryRowContext(ctx, replaceSiteArchive, arg.Archive, arg.Slug, arg.UserID)
+// Replaces a site's archive, but only if it is still the one the caller read
+// (old_blob_id). Building the new archive happens outside any transaction --
+// MCP's update_site reads the old one, merges a patch into it and writes the
+// result to disk -- so this compare-and-swap is what keeps two concurrent
+// edits from silently overwriting each other, without holding SQLite's write
+// lock for the duration of that disk work. No row means "gone, or changed
+// meanwhile"; the caller tells the two apart.
+func (q *Queries) ReplaceSiteBlob(ctx context.Context, arg ReplaceSiteBlobParams) (File, error) {
+	row := q.db.QueryRowContext(ctx, replaceSiteBlob,
+		arg.BlobID,
+		arg.Slug,
+		arg.UserID,
+		arg.OldBlobID,
+	)
 	var i File
 	err := row.Scan(
 		&i.ID,
@@ -820,8 +731,7 @@ func (q *Queries) ReplaceSiteArchive(ctx context.Context, arg ReplaceSiteArchive
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -830,7 +740,7 @@ const restoreFile = `-- name: RestoreFile :one
 UPDATE files
 SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type RestoreFileParams struct {
@@ -862,18 +772,13 @@ func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File,
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
 
 const searchUserFilesByName = `-- name: SearchUserFilesByName :many
-
-SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
-       success_count, failure_count, tags, expires_at, max_views, view_count,
-       kind, code_success_count, user_id, expired_at, expired_reason, content_size
-FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
 WHERE deleted_at IS NULL AND user_id = ?1
   AND instr(lower(name), lower(?2)) > 0
 ORDER BY created_at DESC
@@ -884,41 +789,19 @@ type SearchUserFilesByNameParams struct {
 	NameQuery string `json:"name_query"`
 }
 
-type SearchUserFilesByNameRow struct {
-	ID               int64         `json:"id"`
-	Slug             string        `json:"slug"`
-	Name             string        `json:"name"`
-	IsPublic         bool          `json:"is_public"`
-	AccessCode       string        `json:"access_code"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
-	DeletedAt        sql.NullTime  `json:"deleted_at"`
-	SuccessCount     int64         `json:"success_count"`
-	FailureCount     int64         `json:"failure_count"`
-	Tags             string        `json:"tags"`
-	ExpiresAt        sql.NullTime  `json:"expires_at"`
-	MaxViews         sql.NullInt64 `json:"max_views"`
-	ViewCount        int64         `json:"view_count"`
-	Kind             string        `json:"kind"`
-	CodeSuccessCount int64         `json:"code_success_count"`
-	UserID           int64         `json:"user_id"`
-	ExpiredAt        sql.NullTime  `json:"expired_at"`
-	ExpiredReason    string        `json:"expired_reason"`
-	ContentSize      int64         `json:"content_size"`
-}
-
 // Plain substring search via instr() rather than LIKE: no wildcard/escape
 // handling needed, and lower() gives the same ASCII-only case-insensitivity
-// LIKE would.
-func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFilesByNameParams) ([]SearchUserFilesByNameRow, error) {
+// LIKE would. Content is not searched here: it is on disk, and
+// handlers/search.go reads it there.
+func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFilesByNameParams) ([]File, error) {
 	rows, err := q.db.QueryContext(ctx, searchUserFilesByName, arg.UserID, arg.NameQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []SearchUserFilesByNameRow
+	var items []File
 	for rows.Next() {
-		var i SearchUserFilesByNameRow
+		var i File
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
@@ -940,110 +823,7 @@ func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFiles
 			&i.ExpiredAt,
 			&i.ExpiredReason,
 			&i.ContentSize,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const searchUserFilesWithContent = `-- name: SearchUserFilesWithContent :many
-SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
-       success_count, failure_count, tags, expires_at, max_views, view_count,
-       kind, code_success_count, user_id, expired_at, expired_reason, content_size,
-       CAST(instr(lower(html_content), lower(?1)) AS INTEGER) AS match_pos,
-       CAST(length(html_content) AS INTEGER) AS content_chars,
-       CAST(substr(html_content,
-              MAX(1, instr(lower(html_content), lower(?1)) - 100),
-              length(?1) + 200) AS TEXT) AS snippet_window
-FROM files
-WHERE deleted_at IS NULL AND user_id = ?2
-  AND (instr(lower(name), lower(?3)) > 0
-    OR instr(lower(html_content), lower(?1)) > 0)
-ORDER BY created_at DESC
-`
-
-type SearchUserFilesWithContentParams struct {
-	ContentQuery string `json:"content_query"`
-	UserID       int64  `json:"user_id"`
-	NameQuery    string `json:"name_query"`
-}
-
-type SearchUserFilesWithContentRow struct {
-	ID               int64         `json:"id"`
-	Slug             string        `json:"slug"`
-	Name             string        `json:"name"`
-	IsPublic         bool          `json:"is_public"`
-	AccessCode       string        `json:"access_code"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
-	DeletedAt        sql.NullTime  `json:"deleted_at"`
-	SuccessCount     int64         `json:"success_count"`
-	FailureCount     int64         `json:"failure_count"`
-	Tags             string        `json:"tags"`
-	ExpiresAt        sql.NullTime  `json:"expires_at"`
-	MaxViews         sql.NullInt64 `json:"max_views"`
-	ViewCount        int64         `json:"view_count"`
-	Kind             string        `json:"kind"`
-	CodeSuccessCount int64         `json:"code_success_count"`
-	UserID           int64         `json:"user_id"`
-	ExpiredAt        sql.NullTime  `json:"expired_at"`
-	ExpiredReason    string        `json:"expired_reason"`
-	ContentSize      int64         `json:"content_size"`
-	MatchPos         int64         `json:"match_pos"`
-	ContentChars     int64         `json:"content_chars"`
-	SnippetWindow    string        `json:"snippet_window"`
-}
-
-// Content search returns a bounded window around the first match instead of
-// the whole document, for the same reason the listings dropped html_content: a
-// query matching fifty 5MB files would otherwise pull 250MB into memory to
-// render fifty 200-character excerpts.
-//
-// match_pos is instr()'s 1-based character offset (0 when only the name
-// matched); snippet_window is up to 100 characters either side of the match.
-// Both instr() and substr() count characters here, not bytes, so the window is
-// rune-safe and the handler only has to decide about ellipses.
-func (q *Queries) SearchUserFilesWithContent(ctx context.Context, arg SearchUserFilesWithContentParams) ([]SearchUserFilesWithContentRow, error) {
-	rows, err := q.db.QueryContext(ctx, searchUserFilesWithContent, arg.ContentQuery, arg.UserID, arg.NameQuery)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []SearchUserFilesWithContentRow
-	for rows.Next() {
-		var i SearchUserFilesWithContentRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.Slug,
-			&i.Name,
-			&i.IsPublic,
-			&i.AccessCode,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-			&i.SuccessCount,
-			&i.FailureCount,
-			&i.Tags,
-			&i.ExpiresAt,
-			&i.MaxViews,
-			&i.ViewCount,
-			&i.Kind,
-			&i.CodeSuccessCount,
-			&i.UserID,
-			&i.ExpiredAt,
-			&i.ExpiredReason,
-			&i.ContentSize,
-			&i.MatchPos,
-			&i.ContentChars,
-			&i.SnippetWindow,
+			&i.BlobID,
 		); err != nil {
 			return nil, err
 		}
@@ -1068,7 +848,7 @@ SET is_public = 1,
     expired_reason = '',
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?3 AND user_id = ?4 AND deleted_at IS NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type SetFileExpiryParams struct {
@@ -1110,8 +890,7 @@ func (q *Queries) SetFileExpiry(ctx context.Context, arg SetFileExpiryParams) (F
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -1120,7 +899,7 @@ const setFileTags = `-- name: SetFileTags :one
 UPDATE files
 SET tags = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type SetFileTagsParams struct {
@@ -1153,8 +932,7 @@ func (q *Queries) SetFileTags(ctx context.Context, arg SetFileTagsParams) (File,
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -1163,7 +941,7 @@ const setFileVisibility = `-- name: SetFileVisibility :one
 UPDATE files
 SET is_public = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type SetFileVisibilityParams struct {
@@ -1196,8 +974,7 @@ func (q *Queries) SetFileVisibility(ctx context.Context, arg SetFileVisibilityPa
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -1243,37 +1020,35 @@ const updateFile = `-- name: UpdateFile :one
 UPDATE files
 SET name = ?1,
     slug = ?2,
-    html_content = ?3,
-    content_size = length(CAST(?3 AS BLOB)) + COALESCE(length(archive), 0),
+    blob_id = ?3,
+    content_size = (SELECT size FROM blobs WHERE id = ?3),
     access_code = ?4,
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?5 AND user_id = ?6 AND deleted_at IS NULL
   AND kind <> 'site'
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type UpdateFileParams struct {
-	Name        string `json:"name"`
-	NewSlug     string `json:"new_slug"`
-	HtmlContent string `json:"html_content"`
-	AccessCode  string `json:"access_code"`
-	Slug        string `json:"slug"`
-	UserID      int64  `json:"user_id"`
+	Name       string `json:"name"`
+	NewSlug    string `json:"new_slug"`
+	BlobID     string `json:"blob_id"`
+	AccessCode string `json:"access_code"`
+	Slug       string `json:"slug"`
+	UserID     int64  `json:"user_id"`
 }
 
 // The SET slug and the WHERE slug are different values; naming both explicitly
 // keeps them from being mixed up (and avoids sqlc's generated `Slug_2` field).
 //
 // kind <> 'site' keeps document writes off site rows in SQL rather than in a
-// Go check someone can forget: a site's html_content is ” by design, so a
-// rename that wrote the unchanged "content" back would otherwise be a write
-// of that empty string -- and a site whose archive is left alone but whose
-// size is recomputed from html_content stops counting against the quota.
+// Go check someone can forget: pointing a site at a document's blob would
+// serve that document's source as a zip, and the archive would be lost.
 func (q *Queries) UpdateFile(ctx context.Context, arg UpdateFileParams) (File, error) {
 	row := q.db.QueryRowContext(ctx, updateFile,
 		arg.Name,
 		arg.NewSlug,
-		arg.HtmlContent,
+		arg.BlobID,
 		arg.AccessCode,
 		arg.Slug,
 		arg.UserID,
@@ -1300,8 +1075,7 @@ func (q *Queries) UpdateFile(ctx context.Context, arg UpdateFileParams) (File, e
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }
@@ -1314,7 +1088,7 @@ SET name = ?1,
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?4 AND user_id = ?5 AND deleted_at IS NULL
   AND kind = 'site'
-RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, html_content, archive
+RETURNING id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id
 `
 
 type UpdateSiteMetaParams struct {
@@ -1357,8 +1131,7 @@ func (q *Queries) UpdateSiteMeta(ctx context.Context, arg UpdateSiteMetaParams) 
 		&i.ExpiredAt,
 		&i.ExpiredReason,
 		&i.ContentSize,
-		&i.HtmlContent,
-		&i.Archive,
+		&i.BlobID,
 	)
 	return i, err
 }

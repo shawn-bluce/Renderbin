@@ -4,7 +4,7 @@
 
 A self-hosted file-sharing service: upload an HTML, Markdown or text file — or a whole folder with an `index.html` — and get a link that opens as a rendered page. Built for the self-contained report pages AI agents produce; with the built-in **MCP server**, an agent can upload the file itself and hand you the link.
 
-Ships as one binary (or container) with all state in a single SQLite file.
+Ships as one binary (or container) with all state in one directory: a SQLite database, and the files' content beside it.
 
 ![Screenshot of the Renderbin dashboard](doc/screenshot.png)
 
@@ -26,7 +26,17 @@ docker compose up -d
 
 Open `http://127.0.0.1:8080` and create the first account on the welcome page; it becomes the super admin. The container listens on `127.0.0.1` only — put Nginx or Caddy in front and forward `X-Forwarded-Proto` (plus `X-Forwarded-Host` if the proxy rewrites the host).
 
-Upgrade with `docker compose pull && docker compose up -d`. All data lives in the `db-data` volume (`docker compose down -v` deletes it).
+Upgrade with `docker compose pull && docker compose up -d`. All data lives in the `db-data` volume (`docker compose down -v` deletes it). To see what an upgrade will do first, run `docker compose pull && docker compose run --rm app migrate --check` before `up -d`: it reports, without changing anything, whether the new version has to move data, how much (which is how long the server will be down), and whether the disk has room.
+
+Back up from Settings → Backup, or from the command line, which suits large instances better than a browser download:
+
+```bash
+docker compose exec app ./server backup --out=/data/backup.tar   # then copy it off the host
+docker compose exec app ./server restore --in=/data/backup.tar --yes
+docker compose exec app ./server fsck                            # check every file's content is intact
+```
+
+Copying `app.db` alone is not a backup: it names the files' content but does not hold it.
 
 Without Docker, download the static Linux binary (amd64 or arm64) from the latest release:
 
@@ -35,12 +45,13 @@ curl -LO https://github.com/shawn-bluce/renderbin/releases/latest/download/rende
 tar xzf renderbin_linux_amd64.tar.gz && ./renderbin
 ```
 
-There are two environment variables; everything else is set in the app's Settings page.
+There are three environment variables; everything else is set in the app's Settings page.
 
-| Variable      | Default       | Description          |
-| ------------- | ------------- | -------------------- |
-| `LISTEN_ADDR` | `:8080`       | Address to listen on |
-| `DB_PATH`     | `data/app.db` | SQLite database path |
+| Variable      | Default                  | Description                      |
+| ------------- | ------------------------ | -------------------------------- |
+| `LISTEN_ADDR` | `:8080`                  | Address to listen on             |
+| `DB_PATH`     | `data/app.db`            | SQLite database path             |
+| `BLOB_DIR`    | `blobs` beside `DB_PATH` | Where the files' content is kept |
 
 ## MCP and API
 

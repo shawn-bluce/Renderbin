@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/db"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
@@ -29,10 +30,23 @@ var seedHash = sync.OnceValue(func() string {
 // the server does) and returns the queries handle for assertions.
 func seedAccount(t *testing.T) *sqlcgen.Queries {
 	t.Helper()
+	queries, _ := seedData(t)
+	return queries
+}
+
+// seedData is seedAccount plus the blob store the subcommands will find
+// beside the database (BLOB_DIR's default).
+func seedData(t *testing.T) (*sqlcgen.Queries, *blobstore.Store) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.db")
 	t.Setenv("DB_PATH", path)
+	t.Setenv("BLOB_DIR", "")
 
-	conn, err := db.Open(path)
+	store, err := blobstore.Open(filepath.Join(filepath.Dir(path), "blobs"))
+	if err != nil {
+		t.Fatalf("blobstore.Open: %v", err)
+	}
+	conn, err := db.Open(path, store)
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -54,7 +68,7 @@ func seedAccount(t *testing.T) *sqlcgen.Queries {
 	}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	return queries
+	return queries, store
 }
 
 // run invokes the CLI the way main does, capturing both streams.

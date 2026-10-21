@@ -21,6 +21,30 @@ upgrading** (Settings → Backup) if you might want to go back.
 
 ### Changed
 
+- **File content moved out of the database.** Each file's content is now a
+  file of its own in a `blobs` directory beside `app.db` (in the same `db-data`
+  volume, so nothing about a Docker deployment changes; `BLOB_DIR` overrides the
+  location), and the database keeps only metadata. Backups, compaction and
+  future schema changes no longer slow down as the stored content grows, a site
+  page reads only the one file it serves from its zip, and downloads support
+  Range requests.
+  - **The first start after upgrading moves every file's content out**, before
+    the server starts listening: seconds for a typical instance, minutes for
+    many gigabytes. It needs free disk space of about the total content size,
+    checks for it first, and refuses to start (changing nothing) if it is not
+    there. Run `server migrate --check` with the new version beforehand to see
+    what it will do. An interrupted move resumes on the next start.
+  - **Backups are now a `.tar`** (the database plus every file's content).
+    Restore still accepts a `.db` downloaded from an older version, but an
+    **older version cannot restore the new `.tar`**: to keep a way back, download
+    a backup _before_ upgrading. The 256 MB limit on restoring is gone; instead
+    the upload must fit in the free disk space.
+  - New subcommands: `server backup --out=FILE`, `server restore --in=FILE`
+    (both safe while the server runs), `server fsck` (checks every file's
+    content against its recorded size and checksum) and `server migrate --check`.
+  - Deleted content (an emptied trash, a deleted account, the old version of an
+    edited file) is removed from disk by an hourly cleanup, 24 hours after it
+    stops being used -- the window that lets a backup in progress finish.
 - **Faster with many or large files.** The file listing, trash, search and the
   upload quota check no longer read every document from disk to answer: the
   database stored file contents in the middle of each row, and reading any

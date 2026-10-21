@@ -62,10 +62,12 @@ export interface RestoreResult {
 }
 
 /**
- * Replaces the whole database with an uploaded snapshot. Super admin only.
+ * Replaces all data with an uploaded backup. Super admin only.
  *
- * The body is the raw `.db` file — there is exactly one field, so a multipart
- * wrapper would only add parsing on both ends. A rejected upload changes
+ * The body is the raw backup file (the `.tar` /api/backup produces, or a `.db`
+ * from an older version) — there is exactly one field, so a multipart wrapper
+ * would only add parsing on both ends. The server needs its size up front,
+ * which a File body provides. A rejected upload changes
  * nothing, but a *successful* one replaces the sessions table too, so the caller
  * should expect its own session to be gone and reload.
  */

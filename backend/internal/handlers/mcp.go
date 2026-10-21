@@ -15,6 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/buildinfo"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/site"
@@ -40,17 +41,18 @@ var errFileNotFound = errors.New("file not found in this project")
 // endpoint is gated on the mcp_enabled config.
 type MCPHandler struct {
 	queries *sqlcgen.Queries
-	// conn is here only for update_site, which reads a site's archive, merges
-	// the patch into it and writes it back: in one transaction, so two agents
-	// editing the same site cannot each overwrite the other's change.
+	// blobs holds every file's content.
+	blobs *blobstore.Store
+	// conn is here only for update_site, whose archive swap and rename commit
+	// together.
 	conn   *sql.DB
 	logger *slog.Logger
 }
 
 // NewMCPHandler builds the /mcp http.Handler: body cap → mcp_enabled gate →
 // Bearer-token auth → streamable MCP server with the ten file tools.
-func NewMCPHandler(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handler {
-	m := &MCPHandler{queries: queries, conn: conn, logger: logger}
+func NewMCPHandler(queries *sqlcgen.Queries, blobs *blobstore.Store, conn *sql.DB, logger *slog.Logger) http.Handler {
+	m := &MCPHandler{queries: queries, blobs: blobs, conn: conn, logger: logger}
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "renderbin", Version: buildinfo.Version}, nil)
 	mcp.AddTool(srv, &mcp.Tool{
@@ -261,10 +263,14 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 	if err != nil {
 		return sqlcgen.File{}, m.toolError("generate access code", err)
 	}
+	blobID, err := storeContent(ctx, m.queries, m.blobs, []byte(in.Content))
+	if err != nil {
+		return sqlcgen.File{}, m.toolError("store file", err)
+	}
 	file, err := createFileWithFreshSlug(ctx, m.queries, sqlcgen.CreateFileParams{
-		Name:        name,
-		HtmlContent: in.Content,
-		Kind:        kind,
+		Name:   name,
+		BlobID: blobID,
+		Kind:   kind,
 		// Always private, regardless of ConfigUploadDefaultPublic: the upload
 		// tools promise "starts private" in their descriptions, and publish_file
 		// is the agent's explicit consent step for making anything reachable.
@@ -362,13 +368,9 @@ func (m *MCPHandler) listFiles(ctx context.Context, req *mcp.CallToolRequest, _ 
 		return nil, listFilesOutput{}, err
 	}
 
-	rows, err := m.queries.ListUserFiles(ctx, user.ID)
+	files, err := m.queries.ListUserFiles(ctx, user.ID)
 	if err != nil {
 		return nil, listFilesOutput{}, m.toolError("list files", err)
-	}
-	files := make([]sqlcgen.File, 0, len(rows))
-	for _, row := range rows {
-		files = append(files, listRowToFile(row))
 	}
 	if len(files) == 0 {
 		return textResult("This project has no documents yet. Use upload_file to add one."),
@@ -436,32 +438,28 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, searchFilesOutput{}, errors.New("query is required")
 	}
 
-	rows, err := m.queries.SearchUserFilesWithContent(ctx, sqlcgen.SearchUserFilesWithContentParams{
-		UserID:       user.ID,
-		NameQuery:    q,
-		ContentQuery: q,
-	})
+	hits, err := searchOwnFiles(ctx, m.queries, m.blobs, user.ID, q)
 	if err != nil {
 		return nil, searchFilesOutput{}, m.toolError("search files", err)
 	}
 
-	if len(rows) == 0 {
+	if len(hits) == 0 {
 		return textResult("No documents matching %q were found in this project.", q),
 			searchFilesOutput{Found: false, Results: []searchFilesMatch{}}, nil
 	}
 
-	out := searchFilesOutput{Found: true, Results: make([]searchFilesMatch, 0, len(rows))}
+	out := searchFilesOutput{Found: true, Results: make([]searchFilesMatch, 0, len(hits))}
 	var lines []string
-	for _, row := range rows {
-		f := contentSearchRowToFile(row)
+	for _, hit := range hits {
+		f := hit.file
 		match := searchFilesMatch{mcpFileInfo: fileInfo(baseURL, f)}
 		if !containsFold(f.Name, q) {
-			match.Snippet = snippetFromWindow(row.SnippetWindow, q, row.MatchPos, row.ContentChars)
+			match.Snippet = snippetFromWindow(hit.window, q, hit.matchPos, hit.contentChars)
 		}
 		out.Results = append(out.Results, match)
 		lines = append(lines, fmt.Sprintf("- %q (%s): %s", f.Name, visibilityLabel(f), match.URL))
 	}
-	return textResult("Found %d document(s) matching %q:\n%s", len(rows), q, strings.Join(lines, "\n")), out, nil
+	return textResult("Found %d document(s) matching %q:\n%s", len(hits), q, strings.Join(lines, "\n")), out, nil
 }
 
 // --- update ---
@@ -490,10 +488,9 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, mcpFileInfo{}, err
 	}
-	// A site has no single document to write; its html_content is '' by
-	// design. UpdateFile would match no row anyway (kind <> 'site' in SQL),
-	// but that would read as an internal error rather than a pointer to the
-	// right tool.
+	// A site has no single document to write; its blob is a zip. UpdateFile
+	// would match no row anyway (kind <> 'site' in SQL), but that would read
+	// as an internal error rather than a pointer to the right tool.
 	if file.Kind == KindSite {
 		return nil, mcpFileInfo{}, errors.New("this is a site; use update_site to change its files or name")
 	}
@@ -505,22 +502,25 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if err := nameTooLong(name); err != nil {
 		return nil, mcpFileInfo{}, err
 	}
-	content := file.HtmlContent
+	// A rename alone keeps the blob it has; new content is a new blob, after
+	// the quota check. file.ContentSize is what that write replaces, so
+	// rewriting a document with one of the same size is not charged twice.
+	blobID := file.BlobID
 	if in.Content != "" {
-		content = in.Content
-	}
-	// file.ContentSize is what this write replaces, so rewriting a document
-	// with one of the same size is not charged twice.
-	if err := enforceQuota(ctx, m.queries, user, int64(len(content)), file.ContentSize); err != nil {
-		return nil, mcpFileInfo{}, m.toolError("check quota", err, "user_id", user.ID)
+		if err := enforceQuota(ctx, m.queries, user, int64(len(in.Content)), file.ContentSize); err != nil {
+			return nil, mcpFileInfo{}, m.toolError("check quota", err, "user_id", user.ID)
+		}
+		if blobID, err = storeContent(ctx, m.queries, m.blobs, []byte(in.Content)); err != nil {
+			return nil, mcpFileInfo{}, m.toolError("store file", err)
+		}
 	}
 	updated, err := m.queries.UpdateFile(ctx, sqlcgen.UpdateFileParams{
-		Name:        name,
-		NewSlug:     file.Slug, // slug and access code deliberately unchanged over MCP
-		HtmlContent: content,
-		AccessCode:  file.AccessCode,
-		Slug:        file.Slug,
-		UserID:      user.ID,
+		Name:       name,
+		NewSlug:    file.Slug, // slug and access code deliberately unchanged over MCP
+		BlobID:     blobID,
+		AccessCode: file.AccessCode,
+		Slug:       file.Slug,
+		UserID:     user.ID,
 	})
 	if err != nil {
 		return nil, mcpFileInfo{}, m.toolError("update file", err)
@@ -693,7 +693,7 @@ func (m *MCPHandler) uploadSite(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, siteOutput{}, err
 	}
 	// Private, like every MCP upload: publish_file is the consent step.
-	file, err := storeNewSite(ctx, m.queries, user, name, entries, false)
+	file, err := storeNewSite(ctx, m.queries, m.blobs, user, name, entries, false)
 	if err != nil {
 		return nil, siteOutput{}, m.toolError("upload site", err)
 	}
@@ -723,19 +723,7 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, siteOutput{}, err
 	}
 
-	// Read, merge and write back in one transaction. It is BEGIN IMMEDIATE
-	// (see db.Open), so it holds the write lock from the read onwards and no
-	// other write interleaves. Every query in here must go through q: one on
-	// m.queries runs on another connection, outside the transaction -- and a
-	// write there would wait on the lock this transaction holds.
-	tx, err := m.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, siteOutput{}, m.toolError("begin update site", err)
-	}
-	defer tx.Rollback()
-	q := m.queries.WithTx(tx)
-
-	file, err := m.ownedFile(ctx, q, user, in.Slug)
+	file, err := m.ownedFile(ctx, m.queries, user, in.Slug)
 	if err != nil {
 		return nil, siteOutput{}, err
 	}
@@ -743,11 +731,20 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, siteOutput{}, errors.New("this is a single document, not a site; use update_file")
 	}
 
-	arc, err := site.Open(file.Archive)
+	// Read, merge and write the new archive with no lock held: that is disk
+	// work, and SQLite's write lock is the whole database's. What keeps a
+	// concurrent edit from being silently overwritten is the compare-and-swap
+	// below, which only replaces the archive this call read.
+	stored, err := readContent(m.blobs, file)
+	if err != nil {
+		return nil, siteOutput{}, m.toolError("read site", err)
+	}
+	arc, err := site.OpenBytes(stored)
 	if err != nil {
 		return nil, siteOutput{}, m.toolError("open site", err)
 	}
 	listing := arc.List()
+	newBlob := ""
 	if len(in.Put) > 0 || len(in.Delete) > 0 {
 		old, err := arc.Entries()
 		if err != nil {
@@ -761,14 +758,38 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 		if err != nil {
 			return nil, siteOutput{}, m.toolError("pack site", err)
 		}
-		if err := enforceQuota(ctx, q, user, int64(len(archive)), file.ContentSize); err != nil {
+		if err := enforceQuota(ctx, m.queries, user, int64(len(archive)), file.ContentSize); err != nil {
 			return nil, siteOutput{}, m.toolError("check quota", err)
 		}
-		file, err = q.ReplaceSiteArchive(ctx, sqlcgen.ReplaceSiteArchiveParams{Archive: archive, Slug: file.Slug, UserID: user.ID})
+		if newBlob, err = storeContent(ctx, m.queries, m.blobs, archive); err != nil {
+			return nil, siteOutput{}, m.toolError("store site", err)
+		}
+		listing = site.Infos(merged)
+	}
+
+	// The swap and the rename commit together. The transaction is BEGIN
+	// IMMEDIATE (see db.Open) and holds the write lock only for these two
+	// statements. Every query in here must go through q: one on m.queries
+	// runs on another connection, outside the transaction -- and a write
+	// there would wait on the lock this transaction holds.
+	tx, err := m.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, siteOutput{}, m.toolError("begin update site", err)
+	}
+	defer tx.Rollback()
+	q := m.queries.WithTx(tx)
+	if newBlob != "" {
+		file, err = q.ReplaceSiteBlob(ctx, sqlcgen.ReplaceSiteBlobParams{
+			BlobID: newBlob, Slug: file.Slug, UserID: user.ID, OldBlobID: file.BlobID,
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			// Deleted, or replaced by another edit since it was read. Either
+			// way this patch was made against a version that is gone.
+			return nil, siteOutput{}, errors.New("the site changed (or was deleted) while this update was being applied; read it again and retry")
+		}
 		if err != nil {
 			return nil, siteOutput{}, m.toolError("replace site", err)
 		}
-		listing = site.Infos(merged)
 	}
 	if name != "" {
 		file, err = q.RenameFile(ctx, sqlcgen.RenameFileParams{Name: name, Slug: file.Slug, UserID: user.ID})

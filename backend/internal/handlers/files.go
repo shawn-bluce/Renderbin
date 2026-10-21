@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 	"github.com/shawn-bluce/renderbin/backend/internal/site"
 )
@@ -84,7 +85,8 @@ func withFreshSlug(insert func(slug string) (sqlcgen.File, error)) (sqlcgen.File
 }
 
 // createFileWithFreshSlug inserts a document under a fresh slug (params.Slug is
-// overwritten).
+// overwritten). params.BlobID names content already stored with storeContent;
+// a retry reuses it.
 func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, params sqlcgen.CreateFileParams) (sqlcgen.File, error) {
 	return withFreshSlug(func(slug string) (sqlcgen.File, error) {
 		params.Slug = slug
@@ -94,20 +96,24 @@ func createFileWithFreshSlug(ctx context.Context, queries *sqlcgen.Queries, para
 
 type FilesHandler struct {
 	queries *sqlcgen.Queries
-	logger  *slog.Logger
+	// blobs holds every file's content; queries holds where to find it.
+	blobs  *blobstore.Store
+	logger *slog.Logger
 	// preview signs the owner's preview links into private sites; see
 	// previewSigner. Its key lives only in this process.
 	preview *previewSigner
 }
 
-func NewFilesHandler(queries *sqlcgen.Queries, logger *slog.Logger) *FilesHandler {
-	return &FilesHandler{queries: queries, logger: logger, preview: newPreviewSigner()}
+func NewFilesHandler(queries *sqlcgen.Queries, blobs *blobstore.Store, logger *slog.Logger) *FilesHandler {
+	return &FilesHandler{queries: queries, blobs: blobs, logger: logger, preview: newPreviewSigner()}
 }
 
 type fileResponse struct {
-	Slug        string `json:"slug"`
-	Name        string `json:"name"`
-	Kind        string `json:"kind"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	// HTMLContent is the document's source, filled by Get alone: it is the
+	// one endpoint that returns content, and it feeds the editor.
 	HTMLContent string `json:"html_content,omitempty"`
 	// Size is the stored source's length in bytes (for a site, its compressed
 	// archive), read from the files.content_size column the INSERT and UPDATE
@@ -142,7 +148,6 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 		Slug:             f.Slug,
 		Name:             f.Name,
 		Kind:             f.Kind,
-		HTMLContent:      f.HtmlContent,
 		Size:             f.ContentSize,
 		IsPublic:         f.IsPublic,
 		AccessCode:       f.AccessCode,
@@ -173,14 +178,6 @@ func fmtNullTime(t sql.NullTime) *string {
 	return &s
 }
 
-// fileMetaResponse is toFileResponse without the document source: what every
-// endpoint but Get returns for a file it just wrote.
-func fileMetaResponse(f sqlcgen.File) fileResponse {
-	resp := toFileResponse(f)
-	resp.HTMLContent = ""
-	return resp
-}
-
 // writeFile finishes a handler whose last step is one query returning the
 // file's row: no row is the usual 404, any other error is a logged 500, and
 // success answers with the row's metadata.
@@ -189,7 +186,7 @@ func (h *FilesHandler) writeFile(w http.ResponseWriter, op string, file sqlcgen.
 		queryError(w, h.logger, op, err)
 		return
 	}
-	writeJSON(w, fileMetaResponse(file))
+	writeJSON(w, toFileResponse(file))
 }
 
 // normalizeTags trims whitespace around each comma-separated tag, drops
@@ -211,38 +208,6 @@ func normalizeTags(raw string) string {
 	return strings.Join(tags, ",")
 }
 
-// The listing and search queries deliberately don't select html_content (see
-// queries/files.sql), so sqlc emits a distinct row struct for each of them
-// instead of the shared File model. These converters funnel those rows back
-// into one File with an empty HtmlContent, so toFileResponse stays the single
-// place that formats a file for the wire.
-//
-// The list, trash and name-search rows are field-for-field the same struct, so
-// they share listRowToFile through a type conversion -- which, unlike a
-// struct literal, stops compiling if one of them gains a column the others
-// lack. Only the content search has extra fields, and keeps its own.
-func listRowToFile(r sqlcgen.ListUserFilesRow) sqlcgen.File {
-	return sqlcgen.File{
-		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
-		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
-		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
-		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
-		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
-	}
-}
-
-func contentSearchRowToFile(r sqlcgen.SearchUserFilesWithContentRow) sqlcgen.File {
-	return sqlcgen.File{
-		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
-		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
-		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
-		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
-		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
-	}
-}
-
 func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
@@ -258,7 +223,7 @@ func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = make([]fileResponse, 0, len(rows))
 		for _, row := range rows {
-			resp = append(resp, toFileResponse(listRowToFile(sqlcgen.ListUserFilesRow(row))))
+			resp = append(resp, toFileResponse(row))
 		}
 	} else {
 		rows, err := h.queries.ListUserFiles(r.Context(), user.ID)
@@ -268,7 +233,7 @@ func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = make([]fileResponse, 0, len(rows))
 		for _, row := range rows {
-			resp = append(resp, toFileResponse(listRowToFile(row)))
+			resp = append(resp, toFileResponse(row))
 		}
 	}
 
@@ -301,27 +266,26 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 	case q == "":
 		// Nothing to search; answer with no rows.
 	case includeContent:
-		rows, err := h.queries.SearchUserFilesWithContent(r.Context(), sqlcgen.SearchUserFilesWithContentParams{
-			UserID:       user.ID,
-			NameQuery:    q,
-			ContentQuery: q,
-		})
+		hits, err := searchOwnFiles(r.Context(), h.queries, h.blobs, user.ID, q)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return // the client went away; there is no one to answer
+			}
 			serverError(w, h.logger, "search files", err)
 			return
 		}
-		for _, row := range rows {
+		for _, hit := range hits {
 			res := searchResultResponse{
-				fileResponse:   toFileResponse(contentSearchRowToFile(row)),
-				MatchedName:    containsFold(row.Name, q),
-				MatchedContent: row.MatchPos > 0,
+				fileResponse:   toFileResponse(hit.file),
+				MatchedName:    containsFold(hit.file.Name, q),
+				MatchedContent: hit.matchPos > 0,
 			}
 			// A title hit renders as a plain row, so only a content-*only* hit
 			// carries a snippet -- but matched_content above reports the truth
 			// either way, since a consumer other than the dashboard has no
 			// reason to read it as "matched content and nothing else".
 			if !res.MatchedName {
-				res.Snippet = snippetFromWindow(row.SnippetWindow, q, row.MatchPos, row.ContentChars)
+				res.Snippet = snippetFromWindow(hit.window, q, hit.matchPos, hit.contentChars)
 			}
 			resp = append(resp, res)
 		}
@@ -336,7 +300,7 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			resp = append(resp, searchResultResponse{
-				fileResponse: toFileResponse(listRowToFile(sqlcgen.ListUserFilesRow(row))),
+				fileResponse: toFileResponse(row),
 				MatchedName:  true,
 			})
 		}
@@ -355,22 +319,21 @@ func containsFold(s, substr string) bool {
 // content match in search results.
 const snippetRadius = 100
 
-// snippetFromWindow turns the bounded window SearchUserFilesWithContent
-// extracts around a match into the excerpt the dashboard shows: the match plus
-// up to snippetRadius runes either side, with an ellipsis on each end that was
+// snippetFromWindow turns the bounded window contentWindow extracts around a
+// match into the excerpt the dashboard shows: the match plus up to
+// snippetRadius runes either side, with an ellipsis on each end that was
 // truncated.
 //
-// The window comes from SQL rather than the whole document on purpose -- see
-// the query -- so this never sees the file's full source and cannot be given a
-// 5MB string to slice. It receives the window, the 1-based character offset of
-// the match within the *document* (0 when the content did not match at all),
-// and the document's length in characters, which together are everything
-// needed to decide about ellipses.
+// It receives the window, the 1-based character offset of the match within
+// the *document* (0 when the content did not match at all), and the
+// document's length in characters, which together are everything needed to
+// decide about ellipses. (The window shape is what the SQL search used to
+// return, and contentWindow still produces it.)
 //
-// The window already starts at the right place (SQL clips it to 100 characters
-// before the match), so only its tail may need trimming: when the match sits
-// near the start of the document the "before" part is short and SQL's
-// fixed-length window runs further past the match than snippetRadius allows.
+// The window already starts at the right place (100 characters before the
+// match), so only its tail may need trimming: when the match sits near the
+// start of the document the "before" part is short and the fixed-length
+// window runs further past the match than snippetRadius allows.
 func snippetFromWindow(window, query string, matchPos, contentChars int64) string {
 	if matchPos <= 0 || window == "" {
 		return ""
@@ -534,11 +497,16 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		serverError(w, h.logger, "generate access code", err)
 		return
 	}
+	blobID, err := storeContent(r.Context(), h.queries, h.blobs, []byte(req.HTMLContent))
+	if err != nil {
+		serverError(w, h.logger, "create file", err)
+		return
+	}
 
 	file, err := createFileWithFreshSlug(r.Context(), h.queries, sqlcgen.CreateFileParams{
-		Name:        req.Name,
-		HtmlContent: req.HTMLContent,
-		Kind:        kind,
+		Name:   req.Name,
+		BlobID: blobID,
+		Kind:   kind,
 		// The instance-wide default visibility. Deliberately not a request
 		// field: visibility changes are their own endpoint, and a per-request
 		// override here would let one protocol bypass the policy the admin set.
@@ -555,7 +523,7 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONStatus(w, http.StatusCreated, fileMetaResponse(file))
+	writeJSONStatus(w, http.StatusCreated, toFileResponse(file))
 }
 
 // userFile loads the caller's own live file by slug, answering 404 (a slug
@@ -574,9 +542,9 @@ func (h *FilesHandler) userFile(w http.ResponseWriter, r *http.Request, user sql
 }
 
 // ownedFileSize is the lookup an edit starts with: what the write is about to
-// replace (for the quota) and the file's kind. A slug that matches nothing 404s
-// here rather than after the quota check, which keeps a missing file from being
-// reported as a full one.
+// replace (for the quota), the file's kind, and its current blob. A slug that
+// matches nothing 404s here rather than after the quota check, which keeps a
+// missing file from being reported as a full one.
 func (h *FilesHandler) ownedFileSize(w http.ResponseWriter, r *http.Request, user sqlcgen.User, slug string) (sqlcgen.GetUserFileSizeRow, bool) {
 	old, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
 		Slug:   slug,
@@ -607,12 +575,19 @@ func (h *FilesHandler) Get(w http.ResponseWriter, r *http.Request) {
 	if file.Kind == KindSite {
 		// A site has no single source to edit; the dashboard shows what it
 		// holds instead, read from the zip's central directory alone.
-		entries, err := site.List(file.Archive)
+		entries, err := h.siteEntries(file)
 		if err != nil {
 			serverError(w, h.logger, "list site entries", err, "slug", file.Slug)
 			return
 		}
 		resp.Entries = entries
+	} else {
+		content, err := readContent(h.blobs, file)
+		if err != nil {
+			serverError(w, h.logger, "read file", err)
+			return
+		}
+		resp.HTMLContent = string(content)
 	}
 	writeJSON(w, resp)
 }
@@ -690,13 +665,18 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if !h.checkQuota(w, r, user, int64(len(req.HTMLContent)), old.ContentSize) {
 			return
 		}
+		blobID, blobErr := contentBlob(r.Context(), h.queries, h.blobs, []byte(req.HTMLContent), old.BlobID, old.Sha256)
+		if blobErr != nil {
+			serverError(w, h.logger, "update file", blobErr)
+			return
+		}
 		file, err = h.queries.UpdateFile(r.Context(), sqlcgen.UpdateFileParams{
-			Name:        req.Name,
-			NewSlug:     req.Slug,
-			HtmlContent: req.HTMLContent,
-			AccessCode:  req.AccessCode,
-			Slug:        oldSlug,
-			UserID:      user.ID,
+			Name:       req.Name,
+			NewSlug:    req.Slug,
+			BlobID:     blobID,
+			AccessCode: req.AccessCode,
+			Slug:       oldSlug,
+			UserID:     user.ID,
 		})
 	}
 	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
@@ -1138,7 +1118,12 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 		if !file.IsPublic {
 			note = qrNotePrivate
 		}
-		page := renderContent(file.Kind, file.Name, file.HtmlContent)
+		content, err := readContent(h.blobs, file)
+		if err != nil {
+			serverError(w, h.logger, "read file", err)
+			return
+		}
+		page := renderContent(file.Kind, file.Name, string(content))
 		writeUserHTML(w, http.StatusOK, h.withQRWidget(r.Context(), page, note))
 		return
 	}
@@ -1225,7 +1210,8 @@ const htmlContentType = "text/html; charset=utf-8"
 
 // Download serves the raw source as a file attachment at
 // GET /api/files/{slug}/download. It returns the stored source untransformed
-// (not the rendered form), with a filename extension matching the file's kind.
+// (not the rendered form), with a filename extension matching the file's kind,
+// streamed from its blob (so Range requests and conditional GETs work too).
 // Scoped to the caller's own files, so a soft-deleted, unknown, or foreign
 // slug all 404 alike. Unlike Render, this is not a public view and
 // deliberately does not touch success_count/failure_count.
@@ -1239,14 +1225,17 @@ func (h *FilesHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", downloadContentType(file.Kind))
-	w.Header().Set("Content-Disposition", downloadDisposition(file.Name, file.Slug, extForKind(file.Kind)))
-	if file.Kind == KindSite {
-		// The stored archive is already the site's source, as a zip.
-		w.Write(file.Archive)
+	// A site's blob is already its source, as a zip.
+	content, err := h.blobs.Open(file.BlobID)
+	if err != nil {
+		serverError(w, h.logger, "open file", err, "slug", file.Slug)
 		return
 	}
-	w.Write([]byte(file.HtmlContent))
+	defer content.Close()
+
+	w.Header().Set("Content-Type", downloadContentType(file.Kind))
+	w.Header().Set("Content-Disposition", downloadDisposition(file.Name, file.Slug, extForKind(file.Kind)))
+	http.ServeContent(w, r, "", file.UpdatedAt, content)
 }
 
 // downloadDisposition builds a Content-Disposition header for a download.

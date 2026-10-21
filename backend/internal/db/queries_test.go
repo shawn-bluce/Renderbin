@@ -2,24 +2,63 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/shawn-bluce/renderbin/backend/internal/blobstore"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
-func newQueries(t *testing.T) *sqlcgen.Queries {
+// testStore is an empty blob store in the test's temp dir.
+func testStore(t *testing.T) *blobstore.Store {
 	t.Helper()
-	conn, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	store, err := blobstore.Open(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatalf("blobstore.Open: %v", err)
+	}
+	return store
+}
+
+// openTest opens a fresh database in the test's temp dir.
+func openTest(t *testing.T) *sql.DB {
+	t.Helper()
+	conn, err := Open(filepath.Join(t.TempDir(), "app.db"), testStore(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return sqlcgen.New(conn)
+	return conn
+}
+
+func newQueries(t *testing.T) *sqlcgen.Queries {
+	t.Helper()
+	return sqlcgen.New(openTest(t))
+}
+
+// newBlob records a blob holding content and returns its id. These tests
+// exercise SQL, so the bytes never need to exist on disk: the record is what
+// the files statements and triggers look at.
+func newBlob(t *testing.T, q *sqlcgen.Queries, content string) string {
+	t.Helper()
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatal(err)
+	}
+	id := hex.EncodeToString(raw)
+	sum := sha256.Sum256([]byte(content))
+	if err := q.InsertBlob(context.Background(), sqlcgen.InsertBlobParams{
+		ID: id, Size: int64(len(content)), Sha256: hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("InsertBlob: %v", err)
+	}
+	return id
 }
 
 // ensureUser returns the named user, creating it on first use. Tests that only
@@ -53,13 +92,13 @@ func createFile(t *testing.T, q *sqlcgen.Queries, slug string) sqlcgen.File {
 		t.Fatalf("createFile's owner has id %d, not 1 -- create it before any other user", owner.ID)
 	}
 	f, err := q.CreateFile(context.Background(), sqlcgen.CreateFileParams{
-		Slug:        slug,
-		Name:        "name-" + slug,
-		HtmlContent: "<p>" + slug + "</p>",
-		Kind:        "html",
-		IsPublic:    false,
-		AccessCode:  "code-" + slug,
-		UserID:      1,
+		Slug:       slug,
+		Name:       "name-" + slug,
+		BlobID:     newBlob(t, q, "<p>"+slug+"</p>"),
+		Kind:       "html",
+		IsPublic:   false,
+		AccessCode: "code-" + slug,
+		UserID:     1,
 	})
 	if err != nil {
 		t.Fatalf("CreateFile(%q): %v", slug, err)
@@ -110,7 +149,7 @@ func TestListFilesVsDeleted(t *testing.T) {
 		t.Fatalf("ListUserFiles: %v", err)
 	}
 	if len(active) != 1 || active[0].Slug != "keep" {
-		t.Errorf("ListUserFiles = %v, want only [keep]", activeSlugs(active))
+		t.Errorf("ListUserFiles = %v, want only [keep]", slugsOf(active))
 	}
 
 	deleted, err := q.ListUserDeletedFiles(ctx, 1)
@@ -118,7 +157,7 @@ func TestListFilesVsDeleted(t *testing.T) {
 		t.Fatalf("ListUserDeletedFiles: %v", err)
 	}
 	if len(deleted) != 1 || deleted[0].Slug != "trash" {
-		t.Errorf("ListUserDeletedFiles = %v, want only [trash]", trashSlugs(deleted))
+		t.Errorf("ListUserDeletedFiles = %v, want only [trash]", slugsOf(deleted))
 	}
 }
 
@@ -153,19 +192,21 @@ func TestUpdateFileChangesSlugNameContent(t *testing.T) {
 	q := newQueries(t)
 	ctx := context.Background()
 	createFile(t, q, "old")
+	v2 := newBlob(t, q, "<h1>v2</h1>")
 
 	updated, err := q.UpdateFile(ctx, sqlcgen.UpdateFileParams{
-		Name:        "new name",
-		NewSlug:     "new-slug",
-		HtmlContent: "<h1>v2</h1>",
-		AccessCode:  "code-new",
-		Slug:        "old", // WHERE (old) slug
-		UserID:      1,
+		Name:       "new name",
+		NewSlug:    "new-slug",
+		BlobID:     v2,
+		AccessCode: "code-new",
+		Slug:       "old", // WHERE (old) slug
+		UserID:     1,
 	})
 	if err != nil {
 		t.Fatalf("UpdateFile: %v", err)
 	}
-	if updated.Slug != "new-slug" || updated.Name != "new name" || updated.HtmlContent != "<h1>v2</h1>" {
+	if updated.Slug != "new-slug" || updated.Name != "new name" || updated.BlobID != v2 ||
+		updated.ContentSize != int64(len("<h1>v2</h1>")) {
 		t.Errorf("UpdateFile result = %+v", updated)
 	}
 	if _, err := q.GetFileBySlugAnyOwner(ctx, "old"); !errors.Is(err, sql.ErrNoRows) {
@@ -183,12 +224,12 @@ func TestUpdateFileDuplicateSlugFails(t *testing.T) {
 	createFile(t, q, "b")
 
 	_, err := q.UpdateFile(ctx, sqlcgen.UpdateFileParams{
-		Name:        "x",
-		NewSlug:     "a", // collide with existing slug "a"
-		HtmlContent: "<p>x</p>",
-		AccessCode:  "code-x",
-		Slug:        "b",
-		UserID:      1,
+		Name:       "x",
+		NewSlug:    "a", // collide with existing slug "a"
+		BlobID:     newBlob(t, q, "<p>x</p>"),
+		AccessCode: "code-x",
+		Slug:       "b",
+		UserID:     1,
 	})
 	if err == nil {
 		t.Fatal("expected a uniqueness error, got nil")
@@ -338,7 +379,7 @@ func TestHardDeleteUserTrash(t *testing.T) {
 	createFile(t, q, "trash2")
 	stranger := ensureUser(t, q, "stranger")
 	if _, err := q.CreateFile(ctx, sqlcgen.CreateFileParams{
-		Slug: "theirs", Name: "theirs", HtmlContent: "<p>x</p>", Kind: "html",
+		Slug: "theirs", Name: "theirs", BlobID: newBlob(t, q, "<p>x</p>"), Kind: "html",
 		AccessCode: "c", UserID: stranger.ID,
 	}); err != nil {
 		t.Fatalf("CreateFile(theirs): %v", err)
@@ -370,7 +411,7 @@ func TestHardDeleteUserTrash(t *testing.T) {
 		t.Fatalf("ListUserDeletedFiles: %v", err)
 	}
 	if len(theirs) != 1 {
-		t.Errorf("stranger's trash = %v, want their own file left alone", trashSlugs(theirs))
+		t.Errorf("stranger's trash = %v, want their own file left alone", slugsOf(theirs))
 	}
 
 	// Emptying an empty trash is a no-op, not an error.
@@ -585,17 +626,7 @@ func TestConfigSetOverwrites(t *testing.T) {
 	}
 }
 
-// The two listings select an explicit column set rather than *, so sqlc emits
-// a distinct row type for each and one helper cannot serve both.
-func activeSlugs(rows []sqlcgen.ListUserFilesRow) []string {
-	out := make([]string, len(rows))
-	for i, r := range rows {
-		out[i] = r.Slug
-	}
-	return out
-}
-
-func trashSlugs(rows []sqlcgen.ListUserDeletedFilesRow) []string {
+func slugsOf(rows []sqlcgen.File) []string {
 	out := make([]string, len(rows))
 	for i, r := range rows {
 		out[i] = r.Slug
@@ -640,7 +671,7 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 		}},
 		{"UpdateFile", func(t *testing.T, q *sqlcgen.Queries) bool {
 			_, err := q.UpdateFile(ctx, sqlcgen.UpdateFileParams{
-				Name: "hacked", NewSlug: "hacked", HtmlContent: "<p>hacked</p>",
+				Name: "hacked", NewSlug: "hacked", BlobID: newBlob(t, q, "<p>hacked</p>"),
 				AccessCode: "hacked", Slug: "a", UserID: stranger,
 			})
 			return !errors.Is(err, sql.ErrNoRows)
@@ -687,21 +718,12 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			}
 			return len(rows) != 0
 		}},
-		{"SearchUserFilesWithContent", func(t *testing.T, q *sqlcgen.Queries) bool {
-			rows, err := q.SearchUserFilesWithContent(ctx, sqlcgen.SearchUserFilesWithContentParams{
-				UserID: stranger, NameQuery: "name", ContentQuery: "<p>",
-			})
-			if err != nil {
-				t.Fatalf("SearchUserFilesWithContent: %v", err)
-			}
-			return len(rows) != 0
-		}},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			q := newQueries(t)
-			createFile(t, q, "a") // owned by user 1
+			created := createFile(t, q, "a") // owned by user 1
 			if c.run(t, q) {
 				t.Errorf("%s matched user %d's file as user %d", c.name, owner, stranger)
 			}
@@ -710,7 +732,7 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			if err != nil {
 				t.Fatalf("file should still exist: %v", err)
 			}
-			if got.Name != "name-a" || got.HtmlContent != "<p>a</p>" || got.AccessCode != "code-a" ||
+			if got.Name != "name-a" || got.BlobID != created.BlobID || got.AccessCode != "code-a" ||
 				got.IsPublic || got.Tags != "" || got.DeletedAt.Valid {
 				t.Errorf("file was mutated by a foreign-owner query: %+v", got)
 			}
@@ -731,9 +753,13 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			})
 			return err
 		}},
-		{"ReplaceSiteArchive", func(q *sqlcgen.Queries, userID int64) error {
-			_, err := q.ReplaceSiteArchive(ctx, sqlcgen.ReplaceSiteArchiveParams{
-				Archive: []byte("hacked"), Slug: "site", UserID: userID,
+		{"ReplaceSiteBlob", func(q *sqlcgen.Queries, userID int64) error {
+			site, err := q.GetSiteBySlugAnyOwner(ctx, "site")
+			if err != nil {
+				return err
+			}
+			_, err = q.ReplaceSiteBlob(ctx, sqlcgen.ReplaceSiteBlobParams{
+				BlobID: newBlob(t, q, "hacked"), Slug: "site", UserID: userID, OldBlobID: site.BlobID,
 			})
 			return err
 		}},
@@ -741,8 +767,9 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			q := newQueries(t)
 			createFile(t, q, "a") // seeds user 1
+			original := newBlob(t, q, "original")
 			if _, err := q.CreateSite(ctx, sqlcgen.CreateSiteParams{
-				Slug: "site", Name: "site", Archive: []byte("original"), AccessCode: "code-site", UserID: owner,
+				Slug: "site", Name: "site", BlobID: original, AccessCode: "code-site", UserID: owner,
 			}); err != nil {
 				t.Fatalf("CreateSite: %v", err)
 			}
@@ -753,7 +780,7 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			if err != nil {
 				t.Fatalf("site should still exist: %v", err)
 			}
-			if got.Name != "site" || got.AccessCode != "code-site" || string(got.Archive) != "original" {
+			if got.Name != "site" || got.AccessCode != "code-site" || got.BlobID != original {
 				t.Errorf("site was mutated by a foreign-owner statement: %+v", got)
 			}
 			if err := c.run(q, owner); err != nil {
@@ -801,8 +828,39 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 				t.Fatalf("ListUserDeletedFiles: %v", err)
 			}
 			if len(rows) != 1 || rows[0].Slug != "a" {
-				t.Errorf("owner's trash = %v, want [a]", trashSlugs(rows))
+				t.Errorf("owner's trash = %v, want [a]", slugsOf(rows))
 			}
 		})
+	}
+}
+
+// ReplaceSiteBlob is a compare-and-swap: update_site builds the new archive
+// with no lock held, so the write must only land on the version it read.
+func TestReplaceSiteBlobRefusesAStaleBase(t *testing.T) {
+	q := newQueries(t)
+	ctx := context.Background()
+	createFile(t, q, "a") // seeds user 1
+	v1 := newBlob(t, q, "v1")
+	if _, err := q.CreateSite(ctx, sqlcgen.CreateSiteParams{
+		Slug: "site", Name: "site", BlobID: v1, AccessCode: "c", UserID: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Another edit lands first.
+	v2 := newBlob(t, q, "v2!")
+	if _, err := q.ReplaceSiteBlob(ctx, sqlcgen.ReplaceSiteBlobParams{
+		BlobID: v2, Slug: "site", UserID: 1, OldBlobID: v1,
+	}); err != nil {
+		t.Fatalf("first replace: %v", err)
+	}
+	// This one was built on v1, which is gone.
+	_, err := q.ReplaceSiteBlob(ctx, sqlcgen.ReplaceSiteBlobParams{
+		BlobID: newBlob(t, q, "v3 on top of v1"), Slug: "site", UserID: 1, OldBlobID: v1,
+	})
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale replace = %v, want no rows", err)
+	}
+	if got, _ := q.GetSiteBySlugAnyOwner(ctx, "site"); got.BlobID != v2 || got.ContentSize != 3 {
+		t.Errorf("site = blob %s size %d, want the first edit's", got.BlobID, got.ContentSize)
 	}
 }

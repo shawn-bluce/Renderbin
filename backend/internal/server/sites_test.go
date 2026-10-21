@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -135,7 +137,10 @@ func (e *testEnv) fileRow(t *testing.T, slug string) sqlcgen.File {
 }
 
 // archiveSize is the byte length of a site row's stored zip.
-func archiveSize(f sqlcgen.File) int64 { return int64(len(f.Archive)) }
+func (e *testEnv) archiveSize(t *testing.T, f sqlcgen.File) int64 {
+	t.Helper()
+	return int64(len(e.content(t, f)))
+}
 
 func wantRedirect(t *testing.T, resp *http.Response, location string) {
 	t.Helper()
@@ -486,11 +491,11 @@ func TestSiteViewCounting(t *testing.T) {
 }
 
 // TestSiteRevalidationSkipsArchive pins that a conditional request is answered
-// from the row's metadata, without loading the zip. Every asset of a site
+// from the row's metadata, without opening the zip. Every asset of a site
 // revalidates on every visit (Cache-Control: no-cache), so loading a multi-MB
 // archive to answer each 304 was the bulk of a repeat visit's cost. The
 // stored archive is replaced with garbage behind the handler's back: a
-// request that loads it fails, so a 304 proves it was never read.
+// request that reads it fails, so a 304 proves it was never read.
 func TestSiteRevalidationSkipsArchive(t *testing.T) {
 	e := newEnv(t)
 	cookie := e.authCookie(t)
@@ -503,8 +508,10 @@ func TestSiteRevalidationSkipsArchive(t *testing.T) {
 	assertStatus(t, first, http.StatusOK)
 	lm := first.Header.Get("Last-Modified")
 
-	// Writing archive alone leaves updated_at as it was.
-	if _, err := e.conn.Exec(`UPDATE files SET archive = x'00' WHERE slug = ?`, s.Slug); err != nil {
+	// Overwriting the blob on disk leaves the row, updated_at included, as
+	// it was.
+	blob := e.fileRow(t, s.Slug).BlobID
+	if err := os.WriteFile(filepath.Join(e.blobs.Dir(), blob[:2], blob), []byte{0}, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -542,7 +549,9 @@ func TestSiteRevalidationSkipsArchive(t *testing.T) {
 	// new bytes and the new date.
 	later := time.Now().Add(time.Hour).UTC()
 	fresh := makeSiteZip(t, map[string]string{"index.html": "<p>new</p>", "css/site.css": "body{color:red}"})
-	if _, err := e.conn.Exec(`UPDATE files SET archive = ?, updated_at = ? WHERE slug = ?`, fresh, later, s.Slug); err != nil {
+	freshBlob := e.storeBlob(t, fresh)
+	if _, err := e.conn.Exec(`UPDATE files SET blob_id = ?, content_size = ?, updated_at = ? WHERE slug = ?`,
+		freshBlob, len(fresh), later, s.Slug); err != nil {
 		t.Fatal(err)
 	}
 	ims["Sec-Fetch-Dest"] = "style"
@@ -563,11 +572,8 @@ func TestSiteStorageAndEdits(t *testing.T) {
 
 	// content_size is the compressed archive, i.e. what the database holds.
 	row := e.fileRow(t, s.Slug)
-	if row.ContentSize != archiveSize(row) || row.ContentSize == 0 {
-		t.Errorf("content_size = %d, archive = %d bytes", row.ContentSize, archiveSize(row))
-	}
-	if row.HtmlContent != "" {
-		t.Errorf("html_content = %q, want empty for a site", row.HtmlContent)
+	if row.ContentSize != e.archiveSize(t, row) || row.ContentSize == 0 {
+		t.Errorf("content_size = %d, archive = %d bytes", row.ContentSize, e.archiveSize(t, row))
 	}
 	size := row.ContentSize
 
@@ -577,8 +583,8 @@ func TestSiteStorageAndEdits(t *testing.T) {
 	// Without content it renames, re-slugs and re-codes, and the size holds.
 	e.expect(t, http.StatusOK, http.MethodPatch, "/api/files/"+s.Slug,
 		`{"name":"renamed","slug":"my-site","access_code":"newcode"}`, cookie)
-	if r := e.fileRow(t, "my-site"); r.ContentSize != size || archiveSize(r) != size {
-		t.Errorf("after PATCH: content_size=%d archive=%d, want %d", r.ContentSize, archiveSize(r), size)
+	if r := e.fileRow(t, "my-site"); r.ContentSize != size || e.archiveSize(t, r) != size {
+		t.Errorf("after PATCH: content_size=%d archive=%d, want %d", r.ContentSize, e.archiveSize(t, r), size)
 	}
 
 	// Dot segments are refused as slugs and codes: the browser would drop
@@ -610,8 +616,8 @@ func TestSiteStorageAndEdits(t *testing.T) {
 	if body := bodyString(t, resp); !strings.Contains(body, "v2") {
 		t.Errorf("after replace: %q", body)
 	}
-	if r := e.fileRow(t, "my-site"); r.ContentSize != archiveSize(r) {
-		t.Errorf("after replace: content_size=%d archive=%d", r.ContentSize, archiveSize(r))
+	if r := e.fileRow(t, "my-site"); r.ContentSize != e.archiveSize(t, r) {
+		t.Errorf("after replace: content_size=%d archive=%d", r.ContentSize, e.archiveSize(t, r))
 	}
 
 	// A document cannot be replaced with a zip.
@@ -669,9 +675,9 @@ func TestSiteSurvivesBackupRestore(t *testing.T) {
 	restored.Body.Close()
 
 	after := e.fileRow(t, s.Slug)
-	if archiveSize(after) != archiveSize(before) || after.ContentSize != before.ContentSize || after.ContentSize == 0 {
+	if e.archiveSize(t, after) != e.archiveSize(t, before) || after.ContentSize != before.ContentSize || after.ContentSize == 0 {
 		t.Errorf("restored archive=%d size=%d, want archive=%d size=%d",
-			archiveSize(after), after.ContentSize, archiveSize(before), before.ContentSize)
+			e.archiveSize(t, after), after.ContentSize, e.archiveSize(t, before), before.ContentSize)
 	}
 	if _, err := e.conn.Exec(`UPDATE files SET is_public = 1 WHERE slug = ?`, s.Slug); err != nil {
 		t.Fatal(err)
@@ -764,8 +770,8 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 			t.Errorf("b.html after update = %q", body)
 		}
 	}
-	if r := e.fileRow(t, slug); r.ContentSize != archiveSize(r) {
-		t.Errorf("after update_site: content_size=%d archive=%d", r.ContentSize, archiveSize(r))
+	if r := e.fileRow(t, slug); r.ContentSize != e.archiveSize(t, r) {
+		t.Errorf("after update_site: content_size=%d archive=%d", r.ContentSize, e.archiveSize(t, r))
 	}
 
 	// Refusals arrive as tool errors that say what to do.
@@ -790,8 +796,8 @@ func TestMCPSiteUploadAndUpdate(t *testing.T) {
 			t.Errorf("%s %v: isError=%v %q, want an error mentioning %q", c.tool, c.args, res.IsError, res.text(), c.want)
 		}
 	}
-	if r := e.fileRow(t, slug); r.ContentSize != sizeBefore || r.HtmlContent != "" {
-		t.Errorf("refused calls changed the site: size %d -> %d, html_content %q", sizeBefore, r.ContentSize, r.HtmlContent)
+	if r := e.fileRow(t, slug); r.ContentSize != sizeBefore {
+		t.Errorf("refused calls changed the site: size %d -> %d", sizeBefore, r.ContentSize)
 	}
 
 	// list_files reports the kind.

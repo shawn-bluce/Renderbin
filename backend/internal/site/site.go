@@ -422,8 +422,12 @@ type Archive struct {
 
 // Open parses a stored archive. Stored archives were produced by Pack, so a
 // failure here is data corruption rather than bad input.
-func Open(b []byte) (*Archive, error) {
-	zr, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+//
+// It reads through r rather than taking the bytes, so a site served from its
+// blob on disk reads the central directory and the one entry it needs instead
+// of the whole zip. r must stay open while the Archive is in use.
+func Open(r io.ReaderAt, size int64) (*Archive, error) {
+	zr, err := zip.NewReader(r, size)
 	if err != nil {
 		return nil, fmt.Errorf("open site archive: %w", err)
 	}
@@ -479,10 +483,15 @@ func (a *Archive) Entries() ([]Entry, error) {
 	return out, nil
 }
 
+// OpenBytes is Open over an archive already in memory.
+func OpenBytes(b []byte) (*Archive, error) {
+	return Open(bytes.NewReader(b), int64(len(b)))
+}
+
 // List is Open followed by Archive.List, for callers that only need the
 // listing.
-func List(b []byte) ([]EntryInfo, error) {
-	a, err := Open(b)
+func List(r io.ReaderAt, size int64) ([]EntryInfo, error) {
+	a, err := Open(r, size)
 	if err != nil {
 		return nil, err
 	}

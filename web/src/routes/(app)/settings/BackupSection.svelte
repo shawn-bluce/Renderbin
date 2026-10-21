@@ -1,7 +1,8 @@
 <script lang="ts">
 	// Backup and restore, rendered inline in Settings (super admin only) — the
-	// snapshot is the whole database, so it carries every account's files,
-	// password hashes and API keys, and restoring it overwrites all of them.
+	// backup is the whole instance (the database plus every file's content, as
+	// one .tar), so it carries every account's files, password hashes and API
+	// keys, and restoring it overwrites all of them.
 	import Alert from '$lib/components/Alert.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import SectionTitle from '$lib/components/SectionTitle.svelte';
@@ -40,10 +41,13 @@
 			// lands on the login page when that is the truth.
 			setTimeout(() => location.reload(), 1500);
 		} catch (err) {
-			// The server describes what it rejected (not a database, no accounts,
-			// schema mismatch) and nothing was changed in any of those cases.
+			// The server describes what it rejected (not a backup, no accounts,
+			// schema mismatch, cut short, not enough disk space) and nothing was
+			// changed in any of those cases.
 			errorMessage =
-				err instanceof ApiError && err.status === 400 ? err.message : t('error.restore.failed');
+				err instanceof ApiError && [400, 411, 507].includes(err.status)
+					? err.message
+					: t('error.restore.failed');
 		} finally {
 			busy = false;
 		}
@@ -78,7 +82,7 @@
 			<input
 				bind:this={fileInput}
 				type="file"
-				accept=".db,application/octet-stream"
+				accept=".tar,.db,application/x-tar,application/octet-stream"
 				class="hidden"
 				onchange={onFileSelected}
 			/>

@@ -260,7 +260,7 @@ func TestPackRoundTripIsDeterministic(t *testing.T) {
 		t.Errorf("paths = %q, want %q", paths(back), want)
 	}
 
-	arc, err := Open(a)
+	arc, err := OpenBytes(a)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

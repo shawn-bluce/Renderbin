@@ -4,7 +4,7 @@
 
 一个自托管的文件分享服务：上传 HTML、Markdown 或文本文件，或者一个带 `index.html` 的整个文件夹，就能得到一个链接，打开即是渲染好的页面。它是为 AI 助手生成的那类自包含报告页准备的；借助内置的 **MCP 服务**，Agent 可以自己上传文件，再把链接交给你。
 
-整个服务就是一个二进制文件（或一个容器），所有数据都在一个 SQLite 文件里。
+整个服务就是一个二进制文件（或一个容器），所有数据都在一个目录里：一个 SQLite 数据库，加上旁边存放的文件内容。
 
 ![Renderbin 管理界面截图](doc/screenshot.png)
 
@@ -26,7 +26,17 @@ docker compose up -d
 
 打开 `http://127.0.0.1:8080`，在欢迎页创建第一个账号，它就是超级管理员。容器只监听 `127.0.0.1`，请在前面放一个 Nginx 或 Caddy，并转发 `X-Forwarded-Proto`（如果代理改写了主机名，还要转发 `X-Forwarded-Host`）。
 
-升级：`docker compose pull && docker compose up -d`。所有数据都在 `db-data` 卷里（`docker compose down -v` 会把它删掉）。
+升级：`docker compose pull && docker compose up -d`。所有数据都在 `db-data` 卷里（`docker compose down -v` 会把它删掉）。想先知道升级会做什么，可以在 `up -d` 之前运行 `docker compose pull && docker compose run --rm app migrate --check`：它不做任何改动，只报告新版本要不要搬数据、要搬多少（也就是会停服多久）、磁盘空间够不够。
+
+备份可以在 设置 → 备份 里下载，也可以走命令行；数据量大时命令行比浏览器下载更可靠：
+
+```bash
+docker compose exec app ./server backup --out=/data/backup.tar   # 然后把它拷到别的机器上
+docker compose exec app ./server restore --in=/data/backup.tar --yes
+docker compose exec app ./server fsck                            # 检查每个文件的内容是否完好
+```
+
+只拷贝 `app.db` 不算备份：它只记录文件内容放在哪，并不包含内容本身。
 
 不用 Docker 的话，可以从最新 release 下载静态 Linux 二进制（amd64 或 arm64）：
 
@@ -35,12 +45,13 @@ curl -LO https://github.com/shawn-bluce/renderbin/releases/latest/download/rende
 tar xzf renderbin_linux_amd64.tar.gz && ./renderbin
 ```
 
-环境变量只有两个，其余配置都在应用的设置页里。
+环境变量有三个，其余配置都在应用的设置页里。
 
-| 变量          | 默认值        | 说明            |
-| ------------- | ------------- | --------------- |
-| `LISTEN_ADDR` | `:8080`       | 监听地址        |
-| `DB_PATH`     | `data/app.db` | SQLite 数据库路径 |
+| 变量          | 默认值                     | 说明              |
+| ------------- | -------------------------- | ----------------- |
+| `LISTEN_ADDR` | `:8080`                    | 监听地址          |
+| `DB_PATH`     | `data/app.db`              | SQLite 数据库路径 |
+| `BLOB_DIR`    | `DB_PATH` 同目录下的 `blobs` | 文件内容存放目录  |
 
 ## MCP 与 API
 

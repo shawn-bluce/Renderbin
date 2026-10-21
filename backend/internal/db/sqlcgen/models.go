@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+type Blob struct {
+	ID         string       `json:"id"`
+	Size       int64        `json:"size"`
+	Sha256     string       `json:"sha256"`
+	CreatedAt  time.Time    `json:"created_at"`
+	OrphanedAt sql.NullTime `json:"orphaned_at"`
+}
+
 type Config struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -35,8 +43,7 @@ type File struct {
 	ExpiredAt        sql.NullTime  `json:"expired_at"`
 	ExpiredReason    string        `json:"expired_reason"`
 	ContentSize      int64         `json:"content_size"`
-	HtmlContent      string        `json:"html_content"`
-	Archive          []byte        `json:"archive"`
+	BlobID           string        `json:"blob_id"`
 }
 
 type Session struct {
