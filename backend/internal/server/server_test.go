@@ -364,8 +364,8 @@ func TestFilesCRUD(t *testing.T) {
 	if len(created.Slug) != 8 {
 		t.Errorf("slug length = %d, want 8", len(created.Slug))
 	}
-	if len(created.AccessCode) != 8 {
-		t.Errorf("access code length = %d, want 8", len(created.AccessCode))
+	if len(created.AccessCode) != 22 {
+		t.Errorf("access code length = %d, want 22 (128 bits)", len(created.AccessCode))
 	}
 
 	// Get returns full content.
@@ -594,8 +594,8 @@ func TestVisibilityTagsRefresh(t *testing.T) {
 	}
 
 	resp = e.do(t, http.MethodPost, "/api/files/"+f.Slug+"/refresh-code", "", cookie)
-	if got := decodeFile(t, resp, http.StatusOK); got.AccessCode == f.AccessCode || got.AccessCode == "" {
-		t.Errorf("refresh-code did not produce a new code: %q", got.AccessCode)
+	if got := decodeFile(t, resp, http.StatusOK); got.AccessCode == f.AccessCode || len(got.AccessCode) != 22 {
+		t.Errorf("refresh-code did not produce a new 128-bit code: %q", got.AccessCode)
 	}
 }
 

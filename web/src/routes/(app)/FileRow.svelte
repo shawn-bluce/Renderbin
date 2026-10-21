@@ -275,13 +275,15 @@
 			</div>
 		{:else}
 			<div class="flex flex-wrap items-center gap-2">
+				<!-- Codes are 22 characters now; the chip copies the whole link, so it
+				     only needs enough of the code to tell rows apart. -->
 				<button
 					onclick={() => onCopy(file)}
 					title={t('row.copyLink')}
 					class="chip chip-neutral h-7 gap-1.5 px-2 font-mono hover:text-accent"
 				>
 					<Icon icon={copied ? 'lucide:check' : 'lucide:copy'} width="12" />
-					{file.access_code}
+					{file.access_code.length > 10 ? `${file.access_code.slice(0, 8)}…` : file.access_code}
 				</button>
 				<button
 					role="switch"

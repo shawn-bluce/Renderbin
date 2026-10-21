@@ -88,12 +88,16 @@ func NewSessionToken() (string, error) {
 }
 
 // NewShortToken returns an 8-character string: the first 6 characters of a
-// random hex string, base64-encoded. That is 24 bits of entropy — a deliberate
-// choice trading strength for short shareable URLs; the admin can set a longer
-// custom code per file when it matters, and slug generation retries on UNIQUE
-// conflicts to compensate. RawURLEncoding keeps the result URL-query-safe and
-// padding-free (StdEncoding's '+', '/', '=' would need escaping in ?code= and
-// violate the slug charset). Used for both file slugs and access codes.
+// random hex string, base64-encoded. That is 24 bits of entropy, which is
+// enough for what it is now used for -- file slugs, which name a file but grant
+// nothing, and whose generation retries on UNIQUE conflicts. RawURLEncoding
+// keeps the result URL-safe and padding-free (StdEncoding's '+', '/', '=' would
+// need escaping and violate the slug charset).
+//
+// It used to make access codes too, and 24 bits is not a credential: /res
+// does not throttle wrong codes, so a slug's code could be found in hours
+// (2^24 requests), and "refresh access code" -- the way to revoke a leaked
+// link -- produced another code just as guessable. See NewAccessCode.
 func NewShortToken() (string, error) {
 	h, err := randomHex(16)
 	if err != nil {
@@ -102,9 +106,17 @@ func NewShortToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString([]byte(h[:6])), nil
 }
 
-// NewAccessCode returns a fresh default access code for a file.
+// NewAccessCode returns a fresh default access code for a file: 128 random
+// bits as 22 base64url characters, the same strength as a session token, since
+// a code plus a slug is everything a visitor needs. Codes issued before this
+// change keep working (validation accepts any 1-128 character code); a file
+// gets a strong one on creation or when its code is refreshed.
 func NewAccessCode() (string, error) {
-	return NewShortToken()
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate access code: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // generatedPasswordAlphabet omits the characters people misread when copying a

@@ -33,13 +33,15 @@ func TestNewAccessCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAccessCode: %v", err)
 	}
-	if len(code) != 8 {
-		t.Errorf("access code length = %d, want 8", len(code))
+	// 128 bits: a code is the secret half of a share link, and /res does not
+	// throttle wrong guesses.
+	if len(code) != 22 {
+		t.Errorf("access code length = %d, want 22", len(code))
 	}
 	if decoded, err := base64.RawURLEncoding.DecodeString(code); err != nil {
 		t.Errorf("access code is not valid URL-safe base64: %v", err)
-	} else if len(decoded) != 6 {
-		t.Errorf("access code decodes to %d bytes, want 6", len(decoded))
+	} else if len(decoded) != 16 {
+		t.Errorf("access code decodes to %d bytes, want 16 (128 bits)", len(decoded))
 	}
 
 	other, err := NewAccessCode()

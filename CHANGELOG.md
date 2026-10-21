@@ -10,6 +10,15 @@ upgrading** (Settings → Backup) if you might want to go back.
 
 ## Unreleased
 
+### Security
+
+- **Access codes are 128-bit.** New files, and files whose code is refreshed,
+  get a 22-character random code instead of an 8-character one. The old codes
+  held 24 bits, and wrong codes are not throttled, so a file's code could be
+  guessed in hours by anyone who knew its slug -- including the new code
+  "refresh access code" issued to revoke a leaked link. Existing links keep
+  working; refresh a file's code to give it a strong one.
+
 ### Added
 
 - **Open a page on your phone.** Every opened document and site page shows a
