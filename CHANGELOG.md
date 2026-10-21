@@ -30,6 +30,14 @@ upgrading** (Settings → Backup) if you might want to go back.
 
 ### Changed
 
+- **The dashboard loads files a page at a time.** It used to fetch and render
+  every file at once; now it shows the first 100 and loads more as you scroll.
+  Filtering (All / Public / Private) and sorting moved to the server, and the
+  trash count is shown before the trash is opened. Sorting by name now follows
+  the server's order (case-insensitive for A-Z, then by character code), so
+  non-Latin names no longer sort by the browser's language rules. API clients
+  are unaffected: without `limit`, the file listing still returns every file
+  in one array.
 - **Search looks at names and page titles by default.** Without "Search
   content", a search now matches a file's name and the fields at the top of
   it: an HTML page's `<title>`, description, keywords and Open Graph

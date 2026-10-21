@@ -42,8 +42,57 @@ export interface FileItem {
 
 import { api, apiVoid } from './http';
 
+/** Every live file in one array -- what API clients get without `limit`. */
 export function listFiles(f?: typeof fetch): Promise<FileItem[]> {
 	return api('/api/files', { fetch: f });
+}
+
+export type SortKey = 'recent' | 'name' | 'success' | 'failure';
+export type Visibility = 'all' | 'public' | 'private';
+
+/** How many files each dashboard view holds; sent with every page. */
+export interface FileCounts {
+	all: number;
+	public: number;
+	private: number;
+	trash: number;
+}
+
+export interface FilePage {
+	files: FileItem[];
+	/** Where the next page starts; empty on the last one. */
+	next_cursor: string;
+	counts: FileCounts;
+}
+
+export interface PageQuery {
+	/** The trash instead of the live files; it has one order and no filter. */
+	trash?: boolean;
+	sort?: SortKey;
+	dir?: 'asc' | 'desc';
+	visibility?: Visibility;
+	cursor?: string;
+	limit?: number;
+}
+
+export const PAGE_SIZE = 100;
+
+/**
+ * One page of the listing, filtered and sorted by the server. Keyset pages:
+ * pass the previous page's `next_cursor` to continue, with the same query --
+ * the server refuses a cursor from a different listing.
+ */
+export function listFilesPage(q: PageQuery, f?: typeof fetch): Promise<FilePage> {
+	const params = new URLSearchParams({ limit: String(q.limit ?? PAGE_SIZE) });
+	if (q.trash) {
+		params.set('deleted', 'true');
+	} else {
+		params.set('sort', q.sort ?? 'recent');
+		if (q.dir) params.set('dir', q.dir);
+		params.set('visibility', q.visibility ?? 'all');
+	}
+	if (q.cursor) params.set('cursor', q.cursor);
+	return api(`/api/files?${params}`, { fetch: f });
 }
 
 // A search hit: a name match renders as a plain row; any other match also
@@ -67,10 +116,6 @@ export function searchFiles(query: string, content: boolean): Promise<SearchResu
 	const params = new URLSearchParams({ q: query });
 	if (content) params.set('content', 'true');
 	return api(`/api/search?${params}`);
-}
-
-export function listTrashed(): Promise<FileItem[]> {
-	return api('/api/files?deleted=true');
 }
 
 export function createFile(name: string, htmlContent: string, kind: FileKind): Promise<FileItem> {

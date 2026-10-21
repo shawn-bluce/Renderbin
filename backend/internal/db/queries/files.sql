@@ -60,6 +60,108 @@ SELECT * FROM files
 WHERE deleted_at IS NOT NULL AND user_id = sqlc.arg(user_id)
 ORDER BY deleted_at DESC;
 
+-- Paged listings, for the dashboard (GET /api/files?limit=...). Keyset
+-- pagination: each page starts after the last row of the one before, named by
+-- its sort key and id (after_id = 0 for the first page), so a file created or
+-- deleted between two requests neither repeats nor skips a row the way an
+-- OFFSET would. One statement per sort order, because ORDER BY cannot take a
+-- parameter; id breaks ties, so the order is total.
+--
+-- visibility is 'all', 'public' or 'private'. "Recent" is id order: ids are
+-- issued in creation order, so it is created_at order with exact tie-breaks.
+-- Names sort with NOCASE (ASCII-only case folding, then code points), which is
+-- what SQLite has; there is no ICU collation in a pure-Go build.
+
+-- name: PageUserFilesRecent :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0 OR id < CAST(sqlc.arg(after_id) AS INTEGER))
+ORDER BY id DESC
+LIMIT sqlc.arg(page_size);
+
+-- name: PageUserFilesNameAsc :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR name > CAST(sqlc.arg(after_name) AS TEXT) COLLATE NOCASE
+    OR (name = CAST(sqlc.arg(after_name) AS TEXT) COLLATE NOCASE AND id > CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY name COLLATE NOCASE ASC, id ASC
+LIMIT sqlc.arg(page_size);
+
+-- name: PageUserFilesNameDesc :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR name < CAST(sqlc.arg(after_name) AS TEXT) COLLATE NOCASE
+    OR (name = CAST(sqlc.arg(after_name) AS TEXT) COLLATE NOCASE AND id < CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY name COLLATE NOCASE DESC, id DESC
+LIMIT sqlc.arg(page_size);
+
+-- name: PageUserFilesSuccessAsc :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR success_count > CAST(sqlc.arg(after_n) AS INTEGER)
+    OR (success_count = CAST(sqlc.arg(after_n) AS INTEGER) AND id > CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY success_count ASC, id ASC
+LIMIT sqlc.arg(page_size);
+
+-- name: PageUserFilesSuccessDesc :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR success_count < CAST(sqlc.arg(after_n) AS INTEGER)
+    OR (success_count = CAST(sqlc.arg(after_n) AS INTEGER) AND id < CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY success_count DESC, id DESC
+LIMIT sqlc.arg(page_size);
+
+-- name: PageUserFilesFailureAsc :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR failure_count > CAST(sqlc.arg(after_n) AS INTEGER)
+    OR (failure_count = CAST(sqlc.arg(after_n) AS INTEGER) AND id > CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY failure_count ASC, id ASC
+LIMIT sqlc.arg(page_size);
+
+-- name: PageUserFilesFailureDesc :many
+SELECT * FROM files
+WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(visibility) AS TEXT) = 'all' OR is_public = (CAST(sqlc.arg(visibility) AS TEXT) = 'public'))
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR failure_count < CAST(sqlc.arg(after_n) AS INTEGER)
+    OR (failure_count = CAST(sqlc.arg(after_n) AS INTEGER) AND id < CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY failure_count DESC, id DESC
+LIMIT sqlc.arg(page_size);
+
+-- The trash, most recently deleted first. deleted_at is compared through
+-- unixepoch() because the cursor carries it as a number; every value in the
+-- column was written by CURRENT_TIMESTAMP, so the two orders agree.
+-- name: PageUserTrash :many
+SELECT * FROM files
+WHERE deleted_at IS NOT NULL AND user_id = sqlc.arg(user_id)
+  AND (CAST(sqlc.arg(after_id) AS INTEGER) = 0
+    OR unixepoch(deleted_at) < CAST(sqlc.arg(after_n) AS INTEGER)
+    OR (unixepoch(deleted_at) = CAST(sqlc.arg(after_n) AS INTEGER) AND id < CAST(sqlc.arg(after_id) AS INTEGER)))
+ORDER BY unixepoch(deleted_at) DESC, id DESC
+LIMIT sqlc.arg(page_size);
+
+-- What each view of the dashboard holds, sent with every page: with the list
+-- paged, the client no longer has every row to count. An aggregate over the
+-- owner's rows, which are a few hundred bytes each.
+-- name: CountUserFiles :one
+SELECT CAST(COALESCE(SUM(deleted_at IS NULL), 0) AS INTEGER) AS live,
+       CAST(COALESCE(SUM(deleted_at IS NULL AND is_public), 0) AS INTEGER) AS public,
+       CAST(COALESCE(SUM(deleted_at IS NOT NULL), 0) AS INTEGER) AS trashed
+FROM files
+WHERE user_id = sqlc.arg(user_id);
+
 -- name: GetUserFileBySlug :one
 SELECT * FROM files
 WHERE slug = sqlc.arg(slug) AND user_id = sqlc.arg(user_id) AND deleted_at IS NULL;

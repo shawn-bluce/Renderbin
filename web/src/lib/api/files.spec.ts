@@ -7,7 +7,7 @@ import {
 	emptyTrash,
 	getFile,
 	listFiles,
-	listTrashed,
+	listFilesPage,
 	refreshCode,
 	renameFile,
 	restoreFile,
@@ -54,10 +54,25 @@ describe('files api — request shapes', () => {
 		expect(result).toEqual([{ slug: 'a' }]);
 	});
 
-	it('listTrashed GETs /api/files?deleted=true', async () => {
-		const fetchMock = mockFetch(okJson([]));
-		await listTrashed();
-		expect(fetchMock).toHaveBeenCalledWith('/api/files?deleted=true');
+	it('listFilesPage asks for a sorted, filtered page', async () => {
+		const page = {
+			files: [],
+			next_cursor: '',
+			counts: { all: 0, public: 0, private: 0, trash: 0 }
+		};
+		const fetchMock = mockFetch(okJson(page));
+		await expect(
+			listFilesPage({ sort: 'name', dir: 'asc', visibility: 'public', cursor: 'abc' })
+		).resolves.toEqual(page);
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/files?limit=100&sort=name&dir=asc&visibility=public&cursor=abc'
+		);
+	});
+
+	it('listFilesPage for the trash sends no sort or filter', async () => {
+		const fetchMock = mockFetch(okJson({ files: [], next_cursor: '', counts: {} }));
+		await listFilesPage({ trash: true, sort: 'name', limit: 20 });
+		expect(fetchMock).toHaveBeenCalledWith('/api/files?limit=20&deleted=true');
 	});
 
 	it('createFile POSTs name + kind + snake_case html_content', async () => {

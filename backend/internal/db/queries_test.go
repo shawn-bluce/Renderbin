@@ -718,6 +718,50 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			}
 			return len(rows) != 0
 		}},
+		{"PageUserFiles*", func(t *testing.T, q *sqlcgen.Queries) bool {
+			pages := map[string]func() ([]sqlcgen.File, error){
+				"Recent": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesRecent(ctx, sqlcgen.PageUserFilesRecentParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+				"NameAsc": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesNameAsc(ctx, sqlcgen.PageUserFilesNameAscParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+				"NameDesc": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesNameDesc(ctx, sqlcgen.PageUserFilesNameDescParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+				"SuccessAsc": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesSuccessAsc(ctx, sqlcgen.PageUserFilesSuccessAscParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+				"SuccessDesc": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesSuccessDesc(ctx, sqlcgen.PageUserFilesSuccessDescParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+				"FailureAsc": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesFailureAsc(ctx, sqlcgen.PageUserFilesFailureAscParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+				"FailureDesc": func() ([]sqlcgen.File, error) {
+					return q.PageUserFilesFailureDesc(ctx, sqlcgen.PageUserFilesFailureDescParams{UserID: stranger, Visibility: "all", PageSize: 10})
+				},
+			}
+			leaked := false
+			for name, page := range pages {
+				rows, err := page()
+				if err != nil {
+					t.Fatalf("PageUserFiles%s: %v", name, err)
+				}
+				if len(rows) != 0 {
+					t.Errorf("PageUserFiles%s returned the owner's file to a stranger", name)
+					leaked = true
+				}
+			}
+			return leaked
+		}},
+		{"CountUserFiles", func(t *testing.T, q *sqlcgen.Queries) bool {
+			c, err := q.CountUserFiles(ctx, stranger)
+			if err != nil {
+				t.Fatalf("CountUserFiles: %v", err)
+			}
+			return c.Live != 0
+		}},
 		{"ListUserFilesWithSearchMeta", func(t *testing.T, q *sqlcgen.Queries) bool {
 			rows, err := q.ListUserFilesWithSearchMeta(ctx, stranger)
 			if err != nil {
@@ -804,6 +848,13 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 		{"RestoreFile", func(t *testing.T, q *sqlcgen.Queries) bool {
 			_, err := q.RestoreFile(ctx, sqlcgen.RestoreFileParams{Slug: "a", UserID: stranger})
 			return !errors.Is(err, sql.ErrNoRows)
+		}},
+		{"PageUserTrash", func(t *testing.T, q *sqlcgen.Queries) bool {
+			rows, err := q.PageUserTrash(ctx, sqlcgen.PageUserTrashParams{UserID: stranger, PageSize: 10})
+			if err != nil {
+				t.Fatalf("PageUserTrash: %v", err)
+			}
+			return len(rows) != 0
 		}},
 		{"HardDeleteFile", func(t *testing.T, q *sqlcgen.Queries) bool {
 			rows, err := q.HardDeleteFile(ctx, sqlcgen.HardDeleteFileParams{Slug: "a", UserID: stranger})

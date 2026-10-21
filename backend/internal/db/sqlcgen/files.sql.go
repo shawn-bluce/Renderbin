@@ -56,6 +56,30 @@ func (q *Queries) ClearFileExpiry(ctx context.Context, arg ClearFileExpiryParams
 	return i, err
 }
 
+const countUserFiles = `-- name: CountUserFiles :one
+SELECT CAST(COALESCE(SUM(deleted_at IS NULL), 0) AS INTEGER) AS live,
+       CAST(COALESCE(SUM(deleted_at IS NULL AND is_public), 0) AS INTEGER) AS public,
+       CAST(COALESCE(SUM(deleted_at IS NOT NULL), 0) AS INTEGER) AS trashed
+FROM files
+WHERE user_id = ?1
+`
+
+type CountUserFilesRow struct {
+	Live    int64 `json:"live"`
+	Public  int64 `json:"public"`
+	Trashed int64 `json:"trashed"`
+}
+
+// What each view of the dashboard holds, sent with every page: with the list
+// paged, the client no longer has every row to count. An aggregate over the
+// owner's rows, which are a few hundred bytes each.
+func (q *Queries) CountUserFiles(ctx context.Context, userID int64) (CountUserFilesRow, error) {
+	row := q.db.QueryRowContext(ctx, countUserFiles, userID)
+	var i CountUserFilesRow
+	err := row.Scan(&i.Live, &i.Public, &i.Trashed)
+	return i, err
+}
+
 const createFile = `-- name: CreateFile :one
 
 INSERT INTO files (slug, name, blob_id, content_size, kind, is_public, access_code, user_id)
@@ -642,6 +666,574 @@ func (q *Queries) ListUserFilesWithSearchMeta(ctx context.Context, userID int64)
 			&i.File.ContentSize,
 			&i.File.BlobID,
 			&i.SearchMeta,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesFailureAsc = `-- name: PageUserFilesFailureAsc :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0
+    OR failure_count > CAST(?4 AS INTEGER)
+    OR (failure_count = CAST(?4 AS INTEGER) AND id > CAST(?3 AS INTEGER)))
+ORDER BY failure_count ASC, id ASC
+LIMIT ?5
+`
+
+type PageUserFilesFailureAscParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	AfterN     int64  `json:"after_n"`
+	PageSize   int64  `json:"page_size"`
+}
+
+func (q *Queries) PageUserFilesFailureAsc(ctx context.Context, arg PageUserFilesFailureAscParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesFailureAsc,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.AfterN,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesFailureDesc = `-- name: PageUserFilesFailureDesc :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0
+    OR failure_count < CAST(?4 AS INTEGER)
+    OR (failure_count = CAST(?4 AS INTEGER) AND id < CAST(?3 AS INTEGER)))
+ORDER BY failure_count DESC, id DESC
+LIMIT ?5
+`
+
+type PageUserFilesFailureDescParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	AfterN     int64  `json:"after_n"`
+	PageSize   int64  `json:"page_size"`
+}
+
+func (q *Queries) PageUserFilesFailureDesc(ctx context.Context, arg PageUserFilesFailureDescParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesFailureDesc,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.AfterN,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesNameAsc = `-- name: PageUserFilesNameAsc :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0
+    OR name > CAST(?4 AS TEXT) COLLATE NOCASE
+    OR (name = CAST(?4 AS TEXT) COLLATE NOCASE AND id > CAST(?3 AS INTEGER)))
+ORDER BY name COLLATE NOCASE ASC, id ASC
+LIMIT ?5
+`
+
+type PageUserFilesNameAscParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	AfterName  string `json:"after_name"`
+	PageSize   int64  `json:"page_size"`
+}
+
+func (q *Queries) PageUserFilesNameAsc(ctx context.Context, arg PageUserFilesNameAscParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesNameAsc,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.AfterName,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesNameDesc = `-- name: PageUserFilesNameDesc :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0
+    OR name < CAST(?4 AS TEXT) COLLATE NOCASE
+    OR (name = CAST(?4 AS TEXT) COLLATE NOCASE AND id < CAST(?3 AS INTEGER)))
+ORDER BY name COLLATE NOCASE DESC, id DESC
+LIMIT ?5
+`
+
+type PageUserFilesNameDescParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	AfterName  string `json:"after_name"`
+	PageSize   int64  `json:"page_size"`
+}
+
+func (q *Queries) PageUserFilesNameDesc(ctx context.Context, arg PageUserFilesNameDescParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesNameDesc,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.AfterName,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesRecent = `-- name: PageUserFilesRecent :many
+
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0 OR id < CAST(?3 AS INTEGER))
+ORDER BY id DESC
+LIMIT ?4
+`
+
+type PageUserFilesRecentParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	PageSize   int64  `json:"page_size"`
+}
+
+// Paged listings, for the dashboard (GET /api/files?limit=...). Keyset
+// pagination: each page starts after the last row of the one before, named by
+// its sort key and id (after_id = 0 for the first page), so a file created or
+// deleted between two requests neither repeats nor skips a row the way an
+// OFFSET would. One statement per sort order, because ORDER BY cannot take a
+// parameter; id breaks ties, so the order is total.
+//
+// visibility is 'all', 'public' or 'private'. "Recent" is id order: ids are
+// issued in creation order, so it is created_at order with exact tie-breaks.
+// Names sort with NOCASE (ASCII-only case folding, then code points), which is
+// what SQLite has; there is no ICU collation in a pure-Go build.
+func (q *Queries) PageUserFilesRecent(ctx context.Context, arg PageUserFilesRecentParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesRecent,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesSuccessAsc = `-- name: PageUserFilesSuccessAsc :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0
+    OR success_count > CAST(?4 AS INTEGER)
+    OR (success_count = CAST(?4 AS INTEGER) AND id > CAST(?3 AS INTEGER)))
+ORDER BY success_count ASC, id ASC
+LIMIT ?5
+`
+
+type PageUserFilesSuccessAscParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	AfterN     int64  `json:"after_n"`
+	PageSize   int64  `json:"page_size"`
+}
+
+func (q *Queries) PageUserFilesSuccessAsc(ctx context.Context, arg PageUserFilesSuccessAscParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesSuccessAsc,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.AfterN,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserFilesSuccessDesc = `-- name: PageUserFilesSuccessDesc :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NULL AND user_id = ?1
+  AND (CAST(?2 AS TEXT) = 'all' OR is_public = (CAST(?2 AS TEXT) = 'public'))
+  AND (CAST(?3 AS INTEGER) = 0
+    OR success_count < CAST(?4 AS INTEGER)
+    OR (success_count = CAST(?4 AS INTEGER) AND id < CAST(?3 AS INTEGER)))
+ORDER BY success_count DESC, id DESC
+LIMIT ?5
+`
+
+type PageUserFilesSuccessDescParams struct {
+	UserID     int64  `json:"user_id"`
+	Visibility string `json:"visibility"`
+	AfterID    int64  `json:"after_id"`
+	AfterN     int64  `json:"after_n"`
+	PageSize   int64  `json:"page_size"`
+}
+
+func (q *Queries) PageUserFilesSuccessDesc(ctx context.Context, arg PageUserFilesSuccessDescParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserFilesSuccessDesc,
+		arg.UserID,
+		arg.Visibility,
+		arg.AfterID,
+		arg.AfterN,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pageUserTrash = `-- name: PageUserTrash :many
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
+WHERE deleted_at IS NOT NULL AND user_id = ?1
+  AND (CAST(?2 AS INTEGER) = 0
+    OR unixepoch(deleted_at) < CAST(?3 AS INTEGER)
+    OR (unixepoch(deleted_at) = CAST(?3 AS INTEGER) AND id < CAST(?2 AS INTEGER)))
+ORDER BY unixepoch(deleted_at) DESC, id DESC
+LIMIT ?4
+`
+
+type PageUserTrashParams struct {
+	UserID   int64 `json:"user_id"`
+	AfterID  int64 `json:"after_id"`
+	AfterN   int64 `json:"after_n"`
+	PageSize int64 `json:"page_size"`
+}
+
+// The trash, most recently deleted first. deleted_at is compared through
+// unixepoch() because the cursor carries it as a number; every value in the
+// column was written by CURRENT_TIMESTAMP, so the two orders agree.
+func (q *Queries) PageUserTrash(ctx context.Context, arg PageUserTrashParams) ([]File, error) {
+	rows, err := q.db.QueryContext(ctx, pageUserTrash,
+		arg.UserID,
+		arg.AfterID,
+		arg.AfterN,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []File
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.IsPublic,
+			&i.AccessCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.SuccessCount,
+			&i.FailureCount,
+			&i.Tags,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.Kind,
+			&i.CodeSuccessCount,
+			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.BlobID,
 		); err != nil {
 			return nil, err
 		}

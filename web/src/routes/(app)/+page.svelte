@@ -3,7 +3,7 @@
 	import Alert from '$lib/components/Alert.svelte';
 	import Shell from '$lib/components/Shell.svelte';
 	import Spinner from '$lib/components/Spinner.svelte';
-	import { t, intlLocale } from '$lib/i18n/index.svelte';
+	import { t } from '$lib/i18n/index.svelte';
 	import type { MessageKey } from '$lib/i18n/messages';
 	import { copyFeedback } from '$lib/copy.svelte';
 	import { formatSize } from '$lib/format';
@@ -16,15 +16,18 @@
 		deleteFile,
 		deleteFilePermanent,
 		emptyTrash,
-		listTrashed,
+		listFilesPage,
 		refreshCode,
 		renameFile,
 		restoreFile,
 		setTags,
 		setVisibility,
 		uploadSite,
+		type FileCounts,
 		type FileItem,
-		type SearchResult
+		type PageQuery,
+		type SearchResult,
+		type SortKey
 	} from '$lib/api/files';
 	import { resUrl, zipFolder, zipTooLarge } from '$lib/files-ui';
 	import { planUpload, uploadDocument } from '$lib/upload';
@@ -37,10 +40,21 @@
 
 	let { data } = $props();
 
-	// Intentional one-time snapshots: `files` is mutated locally for optimistic
-	// updates and shouldn't re-sync if `data` changes.
+	// The loaded rows of the current view, in the server's order, a page at a
+	// time (see listFilesPage), and how many files each view holds. Snapshots of
+	// the first page on purpose: they are mutated locally for optimistic updates
+	// and must not re-sync when `data` changes.
 	// svelte-ignore state_referenced_locally
-	let files = $state<FileItem[]>(data.files);
+	let rows = $state<FileItem[]>(data.page.files);
+	// svelte-ignore state_referenced_locally
+	let nextCursor = $state(data.page.next_cursor);
+	// svelte-ignore state_referenced_locally
+	let counts = $state<FileCounts>(data.page.counts);
+	let listLoading = $state(false);
+	let loadingMore = $state(false);
+	// Each (re)load invalidates the ones before it, so a slow answer for a view
+	// the user has already left never lands.
+	let listSeq = 0;
 	// Storage use against the account's quota. Loaded with the list, but counts
 	// trashed files too, which is what the server enforces on upload; summing the
 	// visible rows would show a smaller number than the one that rejects the next
@@ -56,14 +70,11 @@
 	let dragCounter = 0;
 
 	// The sidebar (or, on phones, the chip row) picks one view: a visibility
-	// filter over the live files, or the trash. The trash count is only known
-	// once the trash has been opened -- listing it costs a request.
+	// filter over the live files, or the trash. Each is a listing of its own on
+	// the server, fetched page by page.
 	type View = 'all' | 'public' | 'private' | 'trash';
 	let view = $state<View>('all');
 	const inTrash = $derived(view === 'trash');
-	let trashedFiles = $state<FileItem[]>([]);
-	let trashedLoaded = $state(false);
-	let trashLoading = $state(false);
 	let emptyingTrash = $state(false);
 
 	// Which modal is open. Each owns its own form state and reports back through
@@ -85,7 +96,6 @@
 	// can -- so on failure the page renders it as selectable text instead.
 	let copyFallbackUrl = $state<string | null>(null);
 
-	type SortKey = 'recent' | 'name' | 'success' | 'failure';
 	const sortOptions: { key: SortKey; labelKey: MessageKey; defaultDir: 'asc' | 'desc' }[] = [
 		{ key: 'recent', labelKey: 'sort.recent', defaultDir: 'desc' },
 		{ key: 'name', labelKey: 'sort.name', defaultDir: 'asc' },
@@ -98,53 +108,115 @@
 	function onSortChange(key: SortKey) {
 		sortKey = key;
 		sortDir = sortOptions.find((o) => o.key === key)!.defaultDir;
+		reload();
 	}
 
-	const totalCount = $derived(files.length);
-	const publicCount = $derived(files.filter((f) => f.is_public).length);
-	const privateCount = $derived(totalCount - publicCount);
+	function toggleSortDir() {
+		sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+		reload();
+	}
 
-	const navItems = $derived<{ key: View; icon: string; label: string; count: number | null }[]>([
-		{ key: 'all', icon: 'lucide:layout-list', label: t('nav.all'), count: totalCount },
-		{ key: 'public', icon: 'lucide:globe', label: t('visibility.public'), count: publicCount },
-		{ key: 'private', icon: 'lucide:lock', label: t('visibility.private'), count: privateCount },
-		{
-			key: 'trash',
-			icon: 'lucide:trash-2',
-			label: t('tab.trashed'),
-			count: trashedLoaded ? trashedFiles.length : null
-		}
+	const navItems = $derived<{ key: View; icon: string; label: string; count: number }[]>([
+		{ key: 'all', icon: 'lucide:layout-list', label: t('nav.all'), count: counts.all },
+		{ key: 'public', icon: 'lucide:globe', label: t('visibility.public'), count: counts.public },
+		{ key: 'private', icon: 'lucide:lock', label: t('visibility.private'), count: counts.private },
+		{ key: 'trash', icon: 'lucide:trash-2', label: t('tab.trashed'), count: counts.trash }
 	]);
 	const viewTitle = $derived(navItems.find((i) => i.key === view)!.label);
 
-	async function selectView(next: View) {
-		view = next;
-		if (next !== 'trash' || trashedLoaded || trashLoading) return;
-		trashLoading = true;
-		try {
-			trashedFiles = await listTrashed();
-			trashedLoaded = true;
-		} catch (err) {
-			errorMessage = errText(err, 'error.loadTrash');
-		} finally {
-			trashLoading = false;
-		}
+	function pageQuery(cursor?: string): PageQuery {
+		return view === 'trash'
+			? { trash: true, cursor }
+			: { sort: sortKey, dir: sortDir, visibility: view, cursor };
 	}
 
-	function passesVisibility(f: FileItem): boolean {
+	// Replaces the list with the first page of the current view and order.
+	async function reload() {
+		const mine = ++listSeq;
+		let loaded = false;
+		listLoading = true;
+		try {
+			const page = await listFilesPage(pageQuery());
+			if (mine !== listSeq) return;
+			rows = page.files;
+			nextCursor = page.next_cursor;
+			counts = page.counts;
+			loaded = true;
+		} catch (err) {
+			if (mine === listSeq)
+				errorMessage = errText(err, inTrash ? 'error.loadTrash' : 'error.loadFiles');
+		} finally {
+			if (mine === listSeq) listLoading = false;
+		}
+		if (loaded && endVisible) loadMore();
+	}
+
+	// Appends the next page. Rows already on screen are skipped: a file added
+	// locally (an upload) can also arrive in a later page.
+	async function loadMore() {
+		if (!nextCursor || loadingMore || listLoading) return;
+		const mine = listSeq;
+		let loaded = false;
+		loadingMore = true;
+		try {
+			const page = await listFilesPage(pageQuery(nextCursor));
+			if (mine !== listSeq) return;
+			const have = new Set(rows.map((f) => f.slug));
+			rows = [...rows, ...page.files.filter((f) => !have.has(f.slug))];
+			nextCursor = page.next_cursor;
+			counts = page.counts;
+			loaded = true;
+		} catch (err) {
+			if (mine === listSeq) errorMessage = errText(err, 'error.loadFiles');
+		} finally {
+			loadingMore = false;
+		}
+		// A short page can leave the end of the list on screen, and the
+		// observer only fires on a change. Only after a success: a failing
+		// request must not retry in a loop; the button is there for that.
+		if (loaded && endVisible) loadMore();
+	}
+
+	// Loads the next page as the end of the list nears the viewport (600px
+	// early, so a steady scroll rarely waits for it). The button there does the
+	// same for keyboards and for browsers without IntersectionObserver.
+	let endVisible = false;
+	function nearEnd(node: HTMLElement) {
+		if (typeof IntersectionObserver === 'undefined') return;
+		const io = new IntersectionObserver(
+			(entries) => {
+				endVisible = entries.some((e) => e.isIntersecting);
+				if (endVisible) loadMore();
+			},
+			{ rootMargin: '600px' }
+		);
+		io.observe(node);
+		return () => {
+			endVisible = false;
+			io.disconnect();
+		};
+	}
+
+	function selectView(next: View) {
+		if (next === view) return;
+		view = next;
+		reload();
+	}
+
+	function matchesView(f: FileItem): boolean {
 		if (view === 'public') return f.is_public;
 		if (view === 'private') return !f.is_public;
-		return true;
+		return view === 'all';
 	}
 
-	const filteredFiles = $derived(files.filter(passesVisibility));
-
-	// Grouped-by-day view, used only for the default "Recent" sort.
+	// Grouped-by-day view, used only for the default "Recent" sort. The rows
+	// arrive newest first, so grouping what has loaded so far is the same as
+	// grouping everything, up to the last day shown.
 	const groups = $derived.by(() => {
 		const order: string[] = [];
 		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- a local, rebuilt on every derivation
 		const byLabel = new Map<string, FileItem[]>();
-		for (const file of filteredFiles) {
+		for (const file of rows) {
 			const label = dayLabel(file.created_at);
 			if (!byLabel.has(label)) {
 				byLabel.set(label, []);
@@ -155,33 +227,35 @@
 		return order.map((label) => ({ label, items: byLabel.get(label)! }));
 	});
 
-	function compareFiles(a: FileItem, b: FileItem): number {
-		const dir = sortDir === 'asc' ? 1 : -1;
-		if (sortKey === 'name') return dir * a.name.localeCompare(b.name, intlLocale());
-		if (sortKey === 'success') return dir * (a.success_count - b.success_count);
-		if (sortKey === 'failure') return dir * (a.failure_count - b.failure_count);
-		return 0;
+	// SQLite's NOCASE, which is how the server sorts names: ASCII folded, then
+	// code points. Search results arrive as one complete set and are sorted
+	// here, the same way, so the two lists never disagree.
+	function nocase(s: string): string {
+		return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
 	}
 
-	// Flat sorted view, used for every sort mode except "Recent" — grouping by
-	// day and sorting by name/success/failure at the same time isn't coherent,
-	// so picking an explicit sort key drops the day grouping entirely.
-	const sortedFlat = $derived([...filteredFiles].sort(compareFiles));
+	function compareFiles(a: FileItem, b: FileItem): number {
+		const dir = sortDir === 'asc' ? 1 : -1;
+		if (sortKey === 'name') {
+			const x = nocase(a.name);
+			const y = nocase(b.name);
+			return dir * (x < y ? -1 : x > y ? 1 : 0);
+		}
+		if (sortKey === 'success') return dir * (a.success_count - b.success_count);
+		if (sortKey === 'failure') return dir * (a.failure_count - b.failure_count);
+		return 0; // Recent: the server already answers newest first
+	}
 
-	// Search result rows, joined against `files` so optimistic local mutations
-	// (rename, delete, visibility, …) show up immediately without re-querying.
-	// A title match renders as a plain row; a content-only match carries the
-	// weakened snippet. Always flat (never day-grouped).
+	// Search results are full rows of their own (the list may not have loaded
+	// a match yet), kept in step with local mutations by replaceRow/dropRow. A
+	// title match renders as a plain row; any other carries the weakened
+	// snippet. Always flat (never day-grouped).
 	const searchRows = $derived.by(() => {
 		if (!searchResults) return [];
-		const bySlug = new Map(files.map((f) => [f.slug, f]));
-		const rows: { file: FileItem; snippet: string | null }[] = [];
-		for (const r of searchResults) {
-			const file = bySlug.get(r.slug);
-			if (!file || !passesVisibility(file)) continue;
-			rows.push({ file, snippet: r.matched_name ? null : r.snippet || null });
-		}
-		return rows.sort((a, b) => compareFiles(a.file, b.file));
+		return searchResults
+			.filter(matchesView)
+			.map((r) => ({ file: r as FileItem, snippet: r.matched_name ? null : r.snippet || null }))
+			.sort((a, b) => compareFiles(a.file, b.file));
 	});
 
 	async function copyLink(file: FileItem) {
@@ -190,9 +264,18 @@
 		if (!(await copied.copy(text, file.slug))) copyFallbackUrl = text;
 	}
 
-	// New files land in the live list, so make sure that is what is on screen.
-	function showLive() {
-		if (view === 'trash') view = 'all';
+	// New files land in the live list. In "Recent" they go on top, which is
+	// known without asking; any other order, or the trash, is reloaded.
+	function showCreated(created: FileItem[]) {
+		for (const f of created) countLive(f, 1);
+		if (view === 'trash') {
+			view = 'all';
+			reload();
+		} else if (sortKey === 'recent') {
+			rows = [...created.filter(matchesView), ...rows];
+		} else {
+			reload();
+		}
 	}
 
 	// Uploads one folder as a site. Named after its index.html <title> by the
@@ -207,9 +290,7 @@
 				errorMessage = zip;
 				return;
 			}
-			const created = await uploadSite(null, zip);
-			files = [created, ...files];
-			showLive();
+			showCreated([await uploadSite(null, zip)]);
 			await refreshUsage();
 		} catch (err) {
 			errorMessage = errText(err, 'note.failed', { n: 1 });
@@ -275,8 +356,7 @@
 		}
 
 		if (created.length > 0) {
-			files = [...created, ...files];
-			showLive();
+			showCreated(created);
 			await refreshUsage();
 		}
 
@@ -364,18 +444,41 @@
 		}
 	}
 
-	function replaceRow(updated: FileItem) {
-		files = files.map((f) => (f.slug === updated.slug ? updated : f));
+	// Every loaded copy of a file changes together: the list and, while a
+	// search is showing, its results. oldSlug is the slug the row had before an
+	// edit that may have changed it.
+	function replaceRow(updated: FileItem, oldSlug = updated.slug) {
+		rows = rows.map((f) => (f.slug === oldSlug ? updated : f));
+		if (searchResults) {
+			searchResults = searchResults.map((r) => (r.slug === oldSlug ? { ...r, ...updated } : r));
+		}
+	}
+
+	function dropRow(slug: string) {
+		rows = rows.filter((f) => f.slug !== slug);
+		if (searchResults) searchResults = searchResults.filter((r) => r.slug !== slug);
+	}
+
+	// Keeps the view counts right between page loads (each page brings the
+	// server's own figures).
+	function countLive(f: FileItem, by: number) {
+		counts.all += by;
+		if (f.is_public) counts.public += by;
+		else counts.private += by;
 	}
 
 	const onEmptyTrash = () => {
-		if (trashedFiles.length === 0 || emptyingTrash) return;
-		if (!confirm(t('confirm.emptyTrash', { n: trashedFiles.length }))) return;
+		if (counts.trash === 0 || emptyingTrash) return;
+		if (!confirm(t('confirm.emptyTrash', { n: counts.trash }))) return;
 		emptyingTrash = true;
 		return act('error.emptyTrash', async () => {
 			try {
 				await emptyTrash();
-				trashedFiles = [];
+				if (inTrash) {
+					rows = [];
+					nextCursor = '';
+				}
+				counts.trash = 0;
 				await refreshUsage();
 			} finally {
 				emptyingTrash = false;
@@ -384,26 +487,37 @@
 	};
 
 	function onCreated(created: FileItem) {
-		files = [created, ...files];
 		creating = false;
 		// A new file lands at the top of "Recent"; leaving a search or a
 		// visibility filter on would hide it and read as a failed create.
 		search = '';
-		view = 'all';
+		if (view === 'all') {
+			showCreated([created]);
+		} else {
+			view = 'all';
+			reload();
+		}
 		refreshUsage();
 	}
 
 	const onRestore = (file: FileItem) =>
 		act('error.restore', async () => {
 			const restored = await restoreFile(file.slug);
-			trashedFiles = trashedFiles.filter((f) => f.slug !== file.slug);
-			files = [restored, ...files];
+			dropRow(file.slug);
+			counts.trash -= 1;
+			countLive(restored, 1);
 		});
 
+	// In the Public or Private view a file that changes sides leaves the list,
+	// as it did when the filter ran in the browser.
 	const onToggleVisibility = (file: FileItem) =>
-		act('error.visibility', async () =>
-			replaceRow(await setVisibility(file.slug, !file.is_public))
-		);
+		act('error.visibility', async () => {
+			const updated = await setVisibility(file.slug, !file.is_public);
+			countLive(file, -1);
+			countLive(updated, 1);
+			replaceRow(updated);
+			if (!matchesView(updated)) rows = rows.filter((f) => f.slug !== updated.slug);
+		});
 
 	const onRename = (file: FileItem, name: string) =>
 		act('error.rename', async () => replaceRow(await renameFile(file.slug, name)));
@@ -421,12 +535,11 @@
 		confirm(t('confirm.delete', { name: file.name })) &&
 		act('error.delete', async () => {
 			await deleteFile(file.slug);
-			files = files.filter((f) => f.slug !== file.slug);
-			// Move it into the trash list too. Without this the trash kept whatever
-			// it fetched the first time it was opened (trashedLoaded latches), so a
-			// file deleted afterwards was missing from both lists and looked like a
-			// soft delete had destroyed it.
-			if (trashedLoaded) trashedFiles = [file, ...trashedFiles];
+			// The trash is fetched afresh whenever it is opened, so the file
+			// shows up there without being carried over by hand.
+			dropRow(file.slug);
+			countLive(file, -1);
+			counts.trash += 1;
 			await refreshUsage();
 		});
 
@@ -434,7 +547,8 @@
 		confirm(t('confirm.deletePermanent', { name: file.name })) &&
 		act('error.deletePermanent', async () => {
 			await deleteFilePermanent(file.slug);
-			trashedFiles = trashedFiles.filter((f) => f.slug !== file.slug);
+			dropRow(file.slug);
+			counts.trash -= 1;
 			await refreshUsage();
 		});
 </script>
@@ -461,9 +575,7 @@
 				>
 					<Icon icon={item.icon} width={mobile ? 14 : 16} />
 					<span class="flex-1 text-left">{item.label}</span>
-					{#if item.count !== null}
-						<span class="text-xs tabular-nums opacity-70">{item.count}</span>
-					{/if}
+					<span class="text-xs tabular-nums opacity-70">{item.count}</span>
 				</button>
 			</li>
 		{/each}
@@ -521,10 +633,10 @@
 				<h1 class="text-xl font-bold tracking-tight text-fg-strong sm:text-2xl">{viewTitle}</h1>
 				<p class="mt-0.5 font-mono text-xs text-muted">
 					{#if inTrash}
-						{t('count.inTrash', { n: trashedFiles.length })}
+						{t('count.inTrash', { n: counts.trash })}
 					{:else}
-						{t('count.total', { n: totalCount })} · {t('count.public', { n: publicCount })} ·
-						{t('count.private', { n: privateCount })}
+						{t('count.total', { n: counts.all })} · {t('count.public', { n: counts.public })} ·
+						{t('count.private', { n: counts.private })}
 					{/if}
 					{#if usage}
 						<span class="lg:hidden">
@@ -541,7 +653,7 @@
 				{#if inTrash}
 					<button
 						onclick={onEmptyTrash}
-						disabled={emptyingTrash || trashedFiles.length === 0}
+						disabled={emptyingTrash || counts.trash === 0}
 						title={t('trash.emptyAllTitle')}
 						class="btn btn-soft hover-bad"
 					>
@@ -648,7 +760,7 @@
 					</div>
 					{#if sortKey !== 'recent'}
 						<button
-							onclick={() => (sortDir = sortDir === 'asc' ? 'desc' : 'asc')}
+							onclick={toggleSortDir}
 							title={t(sortDir === 'asc' ? 'sort.ascending' : 'sort.descending')}
 							aria-label={t(sortDir === 'asc' ? 'sort.ascending' : 'sort.descending')}
 							class="btn btn-soft btn-icon size-9"
@@ -660,15 +772,22 @@
 			</div>
 		{/if}
 
-		<section class="card overflow-hidden">
+		<section
+			class="card overflow-hidden transition-opacity {listLoading &&
+			rows.length > 0 &&
+			!searchActive
+				? 'opacity-60'
+				: ''}"
+			aria-busy={listLoading}
+		>
 			{#if inTrash}
-				{#if trashLoading}
+				{#if listLoading && rows.length === 0}
 					{@render empty('lucide:loader-2', t('trash.loading'), true)}
-				{:else if trashedFiles.length === 0}
+				{:else if rows.length === 0}
 					{@render empty('lucide:trash-2', t('trash.empty'))}
 				{:else}
 					<ul>
-						{#each trashedFiles as file (file.slug)}
+						{#each rows as file (file.slug)}
 							{@render row(file, true)}
 						{/each}
 					</ul>
@@ -685,10 +804,12 @@
 						{/each}
 					</ul>
 				{/if}
-			{:else if filteredFiles.length === 0}
+			{:else if listLoading && rows.length === 0}
+				{@render empty('lucide:loader-2', t('files.loading'), true)}
+			{:else if rows.length === 0}
 				{@render empty(
 					'lucide:inbox',
-					files.length === 0 ? t('files.emptyNone') : t('files.emptyFiltered')
+					counts.all === 0 ? t('files.emptyNone') : t('files.emptyFiltered')
 				)}
 			{:else if sortKey === 'recent'}
 				{#each groups as group (group.label)}
@@ -705,10 +826,20 @@
 				{/each}
 			{:else}
 				<ul>
-					{#each sortedFlat as file (file.slug)}
+					{#each rows as file (file.slug)}
 						{@render row(file, false)}
 					{/each}
 				</ul>
+			{/if}
+			{#if nextCursor && !searchActive && rows.length > 0}
+				<div {@attach nearEnd} class="flex justify-center border-t border-line p-3">
+					<button onclick={loadMore} disabled={loadingMore} class="btn btn-ghost btn-sm">
+						{#if loadingMore}
+							<Spinner width={14} />
+						{/if}
+						{t('list.loadMore')}
+					</button>
+				</div>
 			{/if}
 		</section>
 
@@ -728,8 +859,7 @@
 		onclose={() => (editing = null)}
 		onsaved={(updated) => {
 			// Match on the slug the row had when the modal opened: the edit may have changed it.
-			const oldSlug = editing?.slug;
-			files = files.map((f) => (f.slug === oldSlug ? updated : f));
+			replaceRow(updated, editing?.slug);
 			editing = null;
 		}}
 		onreplaced={(updated) => {

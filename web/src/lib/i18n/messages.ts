@@ -59,6 +59,7 @@ const en = {
 	// List controls
 	'list.searchPlaceholder': 'Search files…',
 	'list.sort': 'Sort',
+	'list.loadMore': 'Load more',
 	'search.scopeTitle': 'Searches your own files: names, page titles and descriptions',
 	'search.content': 'Search content',
 	'search.contentTitle': 'Also search the full text of every file (slower)',
@@ -113,6 +114,7 @@ const en = {
 	'trash.empty': 'Trash is empty.',
 	'trash.emptyAll': 'Empty trash',
 	'trash.emptyAllTitle': 'Permanently delete everything in the trash',
+	'files.loading': 'Loading files…',
 	'files.emptyNone': 'No files yet — upload one above.',
 	'files.emptyFiltered': 'No files match your filters.',
 
@@ -171,6 +173,7 @@ const en = {
 	'note.failed': '{n} uploads failed',
 	'note.siteFailed': '{name}: {reason}',
 	'error.loadTrash': 'Failed to load trash',
+	'error.loadFiles': 'Failed to load files',
 	'error.restore': 'Failed to restore',
 	'error.loadContent': 'Failed to load content',
 	'error.slug':
@@ -426,6 +429,7 @@ const zh = {
 	// List controls
 	'list.searchPlaceholder': '搜索文件…',
 	'list.sort': '排序',
+	'list.loadMore': '加载更多',
 	'search.scopeTitle': '只搜索你自己的文件：文件名、页面标题和描述',
 	'search.content': '搜索正文',
 	'search.contentTitle': '同时搜索每个文件的全部正文（较慢）',
@@ -480,6 +484,7 @@ const zh = {
 	'trash.empty': '回收站为空。',
 	'trash.emptyAll': '清空回收站',
 	'trash.emptyAllTitle': '永久删除回收站中的全部文件',
+	'files.loading': '正在加载文件…',
 	'files.emptyNone': '还没有文件——在上方上传一个。',
 	'files.emptyFiltered': '没有符合筛选条件的文件。',
 
@@ -535,6 +540,7 @@ const zh = {
 	'note.failed': '{n} 个上传失败',
 	'note.siteFailed': '{name}：{reason}',
 	'error.loadTrash': '加载回收站失败',
+	'error.loadFiles': '加载文件失败',
 	'error.restore': '恢复失败',
 	'error.loadContent': '加载内容失败',
 	'error.slug':

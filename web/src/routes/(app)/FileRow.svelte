@@ -116,8 +116,11 @@
 	{@render stat('lucide:x-circle', file.failure_count, 'text-bad', t('row.failedViews'))}
 {/snippet}
 
+<!-- content-visibility: a row off screen is not laid out or painted, so a
+     long list costs what is visible. The intrinsic size is a typical row's,
+     remembered once it has rendered (auto), so the scrollbar stays steady. -->
 <li
-	class="group flex flex-col gap-2.5 border-b border-line px-3 py-2.5 last:border-0 hover:bg-raised/40 sm:px-4 xl:flex-row xl:items-center xl:gap-6"
+	class="group flex flex-col gap-2.5 border-b border-line px-3 py-2.5 [contain-intrinsic-size:auto_4.5rem] [content-visibility:auto] last:border-0 hover:bg-raised/40 sm:px-4 xl:flex-row xl:items-center xl:gap-6"
 >
 	<div class="flex min-w-0 flex-1 items-start gap-3">
 		<span

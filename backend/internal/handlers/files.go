@@ -208,35 +208,58 @@ func normalizeTags(raw string) string {
 	return strings.Join(tags, ",")
 }
 
+// List answers GET /api/files (deleted=true for the trash): every file in one
+// array, or with limit a filePage -- see pages.go.
 func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	var resp []fileResponse
-	if r.URL.Query().Get("deleted") == "true" {
-		rows, err := h.queries.ListUserDeletedFiles(r.Context(), user.ID)
-		if err != nil {
-			serverError(w, h.logger, "list deleted files", err)
-			return
-		}
-		resp = make([]fileResponse, 0, len(rows))
-		for _, row := range rows {
-			resp = append(resp, toFileResponse(row))
-		}
-	} else {
-		rows, err := h.queries.ListUserFiles(r.Context(), user.ID)
+	page, paged, err := parsePageRequest(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if paged {
+		rows, next, err := listPage(r.Context(), h.queries, user.ID, page)
 		if err != nil {
 			serverError(w, h.logger, "list files", err)
 			return
 		}
-		resp = make([]fileResponse, 0, len(rows))
-		for _, row := range rows {
-			resp = append(resp, toFileResponse(row))
+		counts, err := h.queries.CountUserFiles(r.Context(), user.ID)
+		if err != nil {
+			serverError(w, h.logger, "count files", err)
+			return
 		}
+		resp := filePage{
+			Files:      make([]fileResponse, 0, len(rows)),
+			NextCursor: next,
+			Counts: fileCounts{
+				All: counts.Live, Public: counts.Public, Private: counts.Live - counts.Public, Trash: counts.Trashed,
+			},
+		}
+		for _, row := range rows {
+			resp.Files = append(resp.Files, toFileResponse(row))
+		}
+		writeJSON(w, resp)
+		return
 	}
 
+	var rows []sqlcgen.File
+	if r.URL.Query().Get("deleted") == "true" {
+		rows, err = h.queries.ListUserDeletedFiles(r.Context(), user.ID)
+	} else {
+		rows, err = h.queries.ListUserFiles(r.Context(), user.ID)
+	}
+	if err != nil {
+		serverError(w, h.logger, "list files", err)
+		return
+	}
+	resp := make([]fileResponse, 0, len(rows))
+	for _, row := range rows {
+		resp = append(resp, toFileResponse(row))
+	}
 	writeJSON(w, resp)
 }
 
