@@ -10,11 +10,12 @@ import (
 )
 
 type Blob struct {
-	ID         string       `json:"id"`
-	Size       int64        `json:"size"`
-	Sha256     string       `json:"sha256"`
-	CreatedAt  time.Time    `json:"created_at"`
-	OrphanedAt sql.NullTime `json:"orphaned_at"`
+	ID         string         `json:"id"`
+	Size       int64          `json:"size"`
+	Sha256     string         `json:"sha256"`
+	CreatedAt  time.Time      `json:"created_at"`
+	OrphanedAt sql.NullTime   `json:"orphaned_at"`
+	SearchMeta sql.NullString `json:"search_meta"`
 }
 
 type Config struct {

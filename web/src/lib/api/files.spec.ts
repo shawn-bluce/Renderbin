@@ -211,7 +211,15 @@ describe('searchFiles', () => {
 	});
 
 	it('adds content=true and encodes the query', async () => {
-		const results = [{ slug: 'a', matched_name: false, matched_content: true, snippet: '…hello…' }];
+		const results = [
+			{
+				slug: 'a',
+				matched_name: false,
+				matched_meta: false,
+				matched_content: true,
+				snippet: '…hello…'
+			}
+		];
 		const fetchMock = mockFetch(okJson(results));
 		await expect(searchFiles('a b&c', true)).resolves.toEqual(results);
 		expect(fetchMock).toHaveBeenCalledWith('/api/search?q=a+b%26c&content=true');

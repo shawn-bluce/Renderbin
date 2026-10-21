@@ -1,0 +1,17 @@
+-- What the default search looks at besides a file's name: an HTML document's
+-- <title>, description, keywords and Open Graph title/description, or a
+-- Markdown document's front-matter title/description or first heading (see
+-- internal/searchmeta). One field per line, at most 1KB.
+--
+-- Keep this file pure ASCII -- sqlc reads this directory for its schema, and
+-- its SQLite rewriter works on byte offsets while the parser reports character
+-- positions, so one multi-byte character silently corrupts codegen.
+--
+-- On blobs rather than files: the fields are derived from the content alone,
+-- and a blob never changes, so they are computed once, by the write that
+-- stores the blob (InsertBlob), and an edit that keeps the content keeps them.
+--
+-- NULL means "not computed yet": 0012_fill_search_meta (Go) fills it in for
+-- the blobs that already exist, and a restore fills it for blobs it stores.
+-- The search treats NULL as no fields.
+ALTER TABLE blobs ADD COLUMN search_meta TEXT;

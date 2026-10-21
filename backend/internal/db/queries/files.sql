@@ -82,15 +82,30 @@ SELECT files.content_size, files.kind, files.blob_id, blobs.sha256 FROM files
 JOIN blobs ON blobs.id = files.blob_id
 WHERE files.slug = sqlc.arg(slug) AND files.user_id = sqlc.arg(user_id) AND files.deleted_at IS NULL;
 
--- Plain substring search via instr() rather than LIKE: no wildcard/escape
--- handling needed, and lower() gives the same ASCII-only case-insensitivity
--- LIKE would. Content is not searched here: it is on disk, and
--- handlers/search.go reads it there.
--- name: SearchUserFilesByName :many
-SELECT * FROM files
-WHERE deleted_at IS NULL AND user_id = sqlc.arg(user_id)
-  AND instr(lower(name), lower(sqlc.arg(name_query))) > 0
-ORDER BY created_at DESC;
+-- The default search: a file's name and its blob's search_meta (title,
+-- description, keywords... see internal/searchmeta), never its content, so it
+-- is answered from the database alone. Plain substring search via instr()
+-- rather than LIKE: no wildcard/escape handling needed, and lower() gives the
+-- same ASCII-only case-insensitivity LIKE would. search_meta is NULL for a
+-- blob not yet filled in, which matches nothing.
+-- name: SearchUserFiles :many
+SELECT sqlc.embed(files), CAST(COALESCE(blobs.search_meta, '') AS TEXT) AS search_meta
+FROM files
+JOIN blobs ON blobs.id = files.blob_id
+WHERE files.deleted_at IS NULL AND files.user_id = sqlc.arg(user_id)
+  AND (instr(lower(files.name), lower(sqlc.arg(query))) > 0
+    OR instr(lower(COALESCE(blobs.search_meta, '')), lower(sqlc.arg(query))) > 0)
+ORDER BY files.created_at DESC;
+
+-- The candidates for a full-text search, which matches in Go after reading
+-- each document from its blob (handlers/search.go): every live file with its
+-- search_meta, so a site -- whose zip is not text -- can still match there.
+-- name: ListUserFilesWithSearchMeta :many
+SELECT sqlc.embed(files), CAST(COALESCE(blobs.search_meta, '') AS TEXT) AS search_meta
+FROM files
+JOIN blobs ON blobs.id = files.blob_id
+WHERE files.deleted_at IS NULL AND files.user_id = sqlc.arg(user_id)
+ORDER BY files.created_at DESC;
 
 -- name: RenameFile :one
 UPDATE files

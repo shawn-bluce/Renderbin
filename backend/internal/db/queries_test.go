@@ -711,10 +711,17 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 			}
 			return used != 0
 		}},
-		{"SearchUserFilesByName", func(t *testing.T, q *sqlcgen.Queries) bool {
-			rows, err := q.SearchUserFilesByName(ctx, sqlcgen.SearchUserFilesByNameParams{UserID: stranger, NameQuery: "name"})
+		{"SearchUserFiles", func(t *testing.T, q *sqlcgen.Queries) bool {
+			rows, err := q.SearchUserFiles(ctx, sqlcgen.SearchUserFilesParams{UserID: stranger, Query: "name"})
 			if err != nil {
-				t.Fatalf("SearchUserFilesByName: %v", err)
+				t.Fatalf("SearchUserFiles: %v", err)
+			}
+			return len(rows) != 0
+		}},
+		{"ListUserFilesWithSearchMeta", func(t *testing.T, q *sqlcgen.Queries) bool {
+			rows, err := q.ListUserFilesWithSearchMeta(ctx, stranger)
+			if err != nil {
+				t.Fatalf("ListUserFilesWithSearchMeta: %v", err)
 			}
 			return len(rows) != 0
 		}},

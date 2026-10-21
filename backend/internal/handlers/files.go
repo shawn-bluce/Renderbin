@@ -241,18 +241,22 @@ func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 // searchResultResponse augments the list-row fields with where the query
-// matched: a name hit renders as a plain title row, while a content-only hit
-// additionally carries the weakened snippet (±100 runes around the match).
+// matched: a name hit renders as a plain title row, while any other hit
+// additionally carries a weakened snippet -- the search field that matched
+// (a page's title or description), or ±100 runes around a content match.
 type searchResultResponse struct {
 	fileResponse
 	MatchedName    bool   `json:"matched_name"`
+	MatchedMeta    bool   `json:"matched_meta"`
 	MatchedContent bool   `json:"matched_content"`
 	Snippet        string `json:"snippet,omitempty"`
 }
 
-// Search implements GET /api/search?q=...&content=true — substring
-// search scoped to the current user's own (non-deleted) files. Name-only by
-// default; content=true also searches the stored source.
+// Search implements GET /api/search?q=...&content=true — substring search
+// scoped to the current user's own (non-deleted) files. By default it matches
+// names and the search fields extracted from each file's head (title,
+// description, keywords), answered from the database alone; content=true also
+// reads and searches every document's full text.
 func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
@@ -262,11 +266,8 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 	includeContent := r.URL.Query().Get("content") == "true"
 
 	resp := make([]searchResultResponse, 0)
-	switch {
-	case q == "":
-		// Nothing to search; answer with no rows.
-	case includeContent:
-		hits, err := searchOwnFiles(r.Context(), h.queries, h.blobs, user.ID, q)
+	if q != "" {
+		hits, err := searchOwnFiles(r.Context(), h.queries, h.blobs, user.ID, q, includeContent)
 		if err != nil {
 			if r.Context().Err() != nil {
 				return // the client went away; there is no one to answer
@@ -278,31 +279,17 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 			res := searchResultResponse{
 				fileResponse:   toFileResponse(hit.file),
 				MatchedName:    containsFold(hit.file.Name, q),
+				MatchedMeta:    hit.metaMatch != "",
 				MatchedContent: hit.matchPos > 0,
 			}
-			// A title hit renders as a plain row, so only a content-*only* hit
-			// carries a snippet -- but matched_content above reports the truth
-			// either way, since a consumer other than the dashboard has no
-			// reason to read it as "matched content and nothing else".
+			// A title hit renders as a plain row, so only other hits carry a
+			// snippet -- but the matched_* flags report the truth either way,
+			// since a consumer other than the dashboard has no reason to read
+			// them as "matched this and nothing else".
 			if !res.MatchedName {
-				res.Snippet = snippetFromWindow(hit.window, q, hit.matchPos, hit.contentChars)
+				res.Snippet = hit.snippet(q)
 			}
 			resp = append(resp, res)
-		}
-	default:
-		rows, err := h.queries.SearchUserFilesByName(r.Context(), sqlcgen.SearchUserFilesByNameParams{
-			UserID:    user.ID,
-			NameQuery: q,
-		})
-		if err != nil {
-			serverError(w, h.logger, "search files", err)
-			return
-		}
-		for _, row := range rows {
-			resp = append(resp, searchResultResponse{
-				fileResponse: toFileResponse(row),
-				MatchedName:  true,
-			})
 		}
 	}
 
@@ -497,7 +484,7 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		serverError(w, h.logger, "generate access code", err)
 		return
 	}
-	blobID, err := storeContent(r.Context(), h.queries, h.blobs, []byte(req.HTMLContent))
+	blobID, err := storeContent(r.Context(), h.queries, h.blobs, kind, []byte(req.HTMLContent))
 	if err != nil {
 		serverError(w, h.logger, "create file", err)
 		return
@@ -665,7 +652,7 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if !h.checkQuota(w, r, user, int64(len(req.HTMLContent)), old.ContentSize) {
 			return
 		}
-		blobID, blobErr := contentBlob(r.Context(), h.queries, h.blobs, []byte(req.HTMLContent), old.BlobID, old.Sha256)
+		blobID, blobErr := contentBlob(r.Context(), h.queries, h.blobs, old.Kind, []byte(req.HTMLContent), old.BlobID, old.Sha256)
 		if blobErr != nil {
 			serverError(w, h.logger, "update file", blobErr)
 			return

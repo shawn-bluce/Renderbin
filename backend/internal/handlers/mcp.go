@@ -80,7 +80,7 @@ func NewMCPHandler(queries *sqlcgen.Queries, blobs *blobstore.Store, conn *sql.D
 	}, m.listFiles)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "search_files",
-		Description: "Search your own documents by name and content. Returns each match's name and access URL.",
+		Description: "Search your own documents by name, title, description and full content. Returns each match's name and access URL.",
 	}, m.searchFiles)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "update_file",
@@ -263,7 +263,7 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 	if err != nil {
 		return sqlcgen.File{}, m.toolError("generate access code", err)
 	}
-	blobID, err := storeContent(ctx, m.queries, m.blobs, []byte(in.Content))
+	blobID, err := storeContent(ctx, m.queries, m.blobs, kind, []byte(in.Content))
 	if err != nil {
 		return sqlcgen.File{}, m.toolError("store file", err)
 	}
@@ -438,7 +438,7 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, searchFilesOutput{}, errors.New("query is required")
 	}
 
-	hits, err := searchOwnFiles(ctx, m.queries, m.blobs, user.ID, q)
+	hits, err := searchOwnFiles(ctx, m.queries, m.blobs, user.ID, q, true)
 	if err != nil {
 		return nil, searchFilesOutput{}, m.toolError("search files", err)
 	}
@@ -454,7 +454,7 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 		f := hit.file
 		match := searchFilesMatch{mcpFileInfo: fileInfo(baseURL, f)}
 		if !containsFold(f.Name, q) {
-			match.Snippet = snippetFromWindow(hit.window, q, hit.matchPos, hit.contentChars)
+			match.Snippet = hit.snippet(q)
 		}
 		out.Results = append(out.Results, match)
 		lines = append(lines, fmt.Sprintf("- %q (%s): %s", f.Name, visibilityLabel(f), match.URL))
@@ -510,7 +510,7 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 		if err := enforceQuota(ctx, m.queries, user, int64(len(in.Content)), file.ContentSize); err != nil {
 			return nil, mcpFileInfo{}, m.toolError("check quota", err, "user_id", user.ID)
 		}
-		if blobID, err = storeContent(ctx, m.queries, m.blobs, []byte(in.Content)); err != nil {
+		if blobID, err = storeContent(ctx, m.queries, m.blobs, file.Kind, []byte(in.Content)); err != nil {
 			return nil, mcpFileInfo{}, m.toolError("store file", err)
 		}
 	}
@@ -761,7 +761,7 @@ func (m *MCPHandler) updateSite(ctx context.Context, req *mcp.CallToolRequest, i
 		if err := enforceQuota(ctx, m.queries, user, int64(len(archive)), file.ContentSize); err != nil {
 			return nil, siteOutput{}, m.toolError("check quota", err)
 		}
-		if newBlob, err = storeContent(ctx, m.queries, m.blobs, archive); err != nil {
+		if newBlob, err = storeContent(ctx, m.queries, m.blobs, KindSite, archive); err != nil {
 			return nil, siteOutput{}, m.toolError("store site", err)
 		}
 		listing = site.Infos(merged)

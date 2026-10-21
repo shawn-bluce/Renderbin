@@ -394,6 +394,12 @@ func prepareTar(ctx context.Context, store *blobstore.Store, r io.Reader, path s
 	if err := renameBlobs(ctx, snap, renamed); err != nil {
 		return Stats{}, created, err
 	}
+	// A backup from before blobs carried search fields was migrated by
+	// db.Open before its blobs had arrived, so those fields could not be
+	// computed then; they can now.
+	if err := db.FillSearchMeta(snap, store); err != nil {
+		return Stats{}, created, fmt.Errorf("fill search fields: %w", err)
+	}
 	return stats, created, snap.Close()
 }
 

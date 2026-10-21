@@ -46,16 +46,19 @@ export function listFiles(f?: typeof fetch): Promise<FileItem[]> {
 	return api('/api/files', { fetch: f });
 }
 
-// A search hit: a name match renders as a plain row; a content-only match
-// also carries a snippet (the match ±100 runes, ellipsized) for weakened display.
+// A search hit: a name match renders as a plain row; any other match also
+// carries a snippet for weakened display -- the head field that matched (a
+// page's title or description), or the content match ±100 runes, ellipsized.
 export interface SearchResult extends FileItem {
 	matched_name: boolean;
+	matched_meta: boolean;
 	matched_content: boolean;
 	snippet?: string;
 }
 
 /**
- * Substring search over the current user's own files (name-only by default).
+ * Substring search over the current user's own files: names and head fields
+ * (title, description, keywords) by default, the full text with `content`.
  *
  * Not `/api/files/search`: that shadowed any file whose custom slug happened to
  * be "search", since a static path segment wins over `{slug}` on the server.

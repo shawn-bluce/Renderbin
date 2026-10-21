@@ -121,7 +121,8 @@ func compactIfMostlyFree(conn *sql.DB) error {
 // safe to re-run after it was interrupted, since it is only recorded once it
 // has finished.
 var goMigrations = map[string]func(*sql.DB, *blobstore.Store) error{
-	"0009_extract_content": extractContent,
+	"0009_extract_content":  extractContent,
+	"0012_fill_search_meta": FillSearchMeta,
 }
 
 // migrationNames lists every migration, SQL files and Go steps, in the order

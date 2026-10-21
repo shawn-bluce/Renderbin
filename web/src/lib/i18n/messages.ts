@@ -59,9 +59,9 @@ const en = {
 	// List controls
 	'list.searchPlaceholder': 'Search files…',
 	'list.sort': 'Sort',
-	'search.scopeTitle': 'Searches your own files',
+	'search.scopeTitle': 'Searches your own files: names, page titles and descriptions',
 	'search.content': 'Search content',
-	'search.contentTitle': 'Also search inside file contents',
+	'search.contentTitle': 'Also search the full text of every file (slower)',
 	'search.loading': 'Searching…',
 	'search.clear': 'Clear search',
 	'search.empty': 'No files match your search.',
@@ -426,9 +426,9 @@ const zh = {
 	// List controls
 	'list.searchPlaceholder': '搜索文件…',
 	'list.sort': '排序',
-	'search.scopeTitle': '只搜索你自己的文件',
+	'search.scopeTitle': '只搜索你自己的文件：文件名、页面标题和描述',
 	'search.content': '搜索正文',
-	'search.contentTitle': '同时搜索文件正文内容',
+	'search.contentTitle': '同时搜索每个文件的全部正文（较慢）',
 	'search.loading': '搜索中…',
 	'search.clear': '清除搜索',
 	'search.empty': '没有匹配的文件。',

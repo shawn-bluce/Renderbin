@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1137,6 +1138,7 @@ type searchResp struct {
 	Slug           string `json:"slug"`
 	Name           string `json:"name"`
 	MatchedName    bool   `json:"matched_name"`
+	MatchedMeta    bool   `json:"matched_meta"`
 	MatchedContent bool   `json:"matched_content"`
 	Snippet        string `json:"snippet"`
 }
@@ -1197,6 +1199,59 @@ func TestSearchFiles(t *testing.T) {
 
 	// Search requires auth.
 	e.expect(t, http.StatusUnauthorized, http.MethodGet, "/api/search?q=hello", "", nil)
+}
+
+// The default search covers names and the head fields extracted when the
+// content was stored -- a page's title, description, keywords -- but not the
+// body, which takes content=true. A field hit shows the field as its snippet.
+func TestSearchMatchesHeadFields(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+
+	e.createViaAPI(t, cookie, "q3.html", `<html><head><title>Quarterly Revenue</title>
+<meta name="description" content="Numbers for the board, by region"></head>
+<body><p>The body mentions zebras.</p></body></html>`)
+	create := func(name, kind, content string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"name": name, "kind": kind, "html_content": content})
+		resp := e.do(t, http.MethodPost, "/api/files", string(body), cookie)
+		assertStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+	}
+	create("notes.md", "markdown", "---\ntitle: 周报\n---\n正文里有 zebras")
+	s := e.uploadSite(t, cookie, "docs", map[string]string{
+		"index.html": `<head><title>Site Handbook</title></head><body>zebras again</body>`,
+	})
+
+	for _, c := range []struct{ q, want, snippet string }{
+		{"quarterly", "q3.html", "Quarterly Revenue"},
+		{"BY REGION", "q3.html", "Numbers for the board, by region"},
+		{"周报", "notes.md", "周报"},
+		{"handbook", s.Name, "Site Handbook"},
+	} {
+		results := e.search(t, cookie, "q="+url.QueryEscape(c.q))
+		if len(results) != 1 || results[0].Name != c.want {
+			t.Errorf("search %q = %+v, want only %q", c.q, results, c.want)
+			continue
+		}
+		r := results[0]
+		if r.MatchedName || !r.MatchedMeta || r.MatchedContent || r.Snippet != c.snippet {
+			t.Errorf("search %q: %+v, want a head-field hit with snippet %q", c.q, r, c.snippet)
+		}
+	}
+
+	// Body text is not in the default search...
+	if results := e.search(t, cookie, "q=zebras"); len(results) != 0 {
+		t.Errorf("default search found body text: %+v", results)
+	}
+	// ...but is in the full-text one (sites excepted: their source is a zip).
+	if results := e.search(t, cookie, "q=zebras&content=true"); len(results) != 2 {
+		t.Errorf("full-text search for body text = %+v, want the two documents", results)
+	}
+	// A full-text search still reports a head-field hit as one.
+	if results := e.search(t, cookie, "q=handbook&content=true"); len(results) != 1 || !results[0].MatchedMeta {
+		t.Errorf("full-text search for a site's title = %+v", results)
+	}
 }
 
 func TestSearchScopedToOwnFiles(t *testing.T) {

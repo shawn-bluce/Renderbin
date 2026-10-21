@@ -312,6 +312,54 @@ func TestRestoreOwnBackup(t *testing.T) {
 	}
 }
 
+// A backup taken by a version whose blobs had no search fields: db.Open adds
+// and fills the column while migrating the snapshot, but its blobs have not
+// arrived yet, so the restore has to fill them in once they have.
+func TestRestoreFillsSearchFieldsOfAnOlderBackup(t *testing.T) {
+	source := seed(t, "admin")
+	source.addFile(t, "page", []byte(`<head><title>Searchable Title</title></head>`))
+	entries := readEntries(t, backupOf(t, source))
+
+	// Turn the snapshot back into one from before 0011.
+	dbPath := filepath.Join(t.TempDir(), "old.db")
+	if err := os.WriteFile(dbPath, entries[0].data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE blobs DROP COLUMN search_meta`,
+		`DELETE FROM schema_migrations WHERE filename >= '0011'`,
+	} {
+		if _, err := old.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	old.Close()
+	oldDB, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries[0] = entry{"renderbin.db", oldDB}
+
+	live := seed(t, "live-user")
+	if _, err := restore(live, tarOf(t, entries...)); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	var meta sql.NullString
+	if err := live.conn.QueryRow(`SELECT blobs.search_meta FROM files JOIN blobs ON blobs.id = files.blob_id
+		WHERE files.slug = 'page'`).Scan(&meta); err != nil {
+		t.Fatal(err)
+	}
+	// addFile records no fields (it is not the handler); the snapshot's were
+	// dropped above, so these can only have come from the restore.
+	if !meta.Valid || meta.String != "Searchable Title" {
+		t.Errorf("search_meta after restore = %v, want the page's title", meta)
+	}
+}
+
 // The id counter has to come across with the rows. Restoring a bigger database
 // over a smaller one otherwise leaves the live sequence behind the restored
 // data, and the next insert collides with an id that already exists.

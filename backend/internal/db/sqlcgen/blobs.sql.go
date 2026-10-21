@@ -51,14 +51,15 @@ func (q *Queries) DeleteOrphanedBlobs(ctx context.Context, cutoff int64) ([]stri
 
 const insertBlob = `-- name: InsertBlob :exec
 
-INSERT INTO blobs (id, size, sha256, orphaned_at)
-VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+INSERT INTO blobs (id, size, sha256, search_meta, orphaned_at)
+VALUES (?1, ?2, ?3, CAST(?4 AS TEXT), CURRENT_TIMESTAMP)
 `
 
 type InsertBlobParams struct {
-	ID     string `json:"id"`
-	Size   int64  `json:"size"`
-	Sha256 string `json:"sha256"`
+	ID         string `json:"id"`
+	Size       int64  `json:"size"`
+	Sha256     string `json:"sha256"`
+	SearchMeta string `json:"search_meta"`
 }
 
 // Blob bookkeeping (see migrations 0008/0010 and internal/blobstore).
@@ -75,8 +76,16 @@ type InsertBlobParams struct {
 // files_blob_adopt/files_blob_swap triggers clear orphaned_at), so if that
 // write never happens -- a slug collision, a quota race, a crash -- what is
 // left is a timestamped orphan the collector removes, not a leak.
+// search_meta is computed from the same bytes by the caller (storeContent);
+// the CAST makes it a plain string parameter, so a write records "no fields"
+// (empty) rather than leaving it NULL, which means "not computed".
 func (q *Queries) InsertBlob(ctx context.Context, arg InsertBlobParams) error {
-	_, err := q.db.ExecContext(ctx, insertBlob, arg.ID, arg.Size, arg.Sha256)
+	_, err := q.db.ExecContext(ctx, insertBlob,
+		arg.ID,
+		arg.Size,
+		arg.Sha256,
+		arg.SearchMeta,
+	)
 	return err
 }
 

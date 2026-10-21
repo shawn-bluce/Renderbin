@@ -709,8 +709,16 @@ func TestInspectChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if fmt.Sprint(plan.Pending) != "[0008_blob_store.sql 0009_extract_content 0010_drop_inline_content.sql]" {
-		t.Errorf("Pending = %v", plan.Pending)
+	// Everything from 0008 on, SQL files and Go steps alike.
+	all, _ := migrationNames()
+	var want []string
+	for _, name := range all {
+		if name >= "0008" {
+			want = append(want, name)
+		}
+	}
+	if fmt.Sprint(plan.Pending) != fmt.Sprint(want) {
+		t.Errorf("Pending = %v, want %v", plan.Pending, want)
 	}
 	if plan.MoveFiles != 2 || plan.MoveBytes != 11 || plan.Need < 11 {
 		t.Errorf("plan = %+v, want 2 files, 11 bytes", plan)
@@ -807,5 +815,35 @@ func TestConcurrentTransactionsWaitForTheWriteLock(t *testing.T) {
 
 	if got := rawText(t, conn, `SELECT value FROM configs WHERE key = 'n'`); got != fmt.Sprint(workers*rounds) {
 		t.Errorf("counter = %s, want %d: a transaction lost an update", got, workers*rounds)
+	}
+}
+
+// TestMigrationFillsSearchMeta covers 0011/0012 on an upgrade: every file
+// that already exists gets the head fields the default search looks at,
+// extracted from content the upgrade just moved to the blob store.
+func TestMigrationFillsSearchMeta(t *testing.T) {
+	path := stageLegacyContent(t,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind)
+		 VALUES ('h', 'h', '<head><title>Old Report</title><meta name="description" content="from before"></head>', 'c1', 1, 'html')`,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind)
+		 VALUES ('m', 'm', '# Markdown Title', 'c2', 1, 'markdown')`,
+		`INSERT INTO files (slug, name, html_content, access_code, user_id, kind)
+		 VALUES ('t', 't', '<title>not html</title>', 'c3', 1, 'txt')`,
+	)
+	conn, err := Open(path, testStore(t))
+	if err != nil {
+		t.Fatalf("Open (upgrade): %v", err)
+	}
+	defer conn.Close()
+
+	for slug, want := range map[string]string{"h": "Old Report\nfrom before", "m": "Markdown Title", "t": ""} {
+		var meta sql.NullString
+		if err := conn.QueryRow(`SELECT blobs.search_meta FROM files JOIN blobs ON blobs.id = files.blob_id
+			WHERE files.slug = ?`, slug).Scan(&meta); err != nil {
+			t.Fatal(err)
+		}
+		if !meta.Valid || meta.String != want {
+			t.Errorf("%s: search_meta = %v, want %q", slug, meta, want)
+		}
 	}
 }

@@ -406,7 +406,7 @@ func storeNewSite(ctx context.Context, queries *sqlcgen.Queries, store *blobstor
 	if err != nil {
 		return sqlcgen.File{}, fmt.Errorf("generate access code: %w", err)
 	}
-	blobID, err := storeContent(ctx, queries, store, archive)
+	blobID, err := storeContent(ctx, queries, store, KindSite, archive)
 	if err != nil {
 		return sqlcgen.File{}, err
 	}
@@ -529,7 +529,7 @@ func (h *FilesHandler) ReplaceSite(w http.ResponseWriter, r *http.Request) {
 	if !h.checkQuota(w, r, user, int64(len(archive)), old.ContentSize) {
 		return
 	}
-	blobID, err := storeContent(r.Context(), h.queries, h.blobs, archive)
+	blobID, err := storeContent(r.Context(), h.queries, h.blobs, KindSite, archive)
 	if err != nil {
 		serverError(w, h.logger, "replace site", err)
 		return

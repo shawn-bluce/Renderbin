@@ -594,6 +594,68 @@ func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]File, erro
 	return items, nil
 }
 
+const listUserFilesWithSearchMeta = `-- name: ListUserFilesWithSearchMeta :many
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.blob_id, CAST(COALESCE(blobs.search_meta, '') AS TEXT) AS search_meta
+FROM files
+JOIN blobs ON blobs.id = files.blob_id
+WHERE files.deleted_at IS NULL AND files.user_id = ?1
+ORDER BY files.created_at DESC
+`
+
+type ListUserFilesWithSearchMetaRow struct {
+	File       File   `json:"file"`
+	SearchMeta string `json:"search_meta"`
+}
+
+// The candidates for a full-text search, which matches in Go after reading
+// each document from its blob (handlers/search.go): every live file with its
+// search_meta, so a site -- whose zip is not text -- can still match there.
+func (q *Queries) ListUserFilesWithSearchMeta(ctx context.Context, userID int64) ([]ListUserFilesWithSearchMetaRow, error) {
+	rows, err := q.db.QueryContext(ctx, listUserFilesWithSearchMeta, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUserFilesWithSearchMetaRow
+	for rows.Next() {
+		var i ListUserFilesWithSearchMetaRow
+		if err := rows.Scan(
+			&i.File.ID,
+			&i.File.Slug,
+			&i.File.Name,
+			&i.File.IsPublic,
+			&i.File.AccessCode,
+			&i.File.CreatedAt,
+			&i.File.UpdatedAt,
+			&i.File.DeletedAt,
+			&i.File.SuccessCount,
+			&i.File.FailureCount,
+			&i.File.Tags,
+			&i.File.ExpiresAt,
+			&i.File.MaxViews,
+			&i.File.ViewCount,
+			&i.File.Kind,
+			&i.File.CodeSuccessCount,
+			&i.File.UserID,
+			&i.File.ExpiredAt,
+			&i.File.ExpiredReason,
+			&i.File.ContentSize,
+			&i.File.BlobID,
+			&i.SearchMeta,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const refreshFileAccessCode = `-- name: RefreshFileAccessCode :one
 UPDATE files
 SET access_code = ?1, updated_at = CURRENT_TIMESTAMP
@@ -777,53 +839,64 @@ func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File,
 	return i, err
 }
 
-const searchUserFilesByName = `-- name: SearchUserFilesByName :many
-SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size, blob_id FROM files
-WHERE deleted_at IS NULL AND user_id = ?1
-  AND instr(lower(name), lower(?2)) > 0
-ORDER BY created_at DESC
+const searchUserFiles = `-- name: SearchUserFiles :many
+SELECT files.id, files.slug, files.name, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size, files.blob_id, CAST(COALESCE(blobs.search_meta, '') AS TEXT) AS search_meta
+FROM files
+JOIN blobs ON blobs.id = files.blob_id
+WHERE files.deleted_at IS NULL AND files.user_id = ?1
+  AND (instr(lower(files.name), lower(?2)) > 0
+    OR instr(lower(COALESCE(blobs.search_meta, '')), lower(?2)) > 0)
+ORDER BY files.created_at DESC
 `
 
-type SearchUserFilesByNameParams struct {
-	UserID    int64  `json:"user_id"`
-	NameQuery string `json:"name_query"`
+type SearchUserFilesParams struct {
+	UserID int64  `json:"user_id"`
+	Query  string `json:"query"`
 }
 
-// Plain substring search via instr() rather than LIKE: no wildcard/escape
-// handling needed, and lower() gives the same ASCII-only case-insensitivity
-// LIKE would. Content is not searched here: it is on disk, and
-// handlers/search.go reads it there.
-func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFilesByNameParams) ([]File, error) {
-	rows, err := q.db.QueryContext(ctx, searchUserFilesByName, arg.UserID, arg.NameQuery)
+type SearchUserFilesRow struct {
+	File       File   `json:"file"`
+	SearchMeta string `json:"search_meta"`
+}
+
+// The default search: a file's name and its blob's search_meta (title,
+// description, keywords... see internal/searchmeta), never its content, so it
+// is answered from the database alone. Plain substring search via instr()
+// rather than LIKE: no wildcard/escape handling needed, and lower() gives the
+// same ASCII-only case-insensitivity LIKE would. search_meta is NULL for a
+// blob not yet filled in, which matches nothing.
+func (q *Queries) SearchUserFiles(ctx context.Context, arg SearchUserFilesParams) ([]SearchUserFilesRow, error) {
+	rows, err := q.db.QueryContext(ctx, searchUserFiles, arg.UserID, arg.Query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []File
+	var items []SearchUserFilesRow
 	for rows.Next() {
-		var i File
+		var i SearchUserFilesRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.Slug,
-			&i.Name,
-			&i.IsPublic,
-			&i.AccessCode,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-			&i.SuccessCount,
-			&i.FailureCount,
-			&i.Tags,
-			&i.ExpiresAt,
-			&i.MaxViews,
-			&i.ViewCount,
-			&i.Kind,
-			&i.CodeSuccessCount,
-			&i.UserID,
-			&i.ExpiredAt,
-			&i.ExpiredReason,
-			&i.ContentSize,
-			&i.BlobID,
+			&i.File.ID,
+			&i.File.Slug,
+			&i.File.Name,
+			&i.File.IsPublic,
+			&i.File.AccessCode,
+			&i.File.CreatedAt,
+			&i.File.UpdatedAt,
+			&i.File.DeletedAt,
+			&i.File.SuccessCount,
+			&i.File.FailureCount,
+			&i.File.Tags,
+			&i.File.ExpiresAt,
+			&i.File.MaxViews,
+			&i.File.ViewCount,
+			&i.File.Kind,
+			&i.File.CodeSuccessCount,
+			&i.File.UserID,
+			&i.File.ExpiredAt,
+			&i.File.ExpiredReason,
+			&i.File.ContentSize,
+			&i.File.BlobID,
+			&i.SearchMeta,
 		); err != nil {
 			return nil, err
 		}

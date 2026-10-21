@@ -13,9 +13,12 @@
 -- files_blob_adopt/files_blob_swap triggers clear orphaned_at), so if that
 -- write never happens -- a slug collision, a quota race, a crash -- what is
 -- left is a timestamped orphan the collector removes, not a leak.
+-- search_meta is computed from the same bytes by the caller (storeContent);
+-- the CAST makes it a plain string parameter, so a write records "no fields"
+-- (empty) rather than leaving it NULL, which means "not computed".
 -- name: InsertBlob :exec
-INSERT INTO blobs (id, size, sha256, orphaned_at)
-VALUES (sqlc.arg(id), sqlc.arg(size), sqlc.arg(sha256), CURRENT_TIMESTAMP);
+INSERT INTO blobs (id, size, sha256, search_meta, orphaned_at)
+VALUES (sqlc.arg(id), sqlc.arg(size), sqlc.arg(sha256), CAST(sqlc.arg(search_meta) AS TEXT), CURRENT_TIMESTAMP);
 
 -- Claims every blob orphaned before cutoff (unix seconds) by deleting its
 -- record, and returns the IDs whose files the collector then removes. Record

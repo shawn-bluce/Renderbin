@@ -1,6 +1,7 @@
 <script lang="ts">
 	// API-backed search over the current user's own files: 250ms debounce,
-	// name-only by default, optionally including file contents. The query and the
+	// names and head fields (title, description, keywords) by default,
+	// optionally the full text of every file. The query and the
 	// outcome are bound by the page (which swaps its list for the results and can
 	// clear the box); the content toggle is this box's own business.
 	import Icon from '$lib/components/Icon.svelte';

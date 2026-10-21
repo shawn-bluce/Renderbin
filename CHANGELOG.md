@@ -30,6 +30,14 @@ upgrading** (Settings → Backup) if you might want to go back.
 
 ### Changed
 
+- **Search looks at names and page titles by default.** Without "Search
+  content", a search now matches a file's name and the fields at the top of
+  it: an HTML page's `<title>`, description, keywords and Open Graph
+  title/description, a Markdown document's front-matter title/description or
+  first heading, and a site's `index.html`. These are extracted when the file
+  is stored, so the default search no longer reads any document; a hit on one
+  shows that field under the name. "Search content" still searches the full
+  text. Existing files get their fields on the first start after upgrading.
 - **File content moved out of the database.** Each file's content is now a
   file of its own in a `blobs` directory beside `app.db` (in the same `db-data`
   volume, so nothing about a Docker deployment changes; `BLOB_DIR` overrides the
