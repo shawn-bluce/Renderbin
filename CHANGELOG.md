@@ -8,7 +8,18 @@ Upgrades are `docker compose pull && docker compose up -d`. Database migrations
 are forward-only and apply themselves on start, so **take a backup before
 upgrading** (Settings → Backup) if you might want to go back.
 
-## Unreleased
+## v0.5.0
+
+### Breaking
+
+- **Backups are now a `.tar`, and an older version cannot restore one.** If you
+  might want to roll back, download a backup from Settings → Backup **before**
+  upgrading: restore still accepts that older `.db`.
+- **The first start moves every file's content out of the database** before
+  the server listens: seconds for a typical instance, longer for gigabytes, and
+  it needs free disk space of about the total content size. Run
+  `docker compose pull && docker compose run --rm app migrate --check` first
+  to see what it will do. Details under "Changed" below.
 
 ### Security
 
