@@ -5,6 +5,30 @@ export interface Settings {
 	mcp_enabled: boolean;
 	upload_default_public: boolean;
 	qr_widget: boolean;
+	/** Read-only: whether a model is configured, i.e. "Ask AI" is offered. */
+	ai_enabled: boolean;
+}
+
+/** The global "Ask AI" model, super admin only. The API key never comes back. */
+export interface AISettings {
+	base_url: string;
+	model: string;
+	api_key_set: boolean;
+	/** The key's last four characters, enough to tell which one it is. */
+	api_key_hint: string;
+}
+
+export function getAISettings(f?: typeof fetch): Promise<AISettings> {
+	return api('/api/settings/ai', { fetch: f });
+}
+
+/** Omit `api_key` to keep the stored key; send "" to clear it. */
+export function updateAISettings(patch: {
+	base_url?: string;
+	model?: string;
+	api_key?: string;
+}): Promise<AISettings> {
+	return api('/api/settings/ai', { method: 'PUT', json: patch });
 }
 
 export function getSettings(f?: typeof fetch): Promise<Settings> {
@@ -12,7 +36,7 @@ export function getSettings(f?: typeof fetch): Promise<Settings> {
 }
 
 /** Super-admin only; fields are optional so a single toggle can be sent alone. */
-export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
+export function updateSettings(patch: Partial<Omit<Settings, 'ai_enabled'>>): Promise<Settings> {
 	return api('/api/settings', { method: 'PUT', json: patch });
 }
 

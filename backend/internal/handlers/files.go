@@ -1133,8 +1133,17 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 			serverError(w, h.logger, "read file", err)
 			return
 		}
-		page := renderContent(file.Kind, file.Name, string(content))
-		writeUserHTML(w, http.StatusOK, h.withQRWidget(r.Context(), page, note))
+		page := h.withQRWidget(r.Context(), renderContent(file.Kind, file.Name, string(content)), note)
+		// See askai.go for who is offered the button, and why a view-limited
+		// file is not offered to a non-owner.
+		if signedIn && (owner || !file.MaxViews.Valid) {
+			code := ""
+			if !owner {
+				code = r.URL.Query().Get("code")
+			}
+			page = h.withAskAI(r.Context(), page, askAITarget(file.Slug, code))
+		}
+		writeUserHTML(w, http.StatusOK, page)
 		return
 	}
 

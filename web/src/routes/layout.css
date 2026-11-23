@@ -166,6 +166,53 @@
 		@apply rounded-lg border border-line bg-surface;
 	}
 
+	/* "Ask AI" answers: Markdown rendered to HTML (see $lib/markdown.ts). */
+	.chat-md {
+		@apply leading-relaxed break-words;
+	}
+	.chat-md > * + * {
+		@apply mt-2.5;
+	}
+	.chat-md :is(h1, h2, h3, h4, h5, h6) {
+		@apply font-semibold text-fg-strong;
+	}
+	.chat-md h1 {
+		@apply text-base;
+	}
+	.chat-md :is(ul, ol) {
+		@apply pl-5;
+	}
+	.chat-md ul {
+		@apply list-disc;
+	}
+	.chat-md ol {
+		@apply list-decimal;
+	}
+	.chat-md li + li {
+		@apply mt-1;
+	}
+	.chat-md a {
+		@apply text-accent underline underline-offset-2;
+	}
+	.chat-md :not(pre) > code {
+		@apply rounded bg-raised px-1 py-0.5 font-mono text-[0.85em];
+	}
+	.chat-md pre {
+		@apply overflow-x-auto rounded-md border border-line bg-page p-3 font-mono text-xs leading-relaxed;
+	}
+	.chat-md blockquote {
+		@apply border-l-2 border-line-strong pl-3 text-muted;
+	}
+	.chat-md table {
+		@apply block overflow-x-auto text-xs;
+	}
+	.chat-md :is(th, td) {
+		@apply border border-line px-2 py-1 text-left;
+	}
+	.chat-md hr {
+		@apply border-line;
+	}
+
 	.chip {
 		@apply inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] leading-4 font-medium;
 	}

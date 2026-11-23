@@ -287,6 +287,10 @@ func (h *FilesHandler) RenderSite(w http.ResponseWriter, r *http.Request) {
 			note = qrNotePreview
 		}
 		data = h.withQRWidget(r.Context(), data, note)
+		if preview {
+			// Only the owner holds a preview link; see askai.go.
+			data = h.withAskAI(r.Context(), data, askAITarget(file.Slug, ""))
+		}
 	}
 
 	setSiteHeaders(w, contentType)

@@ -1,5 +1,6 @@
-// Package cron holds the server's periodic background work. There is one job:
-// collecting blobs no file uses any more.
+// Package cron holds the server's periodic background work: collecting blobs
+// no file uses any more, and, on the same hourly tick, "Ask AI" conversations
+// whose file or account is gone (CollectChats).
 package cron
 
 import (
@@ -122,6 +123,13 @@ func RunBlobGC(ctx context.Context, conn *sql.DB, store *blobstore.Store, logger
 		case res.Orphans+res.Strays+res.TempLeft > 0:
 			logger.Info("blob collection", "orphans", res.Orphans, "strays", res.Strays,
 				"temp", res.TempLeft, "took", time.Since(started).Round(time.Millisecond).String())
+		}
+		convs, msgs, err := CollectChats(ctx, conn)
+		switch {
+		case err != nil && ctx.Err() == nil:
+			logger.Error("chat collection", "error", err)
+		case convs+msgs > 0:
+			logger.Info("chat collection", "conversations", convs, "messages", msgs)
 		}
 		timer.Reset(blobGCEvery)
 	}

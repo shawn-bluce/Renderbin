@@ -96,3 +96,20 @@ func TestQRSVGMatchesCode(t *testing.T) {
 		}
 	}
 }
+
+// The Ask AI button is spliced into documents of any charset too, and its
+// target is a JSON literal that must not be able to end the script.
+func TestAskAIWidgetScriptIsASCII(t *testing.T) {
+	page := string(injectAskAIWidget([]byte("<body></body>"), askAITarget("a.b", `x</script><x>&"'`)))
+	for i, c := range []byte(page) {
+		if c >= 0x80 {
+			t.Fatalf("non-ASCII byte %#x at offset %d", c, i)
+		}
+	}
+	if strings.Count(page, "</script") != 1 {
+		t.Fatal("the target broke out of the script")
+	}
+	if !strings.Contains(page, `("/view/a.b?code=x%3C%2Fscript%3E%3Cx%3E%26%22%27")`) {
+		t.Errorf("target literal not found in %s", page)
+	}
+}

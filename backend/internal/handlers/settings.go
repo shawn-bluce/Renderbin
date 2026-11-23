@@ -26,6 +26,9 @@ type settingsResponse struct {
 	MCPEnabled          bool `json:"mcp_enabled"`
 	UploadDefaultPublic bool `json:"upload_default_public"`
 	QRWidget            bool `json:"qr_widget"`
+	// AIEnabled says whether "Ask AI" is offered: a model is configured. The
+	// configuration itself is GET /api/settings/ai, super admin only.
+	AIEnabled bool `json:"ai_enabled"`
 }
 
 func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -34,6 +37,7 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 		MCPEnabled:          configBool(r.Context(), h.queries, ConfigMCPEnabled),
 		UploadDefaultPublic: configBool(r.Context(), h.queries, ConfigUploadDefaultPublic),
 		QRWidget:            configBool(r.Context(), h.queries, ConfigQRWidget),
+		AIEnabled:           aiEnabled(r.Context(), h.queries),
 	})
 }
 

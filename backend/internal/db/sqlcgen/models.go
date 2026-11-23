@@ -18,6 +18,23 @@ type Blob struct {
 	SearchMeta sql.NullString `json:"search_meta"`
 }
 
+type ChatConversation struct {
+	ID        int64     `json:"id"`
+	UserID    int64     `json:"user_id"`
+	FileID    int64     `json:"file_id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type ChatMessage struct {
+	ID             int64     `json:"id"`
+	ConversationID int64     `json:"conversation_id"`
+	Role           string    `json:"role"`
+	Content        string    `json:"content"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type Config struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`

@@ -34,6 +34,7 @@ func New(conn *sql.DB, blobs *blobstore.Store, logger *slog.Logger) http.Handler
 	files := handlers.NewFilesHandler(queries, blobs, logger)
 	backupH := handlers.NewBackupHandler(conn, blobs, logger)
 	adminH := handlers.NewAdminHandler(queries, conn, logger)
+	chatH := handlers.NewChatHandler(queries, conn, blobs, logger)
 
 	r.Route("/api", func(r chi.Router) {
 		// Without these, an unmatched /api path fell through to the SPA
@@ -63,6 +64,8 @@ func New(conn *sql.DB, blobs *blobstore.Store, logger *slog.Logger) http.Handler
 
 			r.Get("/settings", settingsH.Get)
 			r.Put("/settings", settingsH.Update)
+			r.Get("/settings/ai", settingsH.GetAI)
+			r.Put("/settings/ai", settingsH.UpdateAI)
 			r.Patch("/user", settingsH.UpdateProfile)
 			r.Get("/user/usage", settingsH.Usage)
 			r.Post("/user/api-key", settingsH.EnsureAPIKey)
@@ -92,6 +95,15 @@ func New(conn *sql.DB, blobs *blobstore.Store, logger *slog.Logger) http.Handler
 			r.Post("/files/{slug}/restore", files.Restore)
 			r.Delete("/files/{slug}", files.Delete)
 			r.Delete("/files/{slug}/permanent", files.HardDelete)
+
+			// Ask AI about a document. Its own subtree rather than under
+			// /api/files/{slug}: the caller need not own the file (a public
+			// file's code works, as on /res), and every handler resolves the
+			// file through GetChatFile, which encodes exactly that rule.
+			r.Get("/chat/{slug}", chatH.Overview)
+			r.Post("/chat/{slug}/messages", chatH.Send)
+			r.Get("/chat/{slug}/conversations/{id}", chatH.Conversation)
+			r.Delete("/chat/{slug}/conversations/{id}", chatH.DeleteConversation)
 
 			r.Get("/backup", backupH.Download)
 			r.Post("/backup/restore", backupH.Restore)

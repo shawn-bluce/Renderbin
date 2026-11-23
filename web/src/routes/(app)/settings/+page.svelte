@@ -10,6 +10,7 @@
 	import { t } from '$lib/i18n/index.svelte';
 	import AccountsSection from './AccountsSection.svelte';
 	import BackupSection from './BackupSection.svelte';
+	import AIModelForm from './AIModelForm.svelte';
 	import { ApiError } from '$lib/api/http';
 	import { ensureApiKey, resetApiKey, updateProfile, updateSettings } from '$lib/api/settings';
 	import type { Settings } from '$lib/api/settings';
@@ -101,9 +102,11 @@
 		}
 	}
 
+	type ToggleKey = Exclude<keyof Settings, 'ai_enabled'>;
+
 	// Flips one boolean setting. The switch moves only once the server has
 	// accepted it, to whatever the server says the value now is.
-	async function saveSetting(key: keyof Settings) {
+	async function saveSetting(key: ToggleKey) {
 		configError = null;
 		try {
 			settings = await updateSettings({ [key]: !settings[key] });
@@ -165,7 +168,7 @@
 {/snippet}
 
 <!-- A setting everyone can see; only the super admin can change it. -->
-{#snippet setting(label: string, hint: string, key: keyof Settings)}
+{#snippet setting(label: string, hint: string, key: ToggleKey)}
 	<ToggleRow
 		class="mt-4"
 		{label}
@@ -273,7 +276,23 @@
 		<!-- Section: AI capability -->
 		<section id="ai" class="card scroll-mt-20 p-5">
 			<SectionTitle icon="lucide:sparkles" label={t('settings.ai')} />
-			{@render setting(t('config.enableMcp'), t('config.enableMcpHint'), 'mcp_enabled')}
+
+			<!-- The Ask AI model is global and super-admin-only: the form is not
+			     rendered for anyone else, who only learns whether it is on. -->
+			{#if isAdmin && data.aiSettings}
+				<AIModelForm
+					initial={data.aiSettings}
+					onsaved={(s) => (settings.ai_enabled = s.base_url !== '' && s.model !== '')}
+				/>
+			{:else}
+				<p class="hint mt-4">
+					{settings.ai_enabled ? t('settings.aiStatusOn') : t('settings.aiStatusOff')}
+				</p>
+			{/if}
+
+			<div class="mt-4 border-t border-line pt-1">
+				{@render setting(t('config.enableMcp'), t('config.enableMcpHint'), 'mcp_enabled')}
+			</div>
 
 			{#if settings.mcp_enabled && apiKey}
 				<div class="mt-4 border-t border-line pt-4">

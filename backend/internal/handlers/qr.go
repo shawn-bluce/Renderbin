@@ -92,7 +92,11 @@ func (h *FilesHandler) withQRWidget(ctx context.Context, page []byte, note strin
 // or appends it when there is none (the parser puts trailing content in the
 // body anyway). It returns a new slice; page is not modified.
 func injectQRWidget(page []byte, note string) []byte {
-	script := strings.Replace(qrWidgetScript, "__NOTE__", note, 1)
+	return injectScript(page, strings.Replace(qrWidgetScript, "__NOTE__", note, 1))
+}
+
+// injectScript is the splice every /res widget uses (see injectQRWidget).
+func injectScript(page []byte, script string) []byte {
 	i := lastBodyClose(page)
 	if i < 0 {
 		i = len(page)

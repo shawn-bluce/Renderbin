@@ -367,6 +367,50 @@ const en = {
 	'confirm.disableAccount':
 		'Disable "{name}"? They cannot sign in and their shared links stop working until you re-enable them.',
 
+	// Ask AI
+	'ai.ask': 'Ask AI',
+	'ai.newChat': 'New chat',
+	'ai.history': 'Conversations',
+	'ai.noConversations': 'No conversations yet',
+	'ai.collapse': 'Collapse',
+	'ai.placeholder': 'Ask about this document… (Enter to send, Shift+Enter for a new line)',
+	'ai.send': 'Send',
+	'ai.stop': 'Stop',
+	'ai.thinking': 'Thinking…',
+	'ai.empty':
+		'Ask anything about “{name}”. The whole document is sent to the model along with your question.',
+	'ai.deleteConversation': 'Delete conversation',
+	'ai.confirmDelete': 'Delete the conversation “{title}”?',
+	'ai.untitled': 'Untitled',
+	'ai.notConfigured':
+		'Ask AI is not set up on this server. The super admin can configure a model in Settings.',
+	'ai.stopped': '(stopped)',
+	'ai.openOriginal': 'Open the document on its own',
+	'error.chatLoad': 'Failed to load the conversation',
+	'error.chatSend': 'Failed to send the message',
+	'error.chatDelete': 'Failed to delete the conversation',
+	'settings.aiModel': 'Ask AI model',
+	'settings.aiModelHint':
+		'Signed-in readers get an “Ask AI” button on documents to chat about them with this model. Any OpenAI-compatible API works: OpenAI, DeepSeek, Qwen, OpenRouter, Ollama…',
+	'settings.aiProvider': 'Provider',
+	'settings.aiProviderDeepseek': 'DeepSeek',
+	'settings.aiProviderOther': 'Other (OpenAI-compatible)',
+	'settings.aiProviderDeepseekHint':
+		'The DeepSeek endpoint is built in: only an API key and a model are needed.',
+	'settings.aiBaseUrl': 'Base URL',
+	'settings.aiBaseUrlHint': 'e.g. https://api.openai.com/v1 — /chat/completions is appended.',
+	'settings.aiApiKey': 'API key',
+	'settings.aiApiKeySet': 'A key ending in {hint} is set. Leave blank to keep it.',
+	'settings.aiApiKeySetNoHint': 'A key is set. Leave blank to keep it.',
+	'settings.aiApiKeyClear': 'Clear the stored key',
+	'settings.aiModelName': 'Model name',
+	'settings.aiModelNamePlaceholder': 'e.g. gpt-4o-mini',
+	'settings.aiSaved': 'Model settings saved.',
+	'settings.aiStatusOn': 'Ask AI is on: the super admin has configured a model.',
+	'settings.aiStatusOff':
+		'Ask AI is off: no model is configured. Only the super admin can set one.',
+	'error.aiSettings': 'Failed to save the model settings',
+
 	// Language switcher
 	'switcher.label': 'Language'
 } as const;
@@ -729,6 +773,46 @@ const zh = {
 	'error.quota': '修改存储上限失败',
 	'error.quotaInvalid': '请输入一个体积，例如 100、500MB 或 2GB。',
 	'confirm.disableAccount': '禁用“{name}”？该账号将无法登录，其分享链接在解禁前都会失效。',
+
+	// Ask AI
+	'ai.ask': '问 AI',
+	'ai.newChat': '新对话',
+	'ai.history': '历史对话',
+	'ai.noConversations': '还没有对话',
+	'ai.collapse': '收起',
+	'ai.placeholder': '就这篇文档提问…（回车发送，Shift+回车换行）',
+	'ai.send': '发送',
+	'ai.stop': '停止',
+	'ai.thinking': '思考中…',
+	'ai.empty': '可以就“{name}”问任何问题。提问时会把整篇文档连同问题一起发给模型。',
+	'ai.deleteConversation': '删除对话',
+	'ai.confirmDelete': '删除对话“{title}”？',
+	'ai.untitled': '未命名',
+	'ai.notConfigured': '服务器尚未配置 AI 模型，请超级管理员在设置中配置。',
+	'ai.stopped': '（已停止）',
+	'ai.openOriginal': '单独打开文档',
+	'error.chatLoad': '加载对话失败',
+	'error.chatSend': '发送失败',
+	'error.chatDelete': '删除对话失败',
+	'settings.aiModel': '问 AI 模型',
+	'settings.aiModelHint':
+		'登录用户查看文档时会出现“问 AI”按钮，可以用这个模型就文档对话。支持任何 OpenAI 兼容接口：OpenAI、DeepSeek、通义千问、OpenRouter、Ollama 等。',
+	'settings.aiProvider': '服务商',
+	'settings.aiProviderDeepseek': 'DeepSeek',
+	'settings.aiProviderOther': '其他（OpenAI 兼容）',
+	'settings.aiProviderDeepseekHint': '已内置 DeepSeek 接口地址，只需填写 API Key 和模型。',
+	'settings.aiBaseUrl': 'Base URL',
+	'settings.aiBaseUrlHint': '例如 https://api.openai.com/v1，会自动拼上 /chat/completions。',
+	'settings.aiApiKey': 'API Key',
+	'settings.aiApiKeySet': '已设置末尾为 {hint} 的 Key，留空则保持不变。',
+	'settings.aiApiKeySetNoHint': '已设置 Key，留空则保持不变。',
+	'settings.aiApiKeyClear': '清除已保存的 Key',
+	'settings.aiModelName': '模型名称',
+	'settings.aiModelNamePlaceholder': '例如 gpt-4o-mini',
+	'settings.aiSaved': '模型配置已保存。',
+	'settings.aiStatusOn': '“问 AI”已启用：超级管理员已配置模型。',
+	'settings.aiStatusOff': '“问 AI”未启用：尚未配置模型，只有超级管理员可以配置。',
+	'error.aiSettings': '保存模型配置失败',
 
 	// Language switcher
 	'switcher.label': '语言'

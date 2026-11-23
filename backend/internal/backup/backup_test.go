@@ -331,6 +331,8 @@ func TestRestoreFillsSearchFieldsOfAnOlderBackup(t *testing.T) {
 	}
 	for _, stmt := range []string{
 		`ALTER TABLE blobs DROP COLUMN search_meta`,
+		`DROP TABLE chat_conversations`, // 0013
+		`DROP TABLE chat_messages`,
 		`DELETE FROM schema_migrations WHERE filename >= '0011'`,
 	} {
 		if _, err := old.Exec(stmt); err != nil {
