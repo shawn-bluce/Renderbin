@@ -35,6 +35,7 @@ func New(conn *sql.DB, blobs *blobstore.Store, logger *slog.Logger) http.Handler
 	backupH := handlers.NewBackupHandler(conn, blobs, logger)
 	adminH := handlers.NewAdminHandler(queries, conn, logger)
 	chatH := handlers.NewChatHandler(queries, conn, blobs, logger)
+	commentsH := handlers.NewCommentsHandler(queries, conn, blobs, logger)
 
 	r.Route("/api", func(r chi.Router) {
 		// Without these, an unmatched /api path fell through to the SPA
@@ -104,6 +105,14 @@ func New(conn *sql.DB, blobs *blobstore.Store, logger *slog.Logger) http.Handler
 			r.Post("/chat/{slug}/messages", chatH.Send)
 			r.Get("/chat/{slug}/conversations/{id}", chatH.Conversation)
 			r.Delete("/chat/{slug}/conversations/{id}", chatH.DeleteConversation)
+
+			// Comments on a document, shared among everyone who may read it.
+			// Same subtree reasoning as /chat: the file is resolved through
+			// GetChatFile, not owner-scoped.
+			r.Get("/comments/{slug}", commentsH.List)
+			r.Post("/comments/{slug}", commentsH.Create)
+			r.Post("/comments/{slug}/explain", commentsH.Explain)
+			r.Delete("/comments/{slug}/{id}", commentsH.Delete)
 
 			r.Get("/backup", backupH.Download)
 			r.Post("/backup/restore", backupH.Restore)

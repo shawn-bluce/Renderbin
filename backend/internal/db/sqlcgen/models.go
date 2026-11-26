@@ -64,6 +64,17 @@ type File struct {
 	BlobID           string        `json:"blob_id"`
 }
 
+type FileComment struct {
+	ID        int64         `json:"id"`
+	FileID    int64         `json:"file_id"`
+	UserID    int64         `json:"user_id"`
+	ParentID  sql.NullInt64 `json:"parent_id"`
+	Quote     string        `json:"quote"`
+	Body      string        `json:"body"`
+	CreatedAt time.Time     `json:"created_at"`
+	IsAi      bool          `json:"is_ai"`
+}
+
 type Session struct {
 	Token     string    `json:"token"`
 	CreatedAt time.Time `json:"created_at"`

@@ -298,3 +298,9 @@
 		animation: none;
 	}
 }
+
+/* A margin note floats over the document, so it carries its own shadow (a panel
+   would have borne it); heavy shadows are otherwise avoided. */
+.note {
+	box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
+}

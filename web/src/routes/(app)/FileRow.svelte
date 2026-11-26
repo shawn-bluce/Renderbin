@@ -2,12 +2,13 @@
 	// One row of the file list, for live and trashed files alike. Inline title and
 	// tag editing is local state; everything that touches the server is a callback,
 	// so the page stays the only owner of the lists and of error reporting.
+	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
 	import { t } from '$lib/i18n/index.svelte';
 	import { formatSize } from '$lib/format';
 	import type { FileItem } from '$lib/api/files';
 	import { formatDeadline, formatTime, fullDate } from '$lib/dates';
-	import { downloadName, kindIcon, kindLabel, resUrl } from '$lib/files-ui';
+	import { downloadName, kindIcon, kindLabel } from '$lib/files-ui';
 	import InlineEdit from './InlineEdit.svelte';
 
 	let {
@@ -144,17 +145,16 @@
 						oncancel={() => (editingTitle = false)}
 					/>
 				{:else}
-					<!-- eslint-disable svelte/no-navigation-without-resolve -- /res/[slug] is served by the Go backend, not a SvelteKit route -->
+					<!-- Opens the document in /view (comments, Ask AI), which frames /res. The
+					     owner needs no access code; the share link the row copies stays /res. -->
 					<a
-						href={resUrl(file)}
+						href={resolve(`/view/${encodeURIComponent(file.slug)}`)}
 						target="_blank"
 						rel="noopener"
-						data-sveltekit-reload
 						class="truncate font-medium text-fg-strong hover:text-accent hover:underline"
 					>
 						{file.name}
 					</a>
-					<!-- eslint-enable svelte/no-navigation-without-resolve -->
 					<button
 						onclick={startTitle}
 						title={t('row.editTitle')}

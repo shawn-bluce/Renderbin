@@ -394,15 +394,17 @@ func TestAskAIButtonOnRenderedPages(t *testing.T) {
 		t.Helper()
 		return bodyOf(t, e.do(t, http.MethodGet, path, "", cookie), http.StatusOK)
 	}
-	if strings.Contains(page("/res/doc", adminCookie), "renderbin-ask-ai") {
-		t.Error("button shown while no model is configured")
+	// Comments need no model: the link and the toolbar are offered, without the
+	// AI wording and without the "Explain with AI" button.
+	if p := page("/res/doc", adminCookie); !strings.Contains(p, `("/view/doc",false)`) || !strings.Contains(p, "renderbin-selection") || !strings.Contains(p, "(false)</script>") {
+		t.Error("with no model configured the owner should still get the link (as Comments) and the toolbar without explain")
 	}
 
 	e.configureAI(t, newFakeLLM(t, "ok"))
-	if p := page("/res/doc", adminCookie); !strings.Contains(p, "renderbin-ask-ai") || !strings.Contains(p, `("/view/doc")`) {
-		t.Error("the owner gets no button, or one with a code they do not need")
+	if p := page("/res/doc", adminCookie); !strings.Contains(p, "renderbin-ask-ai") || !strings.Contains(p, `("/view/doc",true)`) || !strings.Contains(p, "(true)</script>") {
+		t.Error("the owner gets no button, or one with a code they do not need, or no explain toolbar")
 	}
-	if p := page("/res/doc?code=code1", otherCookie); !strings.Contains(p, `("/view/doc?code=code1")`) {
+	if p := page("/res/doc?code=code1", otherCookie); !strings.Contains(p, `("/view/doc?code=code1",true)`) {
 		t.Error("a signed-in code holder gets no button carrying the code")
 	}
 	if strings.Contains(page("/res/doc?code=code1", nil), "renderbin-ask-ai") {

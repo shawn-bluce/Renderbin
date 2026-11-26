@@ -11,11 +11,17 @@ const qrWidgetTag = "renderbin-qr"
 
 // qrNote returns the note the page's widget was given, and whether it has one.
 func qrNote(body string) (string, bool) {
-	i := strings.LastIndex(body, `})("`)
-	if !strings.Contains(body, qrWidgetTag) || i < 0 {
+	// The widgets that follow the QR one (the /view link, the selection toolbar)
+	// end in the same `})(` call, so look for the call after the QR tag.
+	start := strings.Index(body, qrWidgetTag)
+	if start < 0 {
 		return "", false
 	}
-	note, _, _ := strings.Cut(body[i+4:], `"`)
+	i := strings.Index(body[start:], `})("`)
+	if i < 0 {
+		return "", false
+	}
+	note, _, _ := strings.Cut(body[start+i+4:], `"`)
 	return note, true
 }
 

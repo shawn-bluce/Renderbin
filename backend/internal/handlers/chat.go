@@ -30,7 +30,7 @@ import (
 // It is reached from the app's /view/{slug} page, never from the sandboxed
 // document itself: that page runs in an opaque origin with no cookie, and the
 // document's own scripts can read anything rendered there. See
-// injectAskAIWidget for the button that leads from one to the other.
+// injectAskAIWidget for the link that leads from one to the other.
 type ChatHandler struct {
 	queries *sqlcgen.Queries
 	conn    *sql.DB
@@ -82,17 +82,24 @@ func toChatMessage(m sqlcgen.ChatMessage) chatMessageResponse {
 	return chatMessageResponse{ID: m.ID, Role: m.Role, Content: m.Content, CreatedAt: m.CreatedAt.Format(timeLayout)}
 }
 
-// chatFile resolves {slug} (plus ?code=) to a file the caller may read, or
-// answers 404 -- the same answer whether the file is missing, someone else's
-// and private, or the code is wrong.
+// chatFile resolves {slug} (plus ?code=) to a file the caller may read; see
+// readableFile.
 func (h *ChatHandler) chatFile(w http.ResponseWriter, r *http.Request, user sqlcgen.User) (sqlcgen.File, bool) {
-	file, err := h.queries.GetChatFile(r.Context(), sqlcgen.GetChatFileParams{
+	return readableFile(w, r, h.queries, h.logger, user)
+}
+
+// readableFile resolves {slug} (plus ?code=) to a file the caller may read, or
+// answers 404 -- the same answer whether the file is missing, someone else's
+// and private, or the code is wrong. Both the chat and the comments go through
+// it, so "who may read a document" has one statement (GetChatFile).
+func readableFile(w http.ResponseWriter, r *http.Request, queries *sqlcgen.Queries, logger *slog.Logger, user sqlcgen.User) (sqlcgen.File, bool) {
+	file, err := queries.GetChatFile(r.Context(), sqlcgen.GetChatFileParams{
 		Slug:       chi.URLParam(r, "slug"),
 		ViewerID:   user.ID,
 		AccessCode: r.URL.Query().Get("code"),
 	})
 	if err != nil {
-		queryError(w, h.logger, "get chat file", err)
+		queryError(w, logger, "get chat file", err)
 		return sqlcgen.File{}, false
 	}
 	return file, true
@@ -304,7 +311,7 @@ func (h *ChatHandler) Send(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	doc, err := h.documentText(file)
+	doc, err := documentText(h.blobs, file)
 	if err != nil {
 		serverError(w, h.logger, "read document for chat", err, "slug", file.Slug)
 		return
@@ -426,8 +433,8 @@ func chatTitle(question string) string {
 // documentText is the document as the model sees it: its stored source --
 // Markdown, HTML or text, exactly as uploaded -- or, for a site, every text
 // entry under its path. Binary entries (images, fonts) are left out.
-func (h *ChatHandler) documentText(file sqlcgen.File) (string, error) {
-	data, err := readContent(h.blobs, file)
+func documentText(blobs *blobstore.Store, file sqlcgen.File) (string, error) {
+	data, err := readContent(blobs, file)
 	if err != nil {
 		return "", err
 	}
@@ -452,18 +459,24 @@ func (h *ChatHandler) documentText(file sqlcgen.File) (string, error) {
 	return b.String(), nil
 }
 
-// chatSystemPrompt puts the whole document in front of the conversation.
-func chatSystemPrompt(file sqlcgen.File, doc string) string {
+// documentBlock is the document as it goes into a prompt: its title, format and
+// text.
+func documentBlock(file sqlcgen.File, doc string) string {
 	format := map[string]string{
 		KindHTML:     "HTML source",
 		KindMarkdown: "Markdown source",
 		KindText:     "plain text",
 		KindSite:     "a multi-page website; each file is introduced by a line \"=== path ===\"",
 	}[file.Kind]
+	return "Document title: " + file.Name + "\n" +
+		"Format: " + format + "\n\n" +
+		"<document>\n" + doc + "\n</document>"
+}
+
+// chatSystemPrompt puts the whole document in front of the conversation.
+func chatSystemPrompt(file sqlcgen.File, doc string) string {
 	return "You are a helpful assistant. The user is reading the document below and is asking you about it. " +
 		"Answer based on the document. When a question goes beyond what the document says, say so, then answer from general knowledge. " +
 		"Reply in the language the user writes in, and format replies in Markdown.\n\n" +
-		"Document title: " + file.Name + "\n" +
-		"Format: " + format + "\n\n" +
-		"<document>\n" + doc + "\n</document>"
+		documentBlock(file, doc)
 }

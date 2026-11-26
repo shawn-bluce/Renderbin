@@ -1141,7 +1141,7 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 			if !owner {
 				code = r.URL.Query().Get("code")
 			}
-			page = h.withAskAI(r.Context(), page, askAITarget(file.Slug, code))
+			page = h.withViewWidgets(r.Context(), page, askAITarget(file.Slug, code))
 		}
 		writeUserHTML(w, http.StatusOK, page)
 		return
