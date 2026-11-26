@@ -8,6 +8,41 @@ Upgrades are `docker compose pull && docker compose up -d`. Database migrations
 are forward-only and apply themselves on start, so **take a backup before
 upgrading** (Settings → Backup) if you might want to go back.
 
+## v0.6.0
+
+Three new migrations (`0013`-`0015`) add tables and apply in a moment on the
+first start; none touches existing data. As always, take a backup before
+upgrading if you might want to go back.
+
+### Added
+
+- **Ask AI: chat with a model about a document.** The super admin connects a
+  model under Settings → AI capability (DeepSeek with just a key, or any
+  OpenAI-compatible base URL); the API key is never shown again, only its last
+  four characters. Signed-in readers then get an "Ask AI" link on opened
+  documents, which opens the document in a reading view with a chat window
+  beside it. The model sees the whole document (for a site, every text file in
+  it); answers stream in, conversations are kept per reader and private to
+  them, and a stopped answer keeps what was written. The document itself never
+  talks to the model or the API -- it still runs sandboxed.
+- **Comments on selected text.** In the reading view, selecting text shows a
+  small toolbar; "Comment" attaches a note to that passage. Notes float beside
+  the document level with their passage, which is highlighted, and a
+  "Comments" button shows or hides them all. Everyone who can read the document
+  sees and can reply to them (one level); the author and the document's owner
+  can delete. A note whose passage was later edited away is kept in a separate
+  list, not lost. Comments need no model.
+- **"Explain with AI"** in the same toolbar, when a model is configured: asks
+  the model what the selected passage means using only the document, and keeps
+  the answer as a note marked AI. The prompt tells the model to say so when the
+  document does not make it clear rather than guess.
+
+### Changed
+
+- **A file's name on the dashboard opens the reading view** (`/view/...`),
+  where comments and Ask AI live. The share link a row copies is unchanged
+  (`/res/...?code=...`), and so is what a visitor with that link sees.
+
 ## v0.5.0
 
 ### Breaking
